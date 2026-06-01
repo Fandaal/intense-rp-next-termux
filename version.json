@@ -1,8 +1,8 @@
 {
-  "version": "2.8.6-patch",
+  "version": "2.8.6-rev1",
   "aua": true,
   "severity": 4,
   "pu": "survey",
   "pufref": "none",
-  "summary": "faster Settings startup, cleaner provider hotswaps, GLM Advanced Search and QwenLM Tools toggles, and AI Studio and DeepSeek fixes."
+  "summary": "critical DeepSeek fixes"
 }

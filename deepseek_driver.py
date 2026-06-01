@@ -73,7 +73,9 @@ class DeepSeekDriver(BaseDriver):
         "button:has-text('Sign in')",
     ]
     SEND_CONTROL_SELECTORS = [
-        "div.ds-icon-button._52c986b",
+        "[role='button'].ds-button._52c986b:visible",
+        ".ds-button._52c986b.ds-button--circle:visible",
+        "div.ds-icon-button._52c986b:visible",
     ]
 
     def __init__(self, config_manager):
@@ -119,7 +121,44 @@ class DeepSeekDriver(BaseDriver):
 
     def _locate_send_control(self):
         selector = ", ".join(self.SEND_CONTROL_SELECTORS)
-        return self.page.locator(selector)
+        return self.page.locator(selector).first
+
+    async def _is_deepseek_control_disabled(self, locator: Any) -> bool:
+        try:
+            return bool(
+                await locator.evaluate(
+                    """(el) => {
+                        const ariaDisabled = (el.getAttribute('aria-disabled') || '').trim().toLowerCase();
+                        const classTokens = (el.getAttribute('class') || '').toString().split(/\\s+/);
+                        const style = window.getComputedStyle(el);
+
+                        return Boolean(
+                            el.disabled ||
+                            ariaDisabled === 'true' ||
+                            el.hasAttribute('disabled') ||
+                            el.hasAttribute('data-disabled') ||
+                            classTokens.some((token) => token === 'disabled' || token.endsWith('--disabled')) ||
+                            ((style.pointerEvents || '').toLowerCase() === 'none')
+                        );
+                    }"""
+                )
+            )
+        except Exception:
+            try:
+                aria_disabled = str(await locator.get_attribute("aria-disabled") or "").strip().lower()
+                disabled_attr = await locator.get_attribute("disabled")
+                data_disabled = await locator.get_attribute("data-disabled")
+                class_attr = await locator.get_attribute("class") or ""
+                class_tokens = class_attr.split()
+            except Exception:
+                return False
+
+            return (
+                aria_disabled == "true"
+                or disabled_attr is not None
+                or data_disabled is not None
+                or any(token == "disabled" or token.endswith("--disabled") for token in class_tokens)
+            )
 
     async def _has_visible_selector(
         self,
@@ -1199,8 +1238,7 @@ class DeepSeekDriver(BaseDriver):
 
                 return False
 
-            is_disabled = await stop_button.get_attribute("aria-disabled")
-            if is_disabled == "true":
+            if await self._is_deepseek_control_disabled(stop_button):
                 Logger.debug("Stop button is disabled (generation may have already stopped).")
                 return False
 
@@ -2032,13 +2070,11 @@ class DeepSeekDriver(BaseDriver):
                 Logger.debug(f"Waiting up to {timeout} seconds for send button to be enabled...")
                 start_time = time.time()
                 while time.time() - start_time < timeout:
-                    is_disabled = await send_button.get_attribute("aria-disabled") == "true"
-                    if not is_disabled:
+                    if not await self._is_deepseek_control_disabled(send_button):
                         break
                     await asyncio.sleep(0.5)
             
-            is_disabled = await send_button.get_attribute("aria-disabled") == "true"
-            if not is_disabled:
+            if not await self._is_deepseek_control_disabled(send_button):
                 Logger.debug("Clicking send button...")
                 await send_button.click()
             else:
