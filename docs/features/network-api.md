@@ -260,6 +260,9 @@ When Providers in Parallel exposes real-model IDs, only exact conflicts get prov
 
 === ":material-image-auto-adjust: Google AI Studio"
 
+    !!! warning "Temporarily locked by default"
+        These IDs are available only when AI Studio is unlocked with **Settings** -> **Advanced** -> **Provider Stability** -> **Ignore Provider Locks**.
+
     | Model ID | Behavior |
     |----------|----------|
     | `aistudio-auto` | Uses your IntenseRP settings |

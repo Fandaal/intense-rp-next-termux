@@ -276,6 +276,7 @@ class PerplexityDriver(BaseDriver):
     BASE_URL = "https://www.perplexity.ai/"
     AUTH_URL_PREFIX = "https://www.perplexity.ai/auth"
     ASK_ROUTE_FRAGMENT = "/rest/sse/perplexity_ask"
+    SESSION_URL = "https://www.perplexity.ai/api/auth/session"
     SESSION_URL_FRAGMENT = "/api/auth/session"
     SESSION_COOKIE_NAME = "__Secure-next-auth.session-token"
 
@@ -294,23 +295,12 @@ class PerplexityDriver(BaseDriver):
     SPACE_INSTRUCTIONS_TEXTAREA_SELECTOR = (
         "textarea[aria-label='Input for editing Space answer instructions']"
     )
-    REQUEST_MODE_BUTTON_CLASSES = (
-        "reset",
-        "interactable",
-        "inline-flex",
-        "select-none",
-        "h-8",
-        "max-w-full",
-        "items-center",
-        "border",
-        "text-sm",
-        "transition-colors",
-    )
     SIGN_IN_LABEL_XPATH = (
         "xpath=//div[normalize-space(.)='Sign In' and "
         "contains(concat(' ', normalize-space(@class), ' '), "
         "' font-sans text-sm text-super leading-tight ')]"
     )
+    EMAIL_LOGIN_INPUT_SELECTOR = "input[placeholder='Enter your email'], input[name='email']"
     VERIFY_REQUEST_HEADING_SELECTOR = "xpath=//h2[normalize-space(.)='Check your email']"
     VERIFY_CONTINUE_BUTTON_SELECTOR = "xpath=//button[.//span[normalize-space(.)='Continue']]"
 
@@ -320,6 +310,12 @@ class PerplexityDriver(BaseDriver):
     MODEL_SWITCH_TIERS = {"pro", "max"}
     MAX_ONLY_MODELS = {"GPT-5.5", "Claude Opus 4.7"}
     FORCED_THINKING_MODELS = {"Gemini 3.1 Pro", "Nemotron 3 Super"}
+    REQUEST_MODE_LABELS = (
+        "Search",
+        "Learn step by step",
+        "Deep research",
+        "Model council",
+    )
 
     def __init__(self, config_manager):
         super().__init__(config_manager=config_manager, provider=DriverProvider.PERPLEXITY)
@@ -434,17 +430,8 @@ class PerplexityDriver(BaseDriver):
             Logger.debug(f"Perplexity: detected subscription tier '{tier}'.")
 
     async def _refresh_subscription_tier(self) -> None:
-        result = await self._run_browser_request(
-            method="GET",
-            url="https://www.perplexity.ai/api/auth/session",
-            headers={"accept": "application/json"},
-            timeout_ms=15000,
-        )
-        if not isinstance(result, dict) or not bool(result.get("ok")):
-            return
-        try:
-            payload = json.loads(str(result.get("text") or ""))
-        except Exception:
+        available, payload = await self._read_session_payload(timeout_ms=15000)
+        if not available:
             return
         self._update_subscription_tier(payload)
 
@@ -465,7 +452,59 @@ class PerplexityDriver(BaseDriver):
             raise RuntimeError("Page is not initialized.")
         return self.page.locator(self.SIGN_IN_LABEL_XPATH)
 
-    async def _is_logged_in(self) -> bool:
+    def _email_login_input_locator(self):
+        if not self.page:
+            raise RuntimeError("Page is not initialized.")
+        return self.page.locator(self.EMAIL_LOGIN_INPUT_SELECTOR)
+
+    async def _read_session_payload(
+        self, timeout_ms: int | None = 10000
+    ) -> tuple[bool, Any]:
+        result = await self._run_browser_request(
+            method="GET",
+            url=self.SESSION_URL,
+            headers={"accept": "application/json"},
+            timeout_ms=timeout_ms or 10000,
+        )
+        if not isinstance(result, dict):
+            return False, None
+
+        try:
+            status = int(result.get("status") or 0)
+        except Exception:
+            status = 0
+
+        if not bool(result.get("ok")):
+            if status in {401, 403}:
+                return True, {}
+            Logger.debug(
+                f"Perplexity: session check failed with status {status or 'unknown'}."
+            )
+            return False, None
+
+        try:
+            return True, json.loads(str(result.get("text") or ""))
+        except Exception as exc:
+            Logger.debug(f"Perplexity: could not parse session check response: {exc}")
+            return False, None
+
+    @staticmethod
+    def _session_payload_is_authenticated(payload: Any) -> bool:
+        if not isinstance(payload, dict):
+            return False
+        user = payload.get("user")
+        return isinstance(user, dict) and bool(user)
+
+    async def _read_session_auth_state(
+        self, timeout_ms: int | None = 10000
+    ) -> bool | None:
+        available, payload = await self._read_session_payload(timeout_ms=timeout_ms)
+        if not available:
+            return None
+        self._update_subscription_tier(payload)
+        return self._session_payload_is_authenticated(payload)
+
+    async def _has_session_cookie(self) -> bool:
         if not self.context:
             return False
 
@@ -487,6 +526,20 @@ class PerplexityDriver(BaseDriver):
             if name == self.SESSION_COOKIE_NAME and value:
                 return True
         return False
+
+    async def _is_logged_in(self) -> bool:
+        if not await self._has_session_cookie():
+            return False
+
+        auth_state = await self._read_session_auth_state(timeout_ms=5000)
+        if auth_state is not None:
+            return auth_state
+
+        Logger.debug(
+            "Perplexity: could not verify the session endpoint; falling back to "
+            "the session cookie."
+        )
+        return True
 
     async def _wait_for_sign_in_label(self, timeout_ms: int | None = 10000):
         start = time.monotonic()
@@ -537,6 +590,39 @@ class PerplexityDriver(BaseDriver):
             sign_in_label, label="Sign In label", timeout_ms=timeout_ms
         )
 
+    async def _wait_for_email_login_input(self, timeout_ms: int | None = 15000):
+        start = time.monotonic()
+        timeout_s = None if not timeout_ms else max(int(timeout_ms), 0) / 1000.0
+        while True:
+            inputs = self._email_login_input_locator()
+            try:
+                count = await inputs.count()
+            except Exception:
+                count = 0
+            for idx in range(count):
+                candidate = inputs.nth(idx)
+                try:
+                    if await candidate.is_visible():
+                        return candidate
+                except Exception:
+                    continue
+            if timeout_s is not None and time.monotonic() - start >= timeout_s:
+                raise TimeoutError("Timed out waiting for Perplexity email login input.")
+            await asyncio.sleep(0.2)
+
+    async def _open_email_login_form(self, timeout_ms: int | None = 15000):
+        try:
+            return await self._wait_for_email_login_input(timeout_ms=3000)
+        except Exception:
+            pass
+
+        try:
+            await self._click_sign_in_label(timeout_ms=3000)
+        except Exception as exc:
+            Logger.debug(f"Perplexity: old Sign In entry point was not available: {exc}")
+
+        return await self._wait_for_email_login_input(timeout_ms=timeout_ms)
+
     async def _wait_for_verify_request_page(self, timeout_ms: int | None = 15000) -> None:
         if not self.page:
             raise RuntimeError("Page is not initialized.")
@@ -548,15 +634,12 @@ class PerplexityDriver(BaseDriver):
     async def _click_continue_with_email(self, timeout_ms: int | None = 10000) -> None:
         if not self.page:
             raise RuntimeError("Page is not initialized.")
-        continue_button = self.page.locator("button[type='button']").filter(
-            has_text="Continue with email"
-        )
-        await continue_button.first.wait_for(state="visible", timeout=timeout_ms or 0)
-        await self._click_locator_center(
-            continue_button.first,
-            label="Continue with email button",
-            timeout_ms=timeout_ms,
-        )
+        if await self._click_button_with_first_span_text(
+            "Continue with email",
+            timeout_ms=timeout_ms or 0,
+        ):
+            return
+        raise TimeoutError("Timed out waiting for Perplexity Continue with email button.")
 
     @staticmethod
     def _normalize_email_code(code: Any) -> str:
@@ -717,10 +800,17 @@ class PerplexityDriver(BaseDriver):
 
         Logger.info("Perplexity: Auto Login enabled. Starting email-code login...")
         try:
-            await self._click_sign_in_label(timeout_ms=10000)
-
-            email_input = self.page.locator("input[name='email']")
-            await email_input.first.fill(email, timeout=15000)
+            email_input = await self._open_email_login_form(timeout_ms=15000)
+            await self._click_locator_center(
+                email_input,
+                label="email login input",
+                timeout_ms=5000,
+            )
+            try:
+                await email_input.fill("", timeout=5000)
+            except Exception:
+                pass
+            await self.page.keyboard.type(email, delay=20)
 
             await self._click_continue_with_email(timeout_ms=10000)
             await self._wait_for_verify_request_page(timeout_ms=15000)
@@ -805,10 +895,36 @@ class PerplexityDriver(BaseDriver):
         except Exception:
             return False
 
+    async def _ensure_signed_in_before_spaces(self) -> None:
+        if not self.page:
+            raise RuntimeError("Page is not initialized.")
+
+        auth_state = await self._read_session_auth_state(timeout_ms=10000)
+        if auth_state is True:
+            return
+
+        Logger.info(
+            "Perplexity Spaces: checking sign-in on the main Perplexity page "
+            "before opening Spaces..."
+        )
+        await self.page.goto(self.BASE_URL, wait_until="domcontentloaded", timeout=45000)
+        await self._dismiss_onboarding()
+        if await self._is_logged_in():
+            return
+
+        self._space_id = None
+        self._last_space_instructions_text = None
+        Logger.info(
+            "Perplexity Spaces: sign-in is not confirmed; completing login before "
+            "opening Spaces."
+        )
+        await self.login()
+
     async def _ensure_space_ready(self) -> None:
         if not self.page or not self._spaces_enabled():
             return
 
+        await self._ensure_signed_in_before_spaces()
         if await self._current_space_is_ready():
             return
         if self._space_id and await self._open_cached_space():
@@ -1122,6 +1238,13 @@ class PerplexityDriver(BaseDriver):
                         const normalize = (value) => (value || '').toString().replace(/\\s+/g, ' ').trim();
                         const buttons = Array.from(document.querySelectorAll("button[role='button'], button"));
                         for (const button of buttons) {
+                            const ariaLabel = normalize(button.getAttribute('aria-label'));
+                            if (ariaLabel === 'Edit instructions') {
+                                return 'edit';
+                            }
+                            if (ariaLabel === 'Add instructions' || ariaLabel === 'Add instructions...') {
+                                return 'add';
+                            }
                             const children = Array.from(button.children || []);
                             const divTexts = children
                                 .filter((child) => child.tagName && child.tagName.toLowerCase() === 'div')
@@ -1158,6 +1281,13 @@ class PerplexityDriver(BaseDriver):
                         return style && style.display !== 'none' && style.visibility !== 'hidden';
                     };
                     const buttonState = (button) => {
+                        const ariaLabel = normalize(button.getAttribute('aria-label'));
+                        if (ariaLabel === 'Edit instructions') {
+                            return 'edit';
+                        }
+                        if (ariaLabel === 'Add instructions' || ariaLabel === 'Add instructions...') {
+                            return 'add';
+                        }
                         const children = Array.from(button.children || []);
                         const divTexts = children
                             .filter((child) => child.tagName && child.tagName.toLowerCase() === 'div')
@@ -1595,53 +1725,92 @@ class PerplexityDriver(BaseDriver):
         return result in {"already", "clicked"}
 
     async def set_search_state(self, state: bool) -> None:
-        ok = await self._set_web_search_checkbox(bool(state))
+        if not bool(state):
+            return
+        ok = await self._ensure_request_mode_search()
         if not ok:
-            Logger.warning(f"Perplexity: could not set Web search to {bool(state)}.")
+            Logger.warning("Perplexity: could not confirm Search request mode.")
 
     async def _ensure_request_mode_search(self) -> bool:
         if not self.page:
             return False
 
-        read_mode_js = """(button) => {
+        read_mode_js = """(button, labels) => {
             const normalize = (value) => (value || '').toString().replace(/\\s+/g, ' ').trim();
-            const last = button && button.lastElementChild;
-            if (!last || last.tagName.toLowerCase() !== 'span') {
-                return normalize(button && button.textContent);
+            const text = normalize(button && button.textContent);
+            const lower = text.toLowerCase();
+            for (const label of labels || []) {
+                if (lower.includes(normalize(label).toLowerCase())) {
+                    return label;
+                }
             }
-            for (const node of Array.from(last.childNodes || [])) {
-                if (node.nodeType !== Node.TEXT_NODE) continue;
-                const text = normalize(node.textContent);
-                if (text) return text;
-            }
-            return normalize(last.textContent);
+            return text;
+        }"""
+
+        read_pressed_js = """(button) => {
+            const dataPressed = (button && button.getAttribute('data-pressed') || '').toLowerCase();
+            const ariaPressed = (button && button.getAttribute('aria-pressed') || '').toLowerCase();
+            if (dataPressed === 'false' || ariaPressed === 'false') return false;
+            if (dataPressed === 'true' || ariaPressed === 'true') return true;
+            return null;
         }"""
 
         handle = None
         opened_menu = False
         try:
+            mode_labels = list(self.REQUEST_MODE_LABELS)
             handle = await self.page.evaluate_handle(
-                """(requiredClasses) => {
+                """(labels) => {
+                    const normalize = (value) => (value || '').toString().replace(/\\s+/g, ' ').trim();
+                    const isVisible = (el) => {
+                        if (!el || !el.getClientRects || el.getClientRects().length === 0) return false;
+                        const style = window.getComputedStyle(el);
+                        return style && style.display !== 'none' && style.visibility !== 'hidden';
+                    };
+                    const hasModeIcon = (button) => Array.from(button.querySelectorAll('use')).some((use) => {
+                        const href = (use.getAttribute('href') || use.getAttribute('xlink:href') || '').toString();
+                        return /pplx-icon-(search|book|telescope|gavel)/.test(href);
+                    });
                     const buttons = Array.from(document.querySelectorAll('button'));
-                    return buttons.find((button) => (
-                        requiredClasses.every((className) => button.classList.contains(className))
-                    )) || null;
+                    return buttons.find((button) => {
+                        if (!isVisible(button)) return false;
+                        const hasMenu = (button.getAttribute('aria-haspopup') || '').toLowerCase() === 'menu';
+                        if (!hasMenu) return false;
+                        const hasPressedState = button.hasAttribute('data-pressed') || button.hasAttribute('aria-pressed');
+                        const text = normalize(button.textContent).toLowerCase();
+                        const hasModeLabel = labels.some((label) => text.includes(normalize(label).toLowerCase()));
+                        return hasPressedState || hasModeLabel || hasModeIcon(button);
+                    }) || null;
                 }""",
-                list(self.REQUEST_MODE_BUTTON_CLASSES),
+                mode_labels,
             )
             button = handle.as_element() if handle else None
             if not button:
                 Logger.warning("Perplexity: request mode button was not found.")
                 return False
 
-            current_mode = str(await button.evaluate(read_mode_js) or "").strip()
-            if current_mode == "Search":
+            pressed = await button.evaluate(read_pressed_js)
+            if pressed is False:
+                await button.click(timeout=5000)
+                await asyncio.sleep(0.25)
+                try:
+                    await self.page.keyboard.press("Escape")
+                except Exception:
+                    pass
+
+            current_mode = str(await button.evaluate(read_mode_js, mode_labels) or "").strip()
+            pressed = await button.evaluate(read_pressed_js)
+            if current_mode == "Search" and pressed is not False:
                 return True
 
-            await button.click(timeout=5000)
+            await button.hover(timeout=5000)
             opened_menu = True
-            await self.page.wait_for_selector("div[role='menuitemradio']", timeout=5000)
-            await asyncio.sleep(0.1)
+            try:
+                await self.page.wait_for_selector("div[role='menuitemradio']", timeout=5000)
+            except Exception:
+                await button.click(timeout=5000)
+                await self.page.wait_for_selector("div[role='menuitemradio']", timeout=5000)
+            await asyncio.sleep(0.15)
 
             result = await self.page.evaluate(
                 """() => {
@@ -1665,17 +1834,50 @@ class PerplexityDriver(BaseDriver):
                     const radios = Array.from(document.querySelectorAll("div[role='menuitemradio']"));
                     const target = radios.find((radio) => isVisible(radio) && radioLabel(radio) === 'Search');
                     if (!target) return 'missing';
-                    target.click();
+                    const aria = (target.getAttribute('aria-checked') || '').toLowerCase();
+                    const dataState = (target.getAttribute('data-state') || '').toLowerCase();
+                    if (aria === 'true' || dataState === 'checked') return 'already';
+                    target.dispatchEvent(new MouseEvent('click', {
+                        bubbles: true,
+                        cancelable: true,
+                        view: window
+                    }));
                     return 'clicked';
                 }"""
             )
-            if result != "clicked":
+            if result not in {"already", "clicked"}:
                 Logger.warning("Perplexity: Search request mode option was not found.")
                 return False
 
             await asyncio.sleep(0.2)
-            current_mode = str(await button.evaluate(read_mode_js) or "").strip()
-            if current_mode != "Search":
+            if handle:
+                try:
+                    await handle.dispose()
+                except Exception:
+                    pass
+                handle = await self.page.evaluate_handle(
+                    """(labels) => {
+                        const normalize = (value) => (value || '').toString().replace(/\\s+/g, ' ').trim();
+                        const isVisible = (el) => {
+                            if (!el || !el.getClientRects || el.getClientRects().length === 0) return false;
+                            const style = window.getComputedStyle(el);
+                            return style && style.display !== 'none' && style.visibility !== 'hidden';
+                        };
+                        const buttons = Array.from(document.querySelectorAll('button'));
+                        return buttons.find((button) => {
+                            if (!isVisible(button)) return false;
+                            if ((button.getAttribute('aria-haspopup') || '').toLowerCase() !== 'menu') return false;
+                            const text = normalize(button.textContent).toLowerCase();
+                            return labels.some((label) => text.includes(normalize(label).toLowerCase()));
+                        }) || null;
+                    }""",
+                    mode_labels,
+                )
+                button = handle.as_element() if handle else None
+
+            current_mode = str(await button.evaluate(read_mode_js, mode_labels) or "").strip() if button else ""
+            pressed = await button.evaluate(read_pressed_js) if button else None
+            if current_mode != "Search" or pressed is False:
                 Logger.warning(
                     f"Perplexity: request mode still shows '{current_mode or 'unknown'}' after selecting Search."
                 )
@@ -1704,12 +1906,32 @@ class PerplexityDriver(BaseDriver):
         try:
             capped = await self.page.evaluate(
                 """() => {
+                    const normalize = (value) => (value || '').toString().replace(/\\s+/g, ' ').trim();
+                    const isVisible = (el) => {
+                        if (!el || !el.getClientRects || el.getClientRects().length === 0) return false;
+                        const style = window.getComputedStyle(el);
+                        return style && style.display !== 'none' && style.visibility !== 'hidden';
+                    };
                     const group = Array.from(document.querySelectorAll('div')).find((el) => (
                         el.classList && el.classList.contains('group/file-upload')
                     ));
-                    if (!group) return false;
-                    const cap = group.querySelector("div.col-start-3.ml-sm svg.inline-flex.fill-current.shrink-0");
-                    return !!cap;
+                    const items = Array.from(document.querySelectorAll("[role='menuitem']"));
+                    const uploadItem = (group && group.querySelector("[role='menuitem']"))
+                        || items.find((item) => (
+                            isVisible(item)
+                            && /upload files?( or images)?/i.test(normalize(item.textContent))
+                        ));
+                    if (!uploadItem) return false;
+                    const disabled = (uploadItem.getAttribute('aria-disabled') || '').toLowerCase() === 'true'
+                        || uploadItem.hasAttribute('data-disabled');
+                    if (disabled) return true;
+                    const text = normalize(uploadItem.textContent).toLowerCase();
+                    if (/(limit|upgrade|unavailable|not available)/.test(text)) return true;
+                    const lock = Array.from(uploadItem.querySelectorAll('use')).some((use) => {
+                        const href = (use.getAttribute('href') || use.getAttribute('xlink:href') || '').toString();
+                        return href.includes('pplx-icon-lock');
+                    });
+                    return !!lock;
                 }"""
             )
         finally:
@@ -1718,6 +1940,53 @@ class PerplexityDriver(BaseDriver):
             except Exception:
                 pass
         return bool(capped)
+
+    async def _upload_file_via_tools_menu(self, file_spec: Any) -> bool:
+        if not self.page:
+            return False
+        if not await self._open_tools_menu():
+            return False
+
+        handle = None
+        try:
+            handle = await self.page.evaluate_handle(
+                """() => {
+                    const normalize = (value) => (value || '').toString().replace(/\\s+/g, ' ').trim();
+                    const isVisible = (el) => {
+                        if (!el || !el.getClientRects || el.getClientRects().length === 0) return false;
+                        const style = window.getComputedStyle(el);
+                        return style && style.display !== 'none' && style.visibility !== 'hidden';
+                    };
+                    const items = Array.from(document.querySelectorAll("[role='menuitem']"));
+                    return items.find((item) => (
+                        isVisible(item)
+                        && /upload files?( or images)?/i.test(normalize(item.textContent))
+                    )) || null;
+                }"""
+            )
+            element = handle.as_element() if handle else None
+            if not element:
+                Logger.warning("Perplexity: Upload files or images menu item was not found.")
+                return False
+
+            async with self.page.expect_file_chooser(timeout=6000) as fc_info:
+                await element.click(timeout=3000)
+            chooser = await fc_info.value
+            await chooser.set_files(file_spec)
+            return True
+        except Exception as exc:
+            Logger.warning(f"Perplexity: plus-menu file upload failed: {exc}")
+            return False
+        finally:
+            try:
+                await self.page.keyboard.press("Escape")
+            except Exception:
+                pass
+            if handle:
+                try:
+                    await handle.dispose()
+                except Exception:
+                    pass
 
     async def upload_file(self, file_spec: Any) -> None:
         await self._upload_file(file_spec)
@@ -1770,12 +2039,16 @@ class PerplexityDriver(BaseDriver):
         file_input = self.page.locator(self.FILE_INPUT_SELECTOR)
         try:
             if await file_input.count() == 0:
-                await self.page.wait_for_selector(self.FILE_INPUT_SELECTOR, timeout=6000)
+                try:
+                    await self.page.wait_for_selector(self.FILE_INPUT_SELECTOR, timeout=6000)
+                except Exception:
+                    pass
                 file_input = self.page.locator(self.FILE_INPUT_SELECTOR)
             if await file_input.count() == 0:
-                Logger.warning("Perplexity: file input was not found.")
-                return False
-            await file_input.first.set_input_files(file_spec)
+                if not await self._upload_file_via_tools_menu(file_spec):
+                    return False
+            else:
+                await file_input.first.set_input_files(file_spec)
         except Exception as exc:
             Logger.warning(f"Perplexity: file upload failed: {exc}")
             return False

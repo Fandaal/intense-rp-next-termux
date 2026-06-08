@@ -45,7 +45,7 @@ If **Show the Server Address in Logs** is enabled in **Settings -> API Server ->
 The remote page is intentionally tiny and simple. Right now it can do simple actions like **Stop**, **Restart**, **Hotswap**, **Switch Account**, and **Switch Models** / **Switch Loadouts**, as well as show you live logs + some minor stuff.
 
 ??? info "Hotswap targets"
-    For Hotswap specifically, it shows every provider except the one you're currently using, so Google AI Studio now appears there as well.
+    For Hotswap specifically, it shows every unlocked provider except the one you're currently using. Temporarily locked providers, such as Google AI Studio right now, only appear if **Ignore Provider Locks** is enabled.
 
 ??? info "Switch Models vs Switch Loadouts"
     If **Loadouts** are enabled, Remote Control uses **Switch Loadouts** instead of **Switch Models**, because the selected model is part of the active loadout. If Loadouts are disabled, providers that support direct model switching still show **Switch Models**.

@@ -14,6 +14,7 @@ These controls are spread across a few of the newer Settings sections:
 
 - :material-arrow-right: **Settings** → **Provider and Login** → **Saved Sessions** (profiles + session cleanup)
 - :material-arrow-right: **Settings** → **Provider and Login** → **Browser Environment** (locale + optional timezone override)
+- :material-arrow-right: **Settings** → **Advanced** → **Provider Stability** (provider locks + crash warnings)
 - :material-arrow-right: **Settings** → **Advanced** → **Config Storage** (config directory location)
 - :material-arrow-right: **Settings** → **Interface** → **Main Window** / **Updates** (queue panel, hotswap button, version checks)
 - :material-arrow-right: **Settings** → **Logs and Troubleshooting** → **Logging Levels** (per-target log severity)
@@ -61,6 +62,19 @@ This is intentionally a best-effort hint. Locale can help with providers that ot
 
 !!! note "Practical recommendation"
     Keeping the locale on **English (en-US)** is pretty reasonable for IntenseRP, because **all** drivers currently expect English UI text anyway. The timezone override is more situational, so it's left off by default.
+
+---
+
+## :material-lock-alert: Provider Locks
+
+Provider locks are temporary safety blocks for providers that are implemented, but currently known to fail in a way that makes normal automation misleading or unusable.
+
+:material-arrow-right: **Settings** -> **Advanced** -> **Provider Stability** -> **Ignore Provider Locks**
+
+Right now, this mainly affects **Google AI Studio**. AI Studio currently appears to detect Patchright/automated browser sessions and can prevent IntenseRP from sending messages at all. With the lock active, AI Studio stays configurable under **Provider Behavior**, but it is hidden from normal provider selection and blocked in API routing.
+
+!!! warning "The override is not a fix"
+    **Ignore Provider Locks** only bypasses IntenseRP's safety lock. It does not make the provider more automation-friendly. Use it only when you are sure your setup can send messages from that provider without issues.
 
 ---
 

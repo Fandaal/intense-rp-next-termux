@@ -10,7 +10,7 @@ from moonshot_driver import MoonshotDriver
 from perplexity_driver import PerplexityDriver
 from qwen_driver import QwenLMDriver
 from drivers.base_driver import BaseDriver
-from drivers.providers import DriverProvider
+from drivers.providers import DriverProvider, is_provider_locked, provider_lock_reason
 from utils.logger import Logger
 
 
@@ -55,6 +55,10 @@ def create_driver(config_manager: Any) -> BaseDriver:
     if provider is None:
         Logger.warning(f"Unknown driver provider '{provider_setting}', falling back to DeepSeek.")
         provider = DriverProvider.DEEPSEEK
+    elif is_provider_locked(provider, config_manager):
+        reason = provider_lock_reason(provider) or f"{provider.value} is currently locked."
+        Logger.warning(f"Selected provider is locked: {reason}")
+        raise RuntimeError(reason)
 
     Logger.info(f"Selected driver provider: {provider.value}")
     return create_driver_for_provider(config_manager, provider)

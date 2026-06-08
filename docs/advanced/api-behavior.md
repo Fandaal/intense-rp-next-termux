@@ -117,6 +117,9 @@ HuggingChat can also accept HuggingChat-only request fields such as `inference_p
 
 Google AI Studio model IDs are also behavior presets:
 
+!!! warning "Temporarily locked by default"
+    AI Studio model IDs are only exposed and routed when Google AI Studio is unlocked. By default, IntenseRP blocks them because AI Studio currently appears to detect Patchright/automated browser sessions and can prevent automated sends.
+
 | Model ID | Thinking Level | Send Thinking |
 |---|---|---|
 | `aistudio-auto` | Uses your settings | Uses your settings |
@@ -147,8 +150,8 @@ Top-level `reasoning_effort` wins if both are present.
 
 When this compatibility setting is enabled, **Reasoning Effort Providers** controls where it applies. For selected providers, the resolved effort takes priority over the reasoning part of the `model` ID for that request. Providers left unchecked ignore the request field and keep using the model ID suffix, Provider Behavior settings, or loadout values.
 
-!!! tip "Recommend to leave only AIStudio enabled"
-     AI Studio is the only provider so far with a built-in reasoning effort parameter, so it benefits the most from this setting. For other providers, the API effort is just a toggle that turns reasoning on or off based on the value sent.
+!!! tip "AI Studio benefits most when it is unlocked"
+     AI Studio is the only provider so far with a built-in reasoning effort parameter, so it benefits the most from this setting when you are deliberately using it. For other providers, the API effort is just a toggle that turns reasoning on or off based on the value sent.
 
 For most providers, effort values are simplified into the existing reasoning toggle:
 

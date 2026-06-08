@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from drivers.providers import DriverProvider
+from drivers.providers import DriverProvider, is_provider_locked
 
 
 PARALLEL_PROVIDER_FIELD_BY_PROVIDER: dict[DriverProvider, str] = {
@@ -52,6 +52,16 @@ def is_parallel_request_queue_feature_enabled(config_manager: Any) -> bool:
         return False
 
 
+def _get_effective_bool_setting(config_manager: Any, category: str, field: str) -> bool:
+    getter = getattr(config_manager, "get_effective_setting", None)
+    try:
+        if callable(getter):
+            return bool(getter(category, field))
+        return bool(config_manager.get_setting(category, field))
+    except Exception:
+        return False
+
+
 def is_full_parallelization_feature_enabled(config_manager: Any) -> bool:
     try:
         return bool(config_manager.get_setting("experimental", "full_parallelization"))
@@ -79,12 +89,9 @@ def get_parallel_selected_providers(config_manager: Any) -> list[DriverProvider]
         if not field_key:
             continue
 
-        try:
-            enabled = bool(config_manager.get_setting("experimental", field_key))
-        except Exception:
-            enabled = False
+        enabled = _get_effective_bool_setting(config_manager, "experimental", field_key)
 
-        if enabled:
+        if enabled and not is_provider_locked(provider, config_manager):
             selected.append(provider)
 
     return selected

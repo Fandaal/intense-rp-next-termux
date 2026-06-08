@@ -8,6 +8,21 @@ This page covers the toggles and options that control how IntenseRP interacts wi
 
 ---
 
+## :material-lock-alert: Temporary Provider Lock
+
+Google AI Studio is temporarily locked by default.
+
+AI Studio currently appears to detect Patchright/automated browser sessions, which can leave IntenseRP unable to send messages there at all. The driver and settings are still kept in place, but IntenseRP hides AI Studio from normal provider selection and blocks AI Studio routing while the lock is active.
+
+You can still configure the settings on this page. To deliberately try AI Studio anyway, enable:
+
+:material-arrow-right: **Settings** -> **Advanced** -> **Provider Stability** -> **Ignore Provider Locks**
+
+!!! warning "Only bypass this if you know your setup works"
+    The override does not fix AI Studio detection. It only tells IntenseRP to ignore the safety lock and try launching/routing to AI Studio anyway.
+
+---
+
 ## :material-tune: Modes (model IDs)
 
 In IntenseRP Next v2, the `model` you select in SillyTavern is still mostly a **behavior preset**, not a true AI Studio model picker.

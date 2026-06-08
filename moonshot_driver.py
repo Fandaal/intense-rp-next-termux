@@ -37,6 +37,7 @@ class MoonshotDriver(BaseDriver):
     REGEN_ROUTE_GLOB = "**/apiv2/kimi.gateway.chat.v1.ChatService/RegenerateMessage*"
     USER_SETTINGS_ROUTE_GLOB = "**/apiv2/kimi.usersetting.v1.UserSettingService/GetUserSetting*"
     USER_SETTINGS_UPDATE_URL = "https://www.kimi.com/apiv2/kimi.usersetting.v1.UserSettingService/UpdateUserSetting"
+    NEW_CHAT_URL = "https://www.kimi.com/?chat_enter_method=new_chat"
     AUTH_HOST_MARKER = "accounts.google.com"
     MEMORY_DISABLE_UPDATE_PAYLOAD = {
         "user_setting": {"memory": {}},
@@ -431,7 +432,6 @@ class MoonshotDriver(BaseDriver):
             return ""
 
         selectors = [
-            "aside.sidebar span.user-name",
             "div.user-info-container span.user-name",
             "span.user-name",
         ]
@@ -474,7 +474,22 @@ class MoonshotDriver(BaseDriver):
     async def _read_auth_state(self) -> str:
         if await self._login_modal_visible():
             return "signed_out"
-        return self._classify_user_name(await self._read_user_name())
+
+        user_state = self._classify_user_name(await self._read_user_name())
+        if user_state != "unknown":
+            return user_state
+
+        editor = await self._find_first_visible(
+            [
+                "div.chat-input-editor[contenteditable='true']",
+                "div.chat-input-editor[contenteditable]",
+            ],
+            timeout_ms=0,
+        )
+        if editor is not None:
+            return "signed_in"
+
+        return "unknown"
 
     async def _is_logged_in(self) -> bool:
         return (await self._read_auth_state()) == "signed_in"
@@ -913,8 +928,6 @@ class MoonshotDriver(BaseDriver):
         if not self.page:
             return
 
-        await self.set_sidebar_status(open=True)
-
         settled_auth_state = await self._wait_for_auth_state(timeout_ms=self.AUTH_STATE_SETTLE_TIMEOUT_MS)
         if settled_auth_state == "signed_in":
             Logger.info("Moonshot: already signed in.")
@@ -934,7 +947,6 @@ class MoonshotDriver(BaseDriver):
 
         user_info_container = await self._find_first_visible(
             [
-                "aside.sidebar div.user-info-container",
                 "div.user-info-container",
             ],
             timeout_ms=15000,
@@ -1231,7 +1243,6 @@ class MoonshotDriver(BaseDriver):
         try:
             await self._click_new_chat()
             await asyncio.sleep(0.4)
-            await self.set_sidebar_status(open=False)
         except Exception as e:
             Logger.warning(
                 f"Moonshot: auto-delete skipped because a replacement chat could not be prepared: {e}"
@@ -1259,7 +1270,7 @@ class MoonshotDriver(BaseDriver):
             return False
 
         auth_state = await self._wait_for_auth_state(timeout_ms=self.AUTH_STATE_SETTLE_TIMEOUT_MS)
-        if auth_state != "signed_in":
+        if auth_state == "signed_out":
             Logger.warning("Multi-Slot Cache (Moonshot): cached chat URL is not available for the active session.")
             return False
 
@@ -1273,11 +1284,6 @@ class MoonshotDriver(BaseDriver):
         if editor is None:
             Logger.warning("Multi-Slot Cache (Moonshot): chat editor did not become ready.")
             return False
-
-        try:
-            await self.set_sidebar_status(open=False)
-        except Exception:
-            pass
 
         return True
 
@@ -1514,9 +1520,6 @@ class MoonshotDriver(BaseDriver):
                     "send_as_text_file": bool(send_as_text_file),
                 },
             )
-            # Kimi's composer controls are flaky while the sidebar is open.
-            await self.set_sidebar_status(open=False)
-
             clean_regeneration = bool(self.config_manager.get_setting("moonshot_behavior", "clean_regeneration"))
             multi_slot_cache_enabled = bool(
                 clean_regeneration
@@ -1587,7 +1590,6 @@ class MoonshotDriver(BaseDriver):
                 Logger.info("Moonshot: preparing new chat session...")
                 await self._click_new_chat()
                 await asyncio.sleep(0.4)
-                await self.set_sidebar_status(open=False)
 
                 await self.set_deepthink_state(effective_deepthink)
                 await self.set_search_state(enable_search)
@@ -2167,31 +2169,6 @@ class MoonshotDriver(BaseDriver):
         if after != state:
             Logger.warning(f"Moonshot: Search state mismatch after toggle (wanted={state}, actual={after}).")
 
-    async def _is_sidebar_open(self) -> Optional[bool]:
-        if not self.page:
-            return None
-
-        app = self.page.locator("div.app.has-sidebar")
-        app_count = await app.count()
-        for idx in range(min(app_count, 5)):
-            candidate = app.nth(idx)
-            try:
-                if not await candidate.is_visible():
-                    continue
-            except Exception:
-                continue
-
-            class_attr = await candidate.get_attribute("class") or ""
-            classes = set(class_attr.split())
-            return "fold" in classes
-
-        if app_count > 0:
-            class_attr = await app.first.get_attribute("class") or ""
-            classes = set(class_attr.split())
-            return "fold" in classes
-
-        return None
-
     async def _wait_for_locator_count(
         self,
         locator,
@@ -2305,87 +2282,33 @@ class MoonshotDriver(BaseDriver):
             await asyncio.sleep(max(0.05, float(poll_interval_s)))
 
     async def set_sidebar_status(self, open: bool):
-        if not self.page:
-            return
-
-        target_open = bool(open)
-
-        for _ in range(3):
-            is_open = await self._is_sidebar_open()
-            if is_open == target_open:
-                return
-
-            if target_open:
-                button = await self._find_first_visible(
-                    [
-                        "div.expand-btn:has(svg[name='LeftBar'])",
-                    ],
-                    timeout_ms=1500,
-                )
-                if button is None:
-                    Logger.warning("Moonshot: open sidebar button not found.")
-                    return
-            else:
-                button = await self._find_first_visible(
-                    [
-                        "aside.sidebar div.sidebar-header div.expand-btn:has(svg[name='LeftBar'])",
-                        "div.expand-btn:has(svg[name='LeftBar'])",
-                    ],
-                    timeout_ms=1500,
-                )
-                if button is None:
-                    # Fallback: Escape often closes slide panels in Kimi
-                    try:
-                        await self.page.keyboard.press("Escape")
-                    except Exception:
-                        pass
-                    await asyncio.sleep(0.1)
-                    continue
-
-            try:
-                await button.click(timeout=2000)
-            except Exception as e:
-                action = "open" if target_open else "close"
-                Logger.warning(f"Moonshot: failed to {action} sidebar: {e}")
-                return
-
-            deadline = time.time() + 2.0
-            while time.time() < deadline:
-                state_now = await self._is_sidebar_open()
-                if state_now == target_open:
-                    return
-                await asyncio.sleep(0.1)
-
-        final_state = await self._is_sidebar_open()
-        if final_state != target_open:
-            Logger.warning(
-                f"Moonshot: sidebar state mismatch after toggle "
-                f"(wanted_open={target_open}, is_open={final_state})."
-            )
+        _ = open
 
     async def click_new_chat(self, source: str = "auto"):
         _ = source
-        await self.set_sidebar_status(open=True)
-        new_chat_button = await self._find_first_visible(
-            [
-                "aside.sidebar div.sidebar-new-chat a.new-chat-btn",
-                "aside.sidebar a.new-chat-btn[href*='chat_enter_method=new_chat']",
-                "aside.sidebar a[href*='chat_enter_method=new_chat']:has-text('New Chat')",
-            ],
-            timeout_ms=8000,
-        )
-        if new_chat_button is None:
-            Logger.warning("Moonshot: New Chat button not found.")
-            await self.set_sidebar_status(open=False)
+        if not self.page:
             return
 
         try:
-            await new_chat_button.click(timeout=2000)
+            await self.page.goto(self.NEW_CHAT_URL, wait_until="domcontentloaded", timeout=45000)
         except Exception as e:
-            Logger.warning(f"Moonshot: failed to click New Chat: {e}")
-        finally:
-            await asyncio.sleep(0.1)
-            await self.set_sidebar_status(open=False)
+            Logger.warning(f"Moonshot: failed to open New Chat URL: {e}")
+            return
+
+        auth_state = await self._wait_for_auth_state(timeout_ms=self.AUTH_STATE_SETTLE_TIMEOUT_MS)
+        if auth_state == "signed_out":
+            Logger.warning("Moonshot: New Chat URL is not available for the active session.")
+            return
+
+        editor = await self._find_first_visible(
+            [
+                "div.chat-input-editor[contenteditable='true']",
+                "div.chat-input-editor[contenteditable]",
+            ],
+            timeout_ms=60000,
+        )
+        if editor is None:
+            Logger.warning("Moonshot: new chat editor did not become ready.")
 
     async def enter_message(self, message: str):
         await self._enter_message(message)
@@ -2394,8 +2317,6 @@ class MoonshotDriver(BaseDriver):
         await self._send_message(timeout=timeout)
 
     async def _enter_message(self, message: str):
-        await self.set_sidebar_status(open=False)
-
         editor = await self._find_first_visible(
             [
                 "div.chat-input-editor[contenteditable='true']",

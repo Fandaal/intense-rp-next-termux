@@ -101,7 +101,12 @@ class ProviderTile(QFrame):
 class HotswapDialog(QDialog):
     """Small modal that lets the user pick one of the other providers."""
 
-    def __init__(self, current_provider: str, parent=None):
+    def __init__(
+        self,
+        current_provider: str,
+        parent=None,
+        providers: list[str] | None = None,
+    ):
         super().__init__(parent)
         self._selected: Optional[str] = None
 
@@ -154,7 +159,8 @@ class HotswapDialog(QDialog):
         )
         layout.addWidget(desc)
 
-        others = [p for p in ALL_PROVIDERS if p != current_provider]
+        provider_names = providers if providers is not None else ALL_PROVIDERS
+        others = [p for p in provider_names if p != current_provider]
         tile_grid = QGridLayout()
         tile_grid.setContentsMargins(0, 0, 0, 0)
         tile_grid.setHorizontalSpacing(12)

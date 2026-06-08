@@ -13,7 +13,7 @@ from typing import List, Optional, Dict, Any, Callable, Literal, Union
 
 from drivers.base_driver import BaseDriver
 from drivers.parallel_manager import ParallelDriversManager
-from drivers.providers import DriverProvider
+from drivers.providers import DriverProvider, is_provider_locked, provider_lock_reason
 from remote_control import RemoteControlActions, RemoteControlWeb
 from utils.ip_utils import is_ip_address_allowed
 from utils.logger import Logger
@@ -742,6 +742,14 @@ class API:
     def _get_default_provider(self) -> DriverProvider:
         return self._get_default_slot().provider
 
+    def _ensure_provider_unlocked(self, provider: DriverProvider) -> None:
+        cfg = getattr(self.driver, "config_manager", None)
+        if not is_provider_locked(provider, cfg):
+            return
+
+        detail = provider_lock_reason(provider) or f"{provider.value} is currently locked."
+        raise HTTPException(status_code=403, detail=detail)
+
     @staticmethod
     def _slot_can_handle_request_model(slot: RuntimeExecutionSlot, model: Any) -> bool:
         checker = getattr(slot.driver, "can_handle_request_model", None)
@@ -761,6 +769,7 @@ class API:
         provider: DriverProvider,
         model: Any = None,
     ) -> RuntimeExecutionSlot:
+        self._ensure_provider_unlocked(provider)
         all_slots = self._get_execution_slots_for_provider(provider)
         if not all_slots:
             raise KeyError(f"No execution slot is registered for provider: {provider.value}")
@@ -814,17 +823,35 @@ class API:
 
     def _resolve_request_provider(self, model: Any) -> DriverProvider:
         if not self._is_multi_provider_runtime():
-            return self._get_default_provider()
+            provider = self._get_default_provider()
+            self._ensure_provider_unlocked(provider)
+            return provider
 
         cfg = getattr(self.driver, "config_manager", None)
+        runtime_providers = list(self._drivers_by_provider.keys())
+        unlocked_runtime_providers = [
+            provider for provider in runtime_providers if not is_provider_locked(provider, cfg)
+        ]
+        locked_runtime_providers = [
+            provider for provider in runtime_providers if is_provider_locked(provider, cfg)
+        ]
         real_model_labels_by_provider = self._get_api_real_model_labels_by_provider()
         provider = resolve_parallel_provider_from_model_id(
             model,
-            list(self._drivers_by_provider.keys()),
+            unlocked_runtime_providers,
             config_manager=cfg,
             real_model_labels_by_provider=real_model_labels_by_provider,
         )
         if provider is None:
+            locked_provider = resolve_parallel_provider_from_model_id(
+                model,
+                locked_runtime_providers,
+                config_manager=cfg,
+                real_model_labels_by_provider=real_model_labels_by_provider,
+            )
+            if locked_provider is not None:
+                self._ensure_provider_unlocked(locked_provider)
+
             real_model_detail = ""
             if is_umm_enabled(cfg):
                 real_model_detail = (
@@ -849,6 +876,7 @@ class API:
                 detail=f"Provider `{provider.value}` is not enabled in Providers in Parallel.",
             )
 
+        self._ensure_provider_unlocked(provider)
         return provider
 
     def _resolve_request_slot(self, model: Any) -> RuntimeExecutionSlot:
@@ -1393,7 +1421,17 @@ class API:
             self._authorize_request(raw_request)
 
             cfg = getattr(self.driver, "config_manager", None)
-            runtime_providers = list(self._drivers_by_provider.keys()) or [DriverProvider.DEEPSEEK]
+            all_runtime_providers = list(self._drivers_by_provider.keys()) or [DriverProvider.DEEPSEEK]
+            runtime_providers = [
+                provider
+                for provider in all_runtime_providers
+                if not is_provider_locked(provider, cfg)
+            ]
+            if not runtime_providers:
+                return {
+                    "object": "list",
+                    "data": [],
+                }
 
             if self._is_multi_provider_runtime():
                 model_data = []

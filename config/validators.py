@@ -38,7 +38,7 @@ def validate_email(value: str):
         return
 
     # Simple regex for email validation
-    pattern = r"^[\w\.-]+@[\w\.-]+\.\w+$"
+    pattern = r"^[\w\.+-]+@[\w\.-]+\.\w+$"
     if not re.match(pattern, value):
         raise ValueError("Invalid email address format.")
 

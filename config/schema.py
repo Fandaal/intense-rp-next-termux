@@ -1442,6 +1442,21 @@ SCHEMA = [
                 default=None,
             ),
             SettingField(
+                key="provider_lock_warning",
+                label="AI Studio is temporarily locked",
+                type=SettingType.HINT,
+                default=(
+                    "AI Studio currently detects Patchright/automated browsers and blocks "
+                    "automated message sends. You can still configure these settings, but "
+                    "IntenseRP will not launch or route to AI Studio unless Advanced -> "
+                    "Provider Stability -> Ignore Provider Locks is enabled."
+                ),
+                tooltip=None,
+                hint_variant="warn",
+                docs_path=DOCS_AISTUDIO,
+                docs_anchor="temporary-provider-lock",
+            ),
+            SettingField(
                 key="model",
                 label="Model",
                 type=SettingType.DROPDOWN,
@@ -2019,6 +2034,34 @@ SCHEMA = [
                 tooltip="Show a notification when the provider browser is closed or crashes unexpectedly.",
             ),
             SettingField(
+                key="ignore_provider_locks",
+                label="Ignore Provider Locks",
+                type=SettingType.BOOLEAN,
+                default=False,
+                tooltip=(
+                    "Allow temporarily locked providers to appear in provider selectors "
+                    "and launch anyway. Only enable this if you are sure your setup can "
+                    "use the locked provider without breaking requests."
+                ),
+                docs_path=DOCS_SYSTEM,
+                docs_anchor="provider-locks",
+            ),
+            SettingField(
+                key="ignore_provider_locks_warning",
+                label="Locked providers may fail hard",
+                type=SettingType.HINT,
+                default=(
+                    "This bypasses provider safety locks. Right now that mainly means "
+                    "Google AI Studio, which may detect automated browsers and prevent "
+                    "messages from sending at all."
+                ),
+                tooltip=None,
+                hint_variant="warn",
+                visible_depends="system_settings.ignore_provider_locks",
+                docs_path=DOCS_SYSTEM,
+                docs_anchor="provider-locks",
+            ),
+            SettingField(
                 key="config_storage_divider",
                 label="Config Storage",
                 type=SettingType.DIVIDER,
@@ -2351,10 +2394,13 @@ SCHEMA = [
                 label="Google AI Studio",
                 type=SettingType.BOOLEAN,
                 default=False,
-                tooltip="Include Google AI Studio in the parallel browser pool.",
+                tooltip=(
+                    "Include Google AI Studio in the parallel browser pool. AI Studio is "
+                    "temporarily locked unless Ignore Provider Locks is enabled."
+                ),
                 visible_depends="experimental.providers_in_parallel",
-                depends="providers_credentials.provider!=Google AI Studio",
-                force_when_dep_unmet=True,
+                depends="system_settings.ignore_provider_locks&&providers_credentials.provider!=Google AI Studio",
+                force_when_dep_unmet=False,
                 docs_path=DOCS_PROVIDERS_IN_PARALLEL,
             ),
             SettingField(
@@ -2364,8 +2410,8 @@ SCHEMA = [
                 default=1,
                 tooltip="How many Google AI Studio account/profile lanes to launch when Full Parallelization is enabled.",
                 validator=validate_integer_range(1, 32, label="Google AI Studio instances"),
-                visible_depends="experimental.full_parallelization&&experimental.parallel_enable_aistudio",
-                depends="experimental.full_parallelization&&experimental.parallel_enable_aistudio",
+                visible_depends="system_settings.ignore_provider_locks&&experimental.full_parallelization&&experimental.parallel_enable_aistudio",
+                depends="system_settings.ignore_provider_locks&&experimental.full_parallelization&&experimental.parallel_enable_aistudio",
                 force_when_dep_unmet=1,
                 docs_path=DOCS_FULL_PARALLELIZATION,
             ),
@@ -2991,7 +3037,11 @@ SETTINGS_CARDS = {
     "provider_stability": SettingCard(
         key="provider_stability",
         title="Provider Stability",
-        field_refs=[("system_settings", "notify_on_driver_crash")],
+        field_refs=[
+            ("system_settings", "notify_on_driver_crash"),
+            ("system_settings", "ignore_provider_locks"),
+            ("system_settings", "ignore_provider_locks_warning"),
+        ],
     ),
     "config_storage": SettingCard(
         key="config_storage",
@@ -3071,7 +3121,7 @@ PROVIDER_BEHAVIOR_GROUPS = {
         {"title": "Quirks", "icon": "bug.svg", "fields": ["completion_request_timeout", "first_chunk_timeout", "model_apply_timeout", "post_action_delay"]},
     ],
     "aistudio_behavior": [
-        {"title": "Core", "icon": "settings.svg", "fields": ["model", "enable_deepthink", "thinking_level", "send_deepthink"]},
+        {"title": "Core", "icon": "settings.svg", "fields": ["provider_lock_warning", "model", "enable_deepthink", "thinking_level", "send_deepthink"]},
         {"title": "Tools and Uploads", "icon": "upload.svg", "fields": ["enable_search", "enable_url_context", "use_system_prompt_field", "send_as_text_file", "text_file_message", "file_upload_timeout"]},
         {"title": "Filtering", "icon": "shield-ban.svg", "fields": ["anti_censorship", "caars_enabled", "caars_savior_model", "anti_censorship_replacement_message", "anti_censorship_continue_nudge"]},
         {"title": "Sampling", "icon": "sliders-horizontal.svg", "fields": ["temperature", "top_p", "max_output_tokens"]},

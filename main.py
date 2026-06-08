@@ -19,7 +19,7 @@ from PySide6.QtGui import QPixmap, QDesktopServices, QIcon
 import qasync
 
 from drivers.factory import create_driver
-from drivers.providers import DriverProvider, provider_options
+from drivers.providers import DriverProvider, is_provider_locked, provider_lock_reason, provider_options
 from api import API
 from config.manager import ConfigManager
 from config.loadouts import get_behavior_category_for_provider, get_loadout_field_defs
@@ -906,7 +906,14 @@ class MainWindow(QMainWindow):
         current = self.config_manager.get_setting("providers_credentials", "provider") or "DeepSeek"
         current_provider = DriverProvider.from_setting(current)
         current_value = current_provider.value if current_provider else "DeepSeek"
-        return [provider_name for provider_name in provider_options() if provider_name != current_value]
+        return [
+            provider_name
+            for provider_name in provider_options(
+                include_locked=False,
+                config_manager=self.config_manager,
+            )
+            if provider_name != current_value
+        ]
 
     def _get_remote_model_switch_provider(self) -> DriverProvider:
         current = self.config_manager.get_setting("providers_credentials", "provider") or "DeepSeek"
@@ -2432,6 +2439,20 @@ class MainWindow(QMainWindow):
             port = 7777
         return f"Running (Port {port})"
 
+    def _reset_start_controls_to_idle(self) -> None:
+        self.start_button.setText("Start")
+        self.start_button.apply_icon(IconType.START, BrandColors.TEXT_PRIMARY)
+        self.start_button.setEnabled(True)
+        self.start_button.set_chevron_visible(False)
+        self._sync_hotswap_button()
+        self._update_tray_menu_state()
+
+    def _show_provider_locked_notice(self, provider: DriverProvider) -> None:
+        reason = provider_lock_reason(provider) or f"{provider.value} is currently locked."
+        Logger.warning(f"Provider locked: {reason}")
+        self._update_status(f"{provider.value} is locked", "warning")
+        self._notify_user("Provider Locked", reason, level="warning")
+
     async def _restart_runtime_providers_impl(
         self,
         providers,
@@ -2793,7 +2814,11 @@ class MainWindow(QMainWindow):
 
     def _on_hotswap(self):
         current = self.config_manager.get_setting("providers_credentials", "provider") or "DeepSeek"
-        dialog = HotswapDialog(current, parent=self)
+        dialog = HotswapDialog(
+            current,
+            parent=self,
+            providers=self._get_hotswap_targets(),
+        )
         if dialog.exec() != HotswapDialog.Accepted:
             return
         new_provider = dialog.selected_provider
@@ -2807,6 +2832,9 @@ class MainWindow(QMainWindow):
         normalized_provider = DriverProvider.from_setting(new_provider)
         if normalized_provider is None:
             raise ValueError(f"Unknown provider: {new_provider}")
+        if is_provider_locked(normalized_provider, self.config_manager):
+            self._show_provider_locked_notice(normalized_provider)
+            return
 
         target_provider = normalized_provider.value
         if target_provider == current:
@@ -3492,11 +3520,27 @@ class MainWindow(QMainWindow):
                 self._update_tray_menu_state()
                 return
 
+            current_provider = get_current_provider(self.config_manager)
+            if is_provider_locked(current_provider, self.config_manager):
+                self._show_provider_locked_notice(current_provider)
+                self._reset_start_controls_to_idle()
+                return
+
             required_providers = (
                 get_parallel_selected_providers(self.config_manager)
                 if bool(self.config_manager.get_setting("experimental", "providers_in_parallel"))
-                else [get_current_provider(self.config_manager)]
+                else [current_provider]
             )
+            locked_required_providers = [
+                provider
+                for provider in required_providers
+                if is_provider_locked(provider, self.config_manager)
+            ]
+            if locked_required_providers:
+                self._show_provider_locked_notice(locked_required_providers[0])
+                self._reset_start_controls_to_idle()
+                return
+
             if not self._validate_runtime_loadouts(providers=required_providers):
                 self.start_button.setText("Start")
                 self.start_button.apply_icon(IconType.START, BrandColors.TEXT_PRIMARY)

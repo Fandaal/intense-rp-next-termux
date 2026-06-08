@@ -23,6 +23,7 @@ After you enable it, you also get per-provider toggles right under that setting.
 
 - The **current provider** is always forced on.
 - The other toggles let you choose which other providers you want to keep alive in parallel.
+- Temporarily locked providers, such as Google AI Studio right now, stay forced off unless **Ignore Provider Locks** is enabled under **Advanced** -> **Provider Stability**.
 - If you also want requests themselves to overlap, turn on **Parallelize API Request Queue** after this.
 - If you also want multiple account-backed instances for the same provider, turn on **Full Parallelization** after the queue mode.
 - Changes only apply after you **restart the browser** with **Stop -> Start**.
@@ -54,7 +55,7 @@ While this mode is active, routing is done by the **provider-prefixed model IDs*
 - `qwen-auto` / `qwen-chat` / `qwen-reasoner`
 - `perplexity-auto` / `perplexity-chat` / `perplexity-reasoner`
 - `huggingchat-auto` / `huggingchat-chat` / `huggingchat-reasoner`
-- `aistudio-auto` / `aistudio-chat` / `aistudio-reasoner`
+- `aistudio-auto` / `aistudio-chat` / `aistudio-reasoner` (only when AI Studio is unlocked)
 
 `GET /v1/models` returns the variants for every enabled provider.
 

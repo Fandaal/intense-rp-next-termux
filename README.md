@@ -66,7 +66,7 @@ And it's done! It should Just Work™️.
 IntenseRP Next v2 (sometimes shortened to "IRP Next v2") is a local bridge between:
 
 - an OpenAI-style client (like SillyTavern), and
-- a supported provider web app (DeepSeek, GLM Chat, Kimi / Moonshot, QwenLM, Perplexity, HuggingChat, or Google AI Studio)
+- a supported provider web app (DeepSeek, GLM Chat, Kimi / Moonshot, QwenLM, Perplexity, or HuggingChat; Google AI Studio is temporarily locked by default)
 
 Under the hood it:
 
@@ -178,7 +178,7 @@ Once the app says **Running (Port 7777)**:
 | Endpoint | `http://127.0.0.1:7777/v1` |
 | API | OpenAI-compatible chat or text completions |
 | API key | Leave blank (unless you enabled API keys) |
-| Model | Provider model IDs like `deepseek-*`, `glm-*`, `moonshot-*`, `qwen-*`, `perplexity-*`, `huggingchat-*`, or `aistudio-*` |
+| Model | Provider model IDs like `deepseek-*`, `glm-*`, `moonshot-*`, `qwen-*`, `perplexity-*`, or `huggingchat-*` |
 
 Available model IDs (depends on provider):
 
@@ -209,7 +209,7 @@ Available model IDs (depends on provider):
   - `huggingchat-auto` (uses your IntenseRP settings)
   - `huggingchat-chat` (uses HuggingChat's default/off behavior)
   - `huggingchat-reasoner` (enables HuggingChat Thinking where available)
-- Google AI Studio:
+- Google AI Studio (only when **Ignore Provider Locks** is enabled):
   - `aistudio-auto` (uses your IntenseRP settings)
   - `aistudio-chat` (forces Thinking off, Send Thinking off)
   - `aistudio-reasoner` (forces Thinking on, Send Thinking follows your setting)
@@ -258,7 +258,7 @@ Current supported providers:
 | <img src=".github/svgs/providers/qwen.svg" width="18" alt=""> **QwenLM** | Stable | Thinking, Web Search, model selection, token counting, and uploads |
 | <img src=".github/svgs/providers/perplexity.svg" width="18" alt=""> **Perplexity** | Verification | Model selection, Thinking/Search controls, uploads, and email-code login |
 | <img src=".github/svgs/providers/huggingface.svg" width="18" alt=""> **HuggingChat** | Early integration | Model/provider selection, Thinking Effort, Exa search, uploads, and tight monthly credits |
-| <img src=".github/svgs/providers/aistudio.svg" width="18" alt=""> **Google AI Studio** | Verification | Gemini model selection, Thinking Level, grounding tools, uploads, and safety controls |
+| <img src=".github/svgs/providers/aistudio.svg" width="18" alt=""> **Google AI Studio** | Temporarily locked | Driver/settings remain available; launch/routing requires **Ignore Provider Locks** |
 
 More detail lives in `docs/` (best viewed as the docs site - see below).
 

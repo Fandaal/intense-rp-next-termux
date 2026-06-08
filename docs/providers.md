@@ -51,7 +51,7 @@ Each provider has its own Behavior page because the web UIs don't all expose the
 
 -   :providers-aistudio: **Google AI Studio Behavior**
 
-    Gemini model selection, Thinking Level, Search grounding, URL Context, uploads, sampling, and safety controls.
+    Gemini model selection, Thinking Level, Search grounding, URL Context, uploads, sampling, and safety controls. Temporarily locked by default.
 
     [:arrow_right: Open AI Studio](providers/aistudio-behavior.md)
 
@@ -69,7 +69,7 @@ Each provider has its own Behavior page because the web UIs don't all expose the
 | **QwenLM** | You need Qwen Thinking, Web Search, model selection, token counting, file uploads, or guardrail behavior. |
 | **Perplexity** | You use Perplexity's model picker, Thinking/Search behavior, uploads, or email-code login. |
 | **HuggingChat** | You need model/provider selection, Thinking Effort, Exa search, uploads, or help with monthly credit limits. |
-| **Google AI Studio** | You need Gemini model selection, Thinking Level, grounding tools, upload behavior, safety sliders, or paid-model access notes. |
+| **Google AI Studio** | You need to configure AI Studio behavior while it is temporarily locked, or you are intentionally using **Ignore Provider Locks**. |
 
 Provider docs are intentionally a little more detailed than the overview pages, though they're still focused on practical user-facing info, as I wanted to avoid dumping too much technicalities into the main flow. If you want to understand more about how a provider integration works under the hood, you're going to have to dig through the code or ask in the community.
 

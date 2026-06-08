@@ -3,7 +3,7 @@ from __future__ import annotations
 from enum import Enum
 from pathlib import Path
 import re
-from typing import Optional
+from typing import Any, Optional
 
 
 class DriverProvider(str, Enum):
@@ -120,13 +120,72 @@ PROVIDER_BEHAVIOR_CATEGORY_KEYS: dict[DriverProvider, str] = {
     DriverProvider.AI_STUDIO: "aistudio_behavior",
 }
 
+PROVIDER_LOCK_OVERRIDE_CATEGORY = "system_settings"
+PROVIDER_LOCK_OVERRIDE_FIELD = "ignore_provider_locks"
+
+PROVIDER_LOCK_REASONS: dict[DriverProvider, str] = {
+    DriverProvider.AI_STUDIO: (
+        "Google AI Studio is temporarily locked because AI Studio currently detects "
+        "Patchright/automated browsers and blocks automated message sends. You can "
+        "still configure AI Studio settings, or enable Advanced -> Provider Stability "
+        "-> Ignore Provider Locks if you are sure your setup can use it safely."
+    ),
+}
+
 
 def get_provider_behavior_category_key(provider: DriverProvider) -> str | None:
     return PROVIDER_BEHAVIOR_CATEGORY_KEYS.get(provider)
 
 
-def provider_options() -> list[str]:
-    return [provider.value for provider in DriverProvider]
+def provider_locks_ignored(config_manager: Any | None = None) -> bool:
+    if config_manager is None:
+        return False
+
+    try:
+        return bool(
+            config_manager.get_setting(
+                PROVIDER_LOCK_OVERRIDE_CATEGORY,
+                PROVIDER_LOCK_OVERRIDE_FIELD,
+            )
+        )
+    except Exception:
+        return False
+
+
+def provider_lock_reason(provider: DriverProvider | str | None) -> str | None:
+    normalized = (
+        provider
+        if isinstance(provider, DriverProvider)
+        else DriverProvider.from_setting(provider)
+    )
+    if normalized is None:
+        return None
+    return PROVIDER_LOCK_REASONS.get(normalized)
+
+
+def is_provider_locked(
+    provider: DriverProvider | str | None,
+    config_manager: Any | None = None,
+) -> bool:
+    normalized = (
+        provider
+        if isinstance(provider, DriverProvider)
+        else DriverProvider.from_setting(provider)
+    )
+    if normalized is None:
+        return False
+    return bool(provider_lock_reason(normalized)) and not provider_locks_ignored(config_manager)
+
+
+def provider_options(
+    include_locked: bool = True,
+    config_manager: Any | None = None,
+) -> list[str]:
+    return [
+        provider.value
+        for provider in DriverProvider
+        if include_locked or not is_provider_locked(provider, config_manager)
+    ]
 
 
 def get_playwright_profile_dir(config_dir: str | Path | None, provider: DriverProvider) -> Path:

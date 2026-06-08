@@ -26,7 +26,7 @@ from config.loadouts import (
 from config.manager import ConfigManager
 from config.location import infer_preset_from_config_dir, migrate_config_dir, resolve_config_dir, write_pointer_file
 from config.schema import SCHEMA, SettingType, SETTINGS_SECTIONS, SETTINGS_CARDS, PROVIDER_BEHAVIOR_GROUPS
-from drivers.providers import DriverProvider
+from drivers.providers import DriverProvider, provider_options
 from ui.core.brand import BrandColors
 from ui.widgets.components import Tumbler, StyledLineEdit, StyledTextEdit, StyledComboBox, Divider, Description, HintCard, StyledButton, MultiColumnRow, SettingRow, ToggleRow, InputPairsWidget, InputListWidget, DirectoryEntry
 from ui.widgets.marshmallow_dropdown import MarshmallowDropdown, MarshmallowMultiSelectDropdown, MarshmallowOption
@@ -1250,6 +1250,8 @@ class SettingsWindow(QMainWindow):
 
     def _dropdown_options_for_field(self, field, category_key: str) -> list[str]:
         options = [str(option) for option in (field.options or [])]
+        if category_key == "providers_credentials" and field.key == "provider":
+            return provider_options(include_locked=False, config_manager=self.config_manager)
         if category_key == "huggingchat_behavior" and field.key == "model":
             unavailable = "Model list unavailable, please successfully log into HuggingChat at least once"
             try:
@@ -4081,6 +4083,8 @@ class SettingsWindow(QMainWindow):
             return
         sender = self.sender()
         full_key = str(sender.property("fullKey") or "").strip() if sender is not None else ""
+        if full_key == "system_settings.ignore_provider_locks":
+            QTimer.singleShot(0, self.refresh_dynamic_dropdown_options)
         if full_key and self._is_loadout_controlled_full_key(full_key):
             field_def = self.field_defs.get(full_key)
             if field_def is not None:

@@ -21,12 +21,12 @@ from PySide6.QtWidgets import (
 from config.manager import ConfigManager
 from config.loadouts import get_behavior_category_for_provider
 from config.validators import validate_email, validate_port
-from drivers.providers import DriverProvider
+from drivers.providers import DriverProvider, is_provider_locked, provider_options
 from ece.manager import EceManager
 from ece.models import CredentialPair
 from ui.core.brand import BrandColors
 from ui.core.icons import IconType, IconUtils
-from ui.niche.hotswap_dialog import ALL_PROVIDERS, PROVIDER_ICON_MAP
+from ui.niche.hotswap_dialog import PROVIDER_ICON_MAP
 from ui.widgets.components import (
     MultiColumnRow,
     SettingRow,
@@ -277,6 +277,8 @@ class WelcomeWindow(QDialog):
 
         raw_provider = config.get_setting("providers_credentials", "provider") or "DeepSeek"
         provider_enum = DriverProvider.from_setting(str(raw_provider))
+        if provider_enum is None or is_provider_locked(provider_enum, config):
+            provider_enum = DriverProvider.DEEPSEEK
         state.provider = provider_enum.value
 
         state.auto_login = bool(config.get_setting("providers_credentials", "auto_login"))
@@ -442,8 +444,8 @@ class WelcomeWindow(QDialog):
 
         desc = QLabel(
             "IntenseRP Next is a local OpenAI-compatible API + desktop app that drives provider web UIs "
-            "(DeepSeek / GLM Chat / Moonshot / QwenLM / Perplexity / HuggingChat / Google AI Studio) in a real browser, so clients like SillyTavern can use them "
-            "without wiring up the paid official APIs."
+            "(DeepSeek / GLM Chat / Moonshot / QwenLM / Perplexity / HuggingChat) in a real browser, so clients like SillyTavern can use them "
+            "without wiring up the paid official APIs. Google AI Studio is implemented too, but temporarily locked by default."
         )
         desc.setWordWrap(True)
         desc.setAlignment(Qt.AlignCenter)
@@ -725,7 +727,7 @@ class WelcomeWindow(QDialog):
         layout.addWidget(intro, 0)
 
         self._provider_cards = {}
-        for provider in ALL_PROVIDERS:
+        for provider in provider_options(include_locked=False, config_manager=self.config_manager):
             desc = ""
             if provider == "DeepSeek":
                 desc = "Default choice. Simple login flow."
@@ -1188,6 +1190,8 @@ class WelcomeWindow(QDialog):
     def _set_provider(self, provider: str) -> None:
         provider_value = str(provider or "").strip() or "DeepSeek"
         provider_enum = DriverProvider.from_setting(provider_value)
+        if provider_enum is None or is_provider_locked(provider_enum, self.config_manager):
+            provider_enum = DriverProvider.DEEPSEEK
         provider_label = provider_enum.value
         self._state.provider = provider_label
         self._load_provider_feature_state(provider_enum)

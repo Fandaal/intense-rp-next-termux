@@ -35,7 +35,7 @@ If **Providers in Parallel** is disabled, **Parallelize API Request Queue** is f
 
 ## :material-routes: How Routing Works
 
-When multiple providers are active, API requests use provider-prefixed model IDs such as `deepseek-auto`, `glm-chat`, `huggingchat-reasoner`, or `aistudio-reasoner`.
+When multiple providers are active, API requests use provider-prefixed model IDs such as `deepseek-auto`, `glm-chat`, or `huggingchat-reasoner`. If Google AI Studio is deliberately unlocked, `aistudio-reasoner` can route there too.
 
 The router uses that model ID to pick the provider lane:
 
@@ -45,7 +45,7 @@ The router uses that model ID to pick the provider lane:
 - `qwen-*` goes to the QwenLM lane
 - `perplexity-*` goes to the Perplexity lane
 - `huggingchat-*` goes to the HuggingChat lane
-- `aistudio-*` goes to the Google AI Studio lane
+- `aistudio-*` goes to the Google AI Studio lane only when AI Studio is unlocked
 
 Each lane still processes its own requests in order. The new part is that different lanes are allowed to work at the same time.
 

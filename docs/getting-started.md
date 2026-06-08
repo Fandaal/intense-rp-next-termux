@@ -15,7 +15,7 @@ Before we dive in, make sure you have:
 | | |
 |---|---|
 | :material-microsoft-windows: **Windows 10/11** or :material-linux: **Linux** | 64-bit with a graphical desktop |
-| :material-account-plus: **Provider account** | [DeepSeek](https://chat.deepseek.com), [GLM Chat (Z.ai)](https://chat.z.ai/), [Kimi](https://www.kimi.com/), [QwenLM](https://chat.qwen.ai/), [Perplexity](https://www.perplexity.ai/), [HuggingChat](https://huggingface.co/chat), or [Google AI Studio](https://aistudio.google.com/) |
+| :material-account-plus: **Provider account** | [DeepSeek](https://chat.deepseek.com), [GLM Chat (Z.ai)](https://chat.z.ai/), [Kimi](https://www.kimi.com/), [QwenLM](https://chat.qwen.ai/), [Perplexity](https://www.perplexity.ai/), or [HuggingChat](https://huggingface.co/chat). [Google AI Studio](https://aistudio.google.com/) is temporarily locked by default. |
 | :material-chat: **SillyTavern** (or similar) | Any OpenAI-compatible client works |
 
 ---
@@ -87,7 +87,7 @@ Before hitting **Start**, pick your provider and decide whether IntenseRP should
 
 1. Click the :material-cog: **Settings** button
 2. Go to **Provider and Login**
-3. In **Current Provider**, choose your provider (DeepSeek, GLM Chat, Moonshot, QwenLM, Perplexity, HuggingChat, or Google AI Studio)
+3. In **Current Provider**, choose your provider (DeepSeek, GLM Chat, Moonshot, QwenLM, Perplexity, or HuggingChat)
 4. In **Sign-In and Accounts**, (optional) turn on :material-toggle-switch: **Sign In Automatically**
 5. Open **Saved Accounts** and add your account(s)
 6. (Optional) Enable **Prefer the Least Used Account** and/or **Retry With Another Account**
@@ -111,6 +111,9 @@ Before hitting **Start**, pick your provider and decide whether IntenseRP should
 
     For the longer version, see [:material-key: Login & Sessions](features/login-sessions.md) and [:material-cloud: Providers](providers.md).
 
+!!! warning "Google AI Studio is temporarily locked"
+    AI Studio currently appears to detect Patchright/automated browser sessions and can block automated sends. You can still configure it under **Provider Behavior**, but it only appears as a selectable provider if you enable **Settings** -> **Advanced** -> **Provider Stability** -> **Ignore Provider Locks**.
+
 !!! note "Upgrading?"
     If you previously saved credentials in older versions, IntenseRP imports them into **Saved Accounts** on startup.
 
@@ -122,7 +125,7 @@ Alright, the fun part!
 
 1. Click the big :material-play: **Start** button
 2. A browser window will pop up
-3. All providers can use auto-login, though Moonshot, Perplexity, and Google AI Studio may still need manual confirmation in the browser.
+3. All normally selectable providers can use auto-login, though Moonshot and Perplexity may still need manual confirmation in the browser.
 4. Once logged in, the status changes to :material-check-circle: **Running (Port 7777)**
 
 <div class="image-grid" markdown>
@@ -161,7 +164,7 @@ Click the :material-power-plug: **API** button in SillyTavern's top bar.
 |-------|-------|
 | :material-web: **Custom Endpoint** | `http://127.0.0.1:7777/v1` |
 | :material-key: **API Key** | Leave blank |
-| :material-robot: **Model** | `deepseek-*` / `glm-*` / `moonshot-*` / `qwen-*` / `perplexity-*` / `huggingchat-*` / `aistudio-*` |
+| :material-robot: **Model** | `deepseek-*` / `glm-*` / `moonshot-*` / `qwen-*` / `perplexity-*` / `huggingchat-*` |
 
 !!! note
     Use the model ID that matches your active provider:
@@ -172,7 +175,7 @@ Click the :material-power-plug: **API** button in SillyTavern's top bar.
     - QwenLM -> `qwen-auto`
     - Perplexity -> `perplexity-auto`
     - HuggingChat -> `huggingchat-auto`
-    - Google AI Studio -> `aistudio-auto`
+    - Google AI Studio -> `aistudio-auto` only when **Ignore Provider Locks** is enabled
 
 !!! info "Model IDs"
     The `*-auto` model is the default and respects your IntenseRP settings for the active provider.

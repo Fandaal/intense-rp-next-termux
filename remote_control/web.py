@@ -13,7 +13,7 @@ from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 from jinja2 import Environment, FileSystemLoader, select_autoescape
 from pydantic import BaseModel
 
-from drivers.providers import DriverProvider, provider_options
+from drivers.providers import DriverProvider, is_provider_locked, provider_options
 from utils.logger import LogLevel, Logger
 from utils.resource_path import resolve_resource_path
 
@@ -676,11 +676,20 @@ class RemoteControlWeb:
         targets = []
         raw_targets = raw_state.get("hotswap_targets")
         if not isinstance(raw_targets, list):
-            raw_targets = [name for name in provider_options() if name != provider_name]
+            raw_targets = [
+                name
+                for name in provider_options(
+                    include_locked=False,
+                    config_manager=self.config_manager,
+                )
+                if name != provider_name
+            ]
 
         for raw_target in raw_targets:
             target_provider = DriverProvider.from_setting(raw_target)
             if target_provider is None or target_provider.value == provider_name:
+                continue
+            if is_provider_locked(target_provider, self.config_manager):
                 continue
             targets.append(
                 {
