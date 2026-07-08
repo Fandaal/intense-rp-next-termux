@@ -10,14 +10,12 @@ from PySide6.QtWidgets import QDialog, QFrame, QHBoxLayout, QLabel, QMessageBox,
 
 from ui.core.brand import BrandColors
 from ui.core.icons import IconType, IconUtils
-from utils.docs_links import build_docs_url
 
 
 REMOTE_LATEST_SURVEY_URL = (
     "https://raw.githubusercontent.com/LyubomirT/intense-rp-next/refs/heads/v2-rewrite/latestsurvey.txt"
 )
 DISCORD_INVITE_URL = "https://discord.gg/4Gvjk2RdsK"
-DONATE_URL = build_docs_url("hands/support", "financial-support-optional")
 _POST_UPDATE_ACTIONS = {"discord", "survey", "none"}
 
 
@@ -183,7 +181,6 @@ class UpdateInstalledDialog(QDialog):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(10)
         layout.addWidget(post_update_button, 1)
-        layout.addWidget(self._build_donate_button(), 0)
 
         return row
 
@@ -218,26 +215,11 @@ class UpdateInstalledDialog(QDialog):
         self._post_update_button = button
         return button
 
-    def _build_donate_button(self) -> QPushButton:
-        button = QPushButton()
-        button.setCursor(Qt.PointingHandCursor)
-        button.setFixedSize(42, 42)
-        button.setToolTip("Support the project")
-        button.setAccessibleName("Support the project")
-        button.setStyleSheet(_post_update_button_style(square=True))
-        IconUtils.apply_icon(button, IconType.DONATE, BrandColors.TEXT_PRIMARY, size=17)
-        button.setIconSize(QSize(17, 17))
-        button.clicked.connect(self._on_donate_clicked)
-        return button
-
     def _on_release_notes_clicked(self) -> None:
         url = (self._info.release_notes_url or "").strip()
         if url:
             QDesktopServices.openUrl(QUrl(url))
         self.accept()
-
-    def _on_donate_clicked(self) -> None:
-        QDesktopServices.openUrl(QUrl(DONATE_URL))
 
     def _on_post_update_clicked(self) -> None:
         action = _normalize_post_update_action(self._info.post_update)

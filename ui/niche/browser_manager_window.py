@@ -183,6 +183,23 @@ class BrowserManagerWindow(QMainWindow):
         except Exception:
             return False
 
+    def _browser_download_mirror_url(self) -> str:
+        main_window = getattr(self, "main_window", None)
+        config_manager = getattr(main_window, "config_manager", None)
+        if config_manager is None:
+            return ""
+
+        try:
+            return str(
+                config_manager.get_setting(
+                    "system_settings",
+                    "browser_download_mirror_url",
+                )
+                or ""
+            ).strip()
+        except Exception:
+            return ""
+
     def _running_driver_browser_path(self) -> str | None:
         main_window = getattr(self, "main_window", None)
         if main_window is None:
@@ -463,8 +480,14 @@ class BrowserManagerWindow(QMainWindow):
 
         try:
             self._set_progress_step(1, total_steps)
-            self._set_status("Step 1 of 2: Installing Chromium browser...", "info")
-            await install_chromium_browser()
+            download_host = self._browser_download_mirror_url()
+            install_label = (
+                "Step 1 of 2: Installing Chromium browser from configured mirror..."
+                if download_host
+                else "Step 1 of 2: Installing Chromium browser..."
+            )
+            self._set_status(install_label, "info")
+            await install_chromium_browser(download_host=download_host)
 
             self._set_progress_step(2, total_steps)
             self._set_status("Step 2 of 2: Refreshing browser status...", "info")
@@ -589,8 +612,14 @@ class BrowserManagerWindow(QMainWindow):
             await uninstall_playwright_browsers()
 
             self._set_progress_step(2, total_steps)
-            self._set_status("Step 2 of 3: Installing fresh Chromium browser...", "info")
-            await install_chromium_browser()
+            download_host = self._browser_download_mirror_url()
+            install_label = (
+                "Step 2 of 3: Installing fresh Chromium browser from configured mirror..."
+                if download_host
+                else "Step 2 of 3: Installing fresh Chromium browser..."
+            )
+            self._set_status(install_label, "info")
+            await install_chromium_browser(download_host=download_host)
 
             self._set_progress_step(3, total_steps)
             self._set_status("Step 3 of 3: Refreshing browser status...", "info")

@@ -1,3 +1,4 @@
+import copy
 import json
 from pathlib import Path
 from typing import Any, Dict
@@ -23,6 +24,7 @@ from utils.logger import Logger
 
 
 _MISSING = object()
+_WELCOME_DISMISSED_FLAG_KEY = "welcome_screen_dismissed"
 
 class ConfigManager:
     def __init__(self, config_dir: str | Path | None = None):
@@ -56,6 +58,17 @@ class ConfigManager:
         self._load_key()
         self.load_settings()
         self.clear_runtime_loadouts()
+
+    def should_show_welcome(self) -> bool:
+        if not self.is_first_run:
+            return False
+        return not self.app_flags.get_bool(_WELCOME_DISMISSED_FLAG_KEY, default=False)
+
+    def mark_welcome_dismissed(self) -> bool:
+        ok = self.app_flags.set(_WELCOME_DISMISSED_FLAG_KEY, True)
+        if ok:
+            self.is_first_run = False
+        return ok
 
     def _ensure_dir(self):
         if not self.config_dir.exists():
@@ -121,7 +134,7 @@ class ConfigManager:
             if category.key not in self.settings:
                 self.settings[category.key] = {}
             for field in self._iter_default_fields(category.fields):
-                self.settings[category.key][field.key] = field.default
+                self.settings[category.key][field.key] = copy.deepcopy(field.default)
         self._ensure_loadouts_store()
         self.save_settings()
 
@@ -133,7 +146,7 @@ class ConfigManager:
                 updated = True
             for field in self._iter_default_fields(category.fields):
                 if field.key not in self.settings[category.key]:
-                    self.settings[category.key][field.key] = field.default
+                    self.settings[category.key][field.key] = copy.deepcopy(field.default)
                     updated = True
         if updated:
             self.save_settings()

@@ -4,20 +4,18 @@ icon: material/cloud
 
 # :material-cloud: Provider Support
 
-IntenseRP Next v2 is designed to support multiple providers by driving their web apps and intercepting the underlying network requests.
+IntenseRP Next v2 is designed to support multiple providers by driving their web apps and capturing the browser session's streaming responses.
 
-Today, **DeepSeek**, **GLM Chat (Z.ai)**, **Moonshot**, **QwenLM**, **Perplexity**, and **HuggingChat** are implemented and usable.
+Today, **DeepSeek**, **GLM Chat (Z.ai)**, **Moonshot**, **QwenLM**, **Perplexity**, **HuggingChat**, **Google AI Studio**, and **Xiaomi MiMo** are implemented and usable.
 
-**Google AI Studio** is implemented too, but it is temporarily locked by default because AI Studio currently appears to detect Patchright/automated browser sessions and can block automated message sends. You can still configure it, and you can deliberately bypass the lock with **Settings -> Advanced -> Provider Stability -> Ignore Provider Locks**.
-
-Search Older Matching Chats is currently supported on **DeepSeek**, **GLM Chat**, **Moonshot**, **QwenLM**, and **HuggingChat**. **Perplexity** does not support chat reuse yet, and **Google AI Studio** still only has the regular single-slot Reuse Matching Chat flow for now.
+Search Older Matching Chats is currently supported on **DeepSeek**, **GLM Chat**, **Moonshot**, **QwenLM**, **HuggingChat**, and **Xiaomi MiMo**. **Perplexity** does not support chat reuse yet, and **Google AI Studio** still only has the regular single-slot Reuse Matching Chat flow for now.
 
 !!! note "GLM status (important)"
     The GLM driver is still beta-like. It is mostly usable, but:
 
     - Search and Advanced Search are supported (search results are not sent to the client)
     - Login requires solving a CAPTCHA (Persistent Sessions are strongly recommended)
-    - GLM model selection is supported (GLM-5.1 / GLM-5-Turbo / GLM-5V-Turbo / GLM-5 / GLM-4.7) via **Settings -> Provider Behavior -> GLM Chat -> Model**
+    - GLM model selection is supported via **Settings -> Provider Behavior -> GLM Chat -> Model**
     - Reuse Matching Chat is currently unreliable with GLM
 
 !!! warning "Web apps change"
@@ -32,7 +30,7 @@ All providers follow the same general approach:
 1. Launch a real browser session (Playwright/Patchright)
 2. Log in (manual or auto-login, depending on settings)
 3. Trigger a generation in the provider UI (type/upload + click send)
-4. Intercept the provider's internal streaming request
+4. Capture the provider's streaming response in the browser session
 5. Convert the provider stream into OpenAI-style SSE deltas (`/v1/chat/completions` or `/v1/completions`)
 
 This is why IntenseRP can present an OpenAI-compatible API even though the underlying provider is a normal web chat app.
@@ -68,22 +66,26 @@ Providers are prioritized in this order:
 | **DeepSeek** | 1 | :material-check-circle:{ style="color: #51CF66" } **Stable** |
 | **GLM Chat** | 2 | :material-check-circle:{ style="color: #51CF66" } **Stable (mostly)** |
 | **Moonshot** | 3 | :material-check-circle:{ style="color: #51CF66" } **Stable (mostly)** |
-| **Google AI Studio** | 4 | :material-lock-alert:{ style="color: #FF922B" } **Temporarily Locked** |
+| **Google AI Studio** | 4 | :material-shield-check:{ style="color: #FFD43B" } **Verification** |
 | **QwenLM** | 5 | :material-check-circle:{ style="color: #51CF66" } **Stable** |
 | **Perplexity** | 6 | :material-shield-check:{ style="color: #FFD43B" } **Verification** |
 | **HuggingChat** | 7 | :material-hammer-wrench:{ style="color: #FF922B" } **Driver Implementation** |
+| **Xiaomi MiMo** | 8 | :material-shield-check:{ style="color: #FFD43B" } **Verification** |
 
 !!! note "What 'Verification' means for Moonshot"
     Moonshot is implemented and usable, but this is the first integration pass. Expect selector and stream-shape adjustments as the provider UI evolves.
 
 !!! warning "Google AI Studio status"
-    Google AI Studio's driver code and settings are still present, but normal provider selection and routing are locked for now. Enable **Ignore Provider Locks** only if you're sure your AI Studio setup can send messages from the automated browser.
+    Google AI Studio is available again with **Humanize Mouse Movements** enabled by default. Leave that setting on unless you are deliberately testing the faster, less reliable path.
 
 !!! note "Perplexity status"
     Perplexity is implemented as an early integration. It can send prompts and stream answer text, but chat reuse/regeneration and thinking-trace forwarding are not supported yet.
 
 !!! note "HuggingChat status"
     HuggingChat is implemented as an early integration. It supports model selection, inference provider selection, thinking effort, Exa search, uploads, chat reuse, and account rotation, but HuggingChat's web UI and monthly credits are both easy to run into. Disable spent accounts until their credits reset.
+
+!!! note "Xiaomi MiMo status"
+    MiMo is implemented as an early integration. It supports model selection, thinking output filtering, token usage, uploads, chat reuse, and provider-specific proxy settings, but availability is heavily region-dependent.
 
 ---
 
@@ -93,7 +95,7 @@ Providers are prioritized in this order:
 
 -   :providers-deepseek: **DeepSeek Behavior**
 
-    DeepThink, Search, anti-censorship, and more.
+    DeepThink, Search, blocked-response handling, and more.
 
     [:arrow_right: DeepSeek Behavior](../providers/deepseek-behavior.md)
 
@@ -129,9 +131,15 @@ Providers are prioritized in this order:
 
 -   :providers-aistudio: **Google AI Studio Behavior**
 
-    AI Studio model selection, Thinking Level, Search, URL Context, and sampling controls.
+    AI Studio model selection, Thinking Level, Search, URL Context, sampling controls, and humanized mouse movement.
 
     [:arrow_right: Google AI Studio Behavior](../providers/aistudio-behavior.md)
+
+-   :providers-xiaomi: **Xiaomi MiMo Behavior**
+
+    MiMo model selection, thinking output filtering, proxy setup, uploads, and regional availability notes.
+
+    [:arrow_right: Xiaomi MiMo Behavior](../providers/mimo-behavior.md)
 
 -   :material-key: **Login & Sessions**
 

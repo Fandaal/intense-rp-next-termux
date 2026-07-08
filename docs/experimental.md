@@ -13,24 +13,6 @@ Experimental features currently include:
 
 <div class="grid cards" markdown>
 
--   :material-source-branch: **Providers in Parallel**
-
-    Keeps multiple provider browser windows alive at once and routes requests by the legacy provider-prefixed model IDs, which helps when you switch between providers often.
-
-    [:arrow_right: Read Providers in Parallel docs](experimental/providers-in-parallel.md)
-
--   :material-lan-connect: **Parallel Request Queue**
-
-    Builds on top of Providers in Parallel and lets different active provider lanes work on API requests at the same time. Useful for shared API setups, but still very experimental.
-
-    [:arrow_right: Read Parallel Request Queue docs](experimental/parallel-request-queue.md)
-
--   :material-source-branch-plus: **Full Parallelization**
-
-    Adds multiple account-backed instances for the same enabled provider, so queue parallelization can spread work across providers and across accounts.
-
-    [:arrow_right: Read Full Parallelization docs](experimental/full-parallelization.md)
-
 -   :material-file-code-outline: **Loadouts**
 
     Lets you build and edit provider-specific Formatting + Provider Behavior presets directly in Settings, then switch the active one per provider.

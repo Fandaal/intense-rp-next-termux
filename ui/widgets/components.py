@@ -1,13 +1,24 @@
+from dataclasses import dataclass
+from typing import Any
+
 from PySide6.QtWidgets import QCheckBox, QWidget, QHBoxLayout, QVBoxLayout, QLabel, QLineEdit, QTextEdit, QComboBox, QFrame, QPushButton, QSizePolicy, QFileDialog, QStyle, QStyleOptionComboBox, QToolButton
-from PySide6.QtCore import Property, QSize, Qt, QRectF, Signal, QEvent, QPropertyAnimation, QEasingCurve, QAbstractAnimation
+from PySide6.QtCore import Property, QSize, Qt, QRectF, Signal, QEvent, QPropertyAnimation, QEasingCurve, QAbstractAnimation, QParallelAnimationGroup
 import html
 import os
 from pathlib import Path
-from PySide6.QtGui import QPainter, QColor, QBrush, QPen, QIcon, QTextCursor
+from PySide6.QtGui import QPainter, QColor, QBrush, QPen, QIcon, QTextCursor, QFont
 from ui.core.brand import BrandColors
 from ui.core.animation_settings import animations_disabled
 from ui.core.icons import IconUtils, IconType
 from ui.widgets.tooltip_text import render_tooltip_text
+
+
+@dataclass(frozen=True)
+class SwitcherOption:
+    label: str
+    value: str
+    enabled: bool = True
+    tooltip: str | None = None
 
 
 class DocsHelpButton(QToolButton):
@@ -654,6 +665,291 @@ class Tumbler(QCheckBox):
         handle_y = self._margin
         
         painter.drawEllipse(QRectF(handle_x, handle_y, handle_d, handle_d))
+        painter.end()
+
+
+class _SegmentedSwitcherButton(QPushButton):
+    def __init__(self, option: SwitcherOption, parent=None):
+        super().__init__(option.label, parent)
+        self.option = option
+        self._selection_opacity = 0.0
+        self._selected = False
+
+        self.setCursor(Qt.PointingHandCursor)
+        self.setFocusPolicy(Qt.StrongFocus)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.setMinimumHeight(32)
+        self.setAccessibleName(option.label)
+        if option.tooltip:
+            self.setToolTip(render_tooltip_text(option.tooltip))
+        self.setStyleSheet("background-color: transparent; border: none; padding: 0px;")
+
+    def _get_selection_opacity(self) -> float:
+        return float(self._selection_opacity)
+
+    def _set_selection_opacity(self, value: float) -> None:
+        value = max(0.0, min(1.0, float(value)))
+        if value == self._selection_opacity:
+            return
+        self._selection_opacity = value
+        self.update()
+
+    selection_opacity = Property(float, _get_selection_opacity, _set_selection_opacity)
+
+    @staticmethod
+    def _font_pixel_size() -> int:
+        try:
+            return int(str(BrandColors.FONT_SIZE_REGULAR).rstrip("px"))
+        except Exception:
+            return 14
+
+    def set_selected_visual(self, selected: bool) -> None:
+        selected = bool(selected)
+        if self._selected == selected:
+            return
+        self._selected = selected
+        self.update()
+
+    def sizeHint(self) -> QSize:
+        return QSize(132, 34)
+
+    def enterEvent(self, event) -> None:
+        super().enterEvent(event)
+        self.update()
+
+    def leaveEvent(self, event) -> None:
+        super().leaveEvent(event)
+        self.update()
+
+    def paintEvent(self, event) -> None:
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+
+        rect = QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5)
+        radius = 4.0
+
+        if self.isEnabled() and self.underMouse() and self._selection_opacity < 0.95:
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(QColor(BrandColors.ITEM_HOVER))
+            painter.drawRoundedRect(rect, radius, radius)
+
+        if self._selection_opacity > 0.0:
+            painter.save()
+            painter.setOpacity(self._selection_opacity)
+            painter.setPen(QPen(QColor(BrandColors.ACCENT), 1))
+            painter.setBrush(QColor(BrandColors.ACCENT))
+            painter.drawRoundedRect(rect, radius, radius)
+            painter.restore()
+
+        if self.hasFocus():
+            painter.setPen(QPen(QColor(BrandColors.ACCENT), 1))
+            painter.setBrush(Qt.NoBrush)
+            painter.drawRoundedRect(rect.adjusted(1.0, 1.0, -1.0, -1.0), radius, radius)
+
+        font = QFont(BrandColors.FONT_FAMILY)
+        font.setPixelSize(self._font_pixel_size())
+        font.setWeight(QFont.Bold if self._selected else QFont.Normal)
+        painter.setFont(font)
+
+        if not self.isEnabled():
+            text_color = BrandColors.TEXT_DISABLED
+        elif self._selected:
+            text_color = BrandColors.TEXT_PRIMARY
+        else:
+            text_color = BrandColors.TEXT_SOFT
+        painter.setPen(QColor(text_color))
+
+        text_rect = self.rect().adjusted(8, 0, -8, 0)
+        elided = painter.fontMetrics().elidedText(self.text(), Qt.ElideRight, text_rect.width())
+        painter.drawText(text_rect, Qt.AlignCenter, elided)
+        painter.end()
+
+
+class SegmentedSwitcher(QWidget):
+    valueChanged = Signal(str)
+
+    MAX_OPTIONS = 4
+
+    def __init__(
+        self,
+        options: list[SwitcherOption | dict[str, Any] | tuple[Any, ...] | str] | None = None,
+        default_value: str | None = None,
+        parent=None,
+    ):
+        super().__init__(parent)
+        self._options: list[SwitcherOption] = []
+        self._buttons: dict[str, _SegmentedSwitcherButton] = {}
+        self._value = ""
+        self._default_value = str(default_value or "").strip()
+        self._selection_anim_group: QParallelAnimationGroup | None = None
+
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.setMinimumHeight(42)
+        self.setMaximumHeight(46)
+        self.setStyleSheet("background-color: transparent;")
+
+        self._layout = QHBoxLayout(self)
+        self._layout.setContentsMargins(4, 4, 4, 4)
+        self._layout.setSpacing(4)
+
+        if options is not None:
+            self.set_options(options, default_value=default_value, emit_change=False)
+
+    @staticmethod
+    def _normalize_option(raw: SwitcherOption | dict[str, Any] | tuple[Any, ...] | str) -> SwitcherOption:
+        if isinstance(raw, SwitcherOption):
+            return raw
+
+        if isinstance(raw, dict):
+            label = str(raw.get("label") or raw.get("name") or raw.get("display") or "").strip()
+            value = str(raw.get("value") or raw.get("key") or raw.get("id") or "").strip()
+            enabled = bool(raw.get("enabled", True))
+            tooltip = raw.get("tooltip")
+            return SwitcherOption(label=label or value, value=value or label, enabled=enabled, tooltip=tooltip)
+
+        if isinstance(raw, (tuple, list)):
+            label = str(raw[0] if len(raw) >= 1 else "").strip()
+            value = str(raw[1] if len(raw) >= 2 else label).strip()
+            enabled = bool(raw[2]) if len(raw) >= 3 else True
+            tooltip = str(raw[3]) if len(raw) >= 4 and raw[3] is not None else None
+            return SwitcherOption(label=label or value, value=value or label, enabled=enabled, tooltip=tooltip)
+
+        text = str(raw or "").strip()
+        return SwitcherOption(label=text, value=text, enabled=True)
+
+    def set_options(
+        self,
+        options: list[SwitcherOption | dict[str, Any] | tuple[Any, ...] | str],
+        *,
+        default_value: str | None = None,
+        emit_change: bool = True,
+    ) -> None:
+        normalized: list[SwitcherOption] = []
+        seen_values: set[str] = set()
+        for raw_option in options or []:
+            option = self._normalize_option(raw_option)
+            if not option.label or not option.value:
+                raise ValueError("Switcher options must include both a label and a value.")
+            if option.value in seen_values:
+                raise ValueError(f"Switcher option values must be unique: {option.value}")
+            seen_values.add(option.value)
+            normalized.append(option)
+
+        if not normalized:
+            raise ValueError("SegmentedSwitcher requires at least one option.")
+        if len(normalized) > self.MAX_OPTIONS:
+            raise ValueError(f"SegmentedSwitcher supports at most {self.MAX_OPTIONS} options.")
+
+        if default_value is not None:
+            self._default_value = str(default_value or "").strip()
+
+        old_value = self._value
+        self._clear_buttons()
+        self._options = normalized
+        self._buttons = {}
+
+        for option in self._options:
+            button = _SegmentedSwitcherButton(option, self)
+            button.clicked.connect(lambda _checked=False, value=option.value: self.set_value(value))
+            self._buttons[option.value] = button
+            self._layout.addWidget(button, 1)
+
+        self._sync_button_enabled()
+        target_value = old_value or self._default_value
+        self.set_value(target_value, emit=emit_change, animate=False)
+
+    def _clear_buttons(self) -> None:
+        while self._layout.count():
+            item = self._layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+
+    def _sync_button_enabled(self) -> None:
+        widget_enabled = self.isEnabled()
+        for option in self._options:
+            button = self._buttons.get(option.value)
+            if button is None:
+                continue
+            button.setEnabled(widget_enabled and option.enabled)
+            button.setCursor(Qt.PointingHandCursor if widget_enabled and option.enabled else Qt.ArrowCursor)
+
+    def _resolve_selectable_value(self, requested: str | None) -> str:
+        requested_value = str(requested or "").strip()
+        enabled_values = [option.value for option in self._options if option.enabled]
+        if requested_value in enabled_values:
+            return requested_value
+        if self._default_value in enabled_values:
+            return self._default_value
+        return enabled_values[0] if enabled_values else ""
+
+    def set_value(self, value: str | None, *, emit: bool = True, animate: bool | None = None) -> bool:
+        target_value = self._resolve_selectable_value(value)
+        if not target_value:
+            return False
+
+        old_value = self._value
+        self._value = target_value
+        self._sync_selection(old_value, target_value, animate=animate)
+
+        if emit and old_value != target_value:
+            self.valueChanged.emit(target_value)
+        return True
+
+    def current_value(self) -> str:
+        return self._value
+
+    def set_default_value(self, value: str | None) -> None:
+        self._default_value = str(value or "").strip()
+        if not self._value:
+            self.set_value(self._default_value, emit=False, animate=False)
+
+    def _sync_selection(self, old_value: str, new_value: str, *, animate: bool | None) -> None:
+        if self._selection_anim_group and self._selection_anim_group.state() == QAbstractAnimation.Running:
+            self._selection_anim_group.stop()
+
+        old_button = self._buttons.get(old_value)
+        new_button = self._buttons.get(new_value)
+        for value, button in self._buttons.items():
+            button.set_selected_visual(value == new_value)
+            if value not in {old_value, new_value}:
+                button.selection_opacity = 0.0
+
+        should_animate = (not animations_disabled()) if animate is None else bool(animate)
+        if not should_animate or old_button is None or new_button is None or old_button is new_button:
+            if old_button is not None and old_button is not new_button:
+                old_button.selection_opacity = 0.0
+            if new_button is not None:
+                new_button.selection_opacity = 1.0
+            return
+
+        group = QParallelAnimationGroup(self)
+        for button, end_value in ((old_button, 0.0), (new_button, 1.0)):
+            animation = QPropertyAnimation(button, b"selection_opacity", group)
+            animation.setDuration(130)
+            animation.setEasingCurve(QEasingCurve.OutCubic)
+            animation.setStartValue(button.selection_opacity)
+            animation.setEndValue(end_value)
+            group.addAnimation(animation)
+
+        self._selection_anim_group = group
+        group.start()
+
+    def setEnabled(self, enabled: bool) -> None:
+        super().setEnabled(enabled)
+        self._sync_button_enabled()
+        self.update()
+
+    def sizeHint(self) -> QSize:
+        return QSize(BrandColors.CONTROL_MIN_WIDTH * 2, 42)
+
+    def paintEvent(self, event) -> None:
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        rect = QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5)
+        painter.setPen(QPen(QColor(BrandColors.INPUT_BORDER), 1))
+        painter.setBrush(QColor(BrandColors.INPUT_BG))
+        painter.drawRoundedRect(rect, 6.0, 6.0)
         painter.end()
 
 class StyledLineEdit(QLineEdit):

@@ -8,17 +8,17 @@ This page covers the settings that control how IntenseRP interacts with **Perple
 
 Perplexity is powerful, but its web app is fairly strict. IntenseRP drives the same composer you use in the browser, watches the `perplexity_ask` stream, and forwards only the assistant answer text to the OpenAI-compatible API.
 
-!!! warning "Free tier limitations"
-    It really only makes sense to use Perplexity with a paid (Pro or higher) account. IntenseRP can work with free accounts, but the experience is rough due to being locked mainly to the Sonar 2 model without Thinking controls. It's also heavily rate-limited, so expect slow responses and possible temporary blocks if you send too many requests.
+!!! warning "Account capability limitations"
+    Perplexity exposes different controls depending on the account. If your account does not expose model or Thinking controls, IntenseRP skips those steps and uses whatever the Perplexity UI allows.
 
-!!! danger "Special thanks"
-    Huge **thank you** to [Yurushia](https://github.com/twgok123) for their financial support and giving me access to a paid Perplexity account for development and testing. Without them, this integration quite literally would not exist. So, wholeheartedly, thank you!! 💙
+!!! note "Special thanks"
+    Huge **thank you** to [Yurushia](https://github.com/twgok123) for Perplexity testing help during development.
 
 ---
 
 ## :material-tune: Modes (model IDs)
 
-In IntenseRP Next v2, the `model` you select in SillyTavern is mostly a **behavior preset**, not the same thing as Perplexity's paid model picker.
+In IntenseRP Next v2, the `model` you select in SillyTavern is mostly a **behavior preset**, not the same thing as Perplexity's own model picker.
 
 For Perplexity, these model IDs map to simple behavior presets:
 
@@ -36,20 +36,10 @@ IntenseRP can switch Perplexity's real model picker in the web UI when your acco
 
 :material-arrow-right: **Settings** -> **Provider Behavior** -> **Perplexity** -> **Model**
 
-Current options:
+The dropdown includes **Best (Auto)** plus the account-tier model entries IntenseRP knows how to select. Exact labels live in Settings, since Perplexity's picker can change faster than this page should try to keep up with.
 
-- `Best (Auto)`
-- `Sonar 2`
-- `GPT-5.4`
-- `GPT-5.5`
-- `Gemini 3.1 Pro`
-- `Claude Sonnet 4.6`
-- `Claude Opus 4.7`
-- `Kimi K2.6`
-- `Nemotron 3 Super`
-
-!!! note "Paid-account controls"
-    Perplexity only exposes model and Thinking controls on paid accounts. Free accounts can still send prompts, but IntenseRP skips those controls and uses whatever the Perplexity UI allows.
+!!! note "Account-tier controls"
+    Perplexity only exposes some controls on some accounts. If a control is unavailable, IntenseRP skips it and uses the current Perplexity UI defaults.
 
 ---
 
@@ -180,7 +170,7 @@ All macros are stripped from the message before sending it to Perplexity.
 
 | Setting | What It Does | Default |
 |---------|--------------|---------|
-| **Model** | Selects Perplexity's real model picker (paid accounts) | Best (Auto) |
+| **Model** | Selects Perplexity's real model picker when available | Best (Auto) |
 | **Enable Thinking** | Toggles Perplexity Thinking where available | Off |
 | **Send Thinking** | Reserved; no thinking traces are forwarded yet | Off |
 | **Enable Search** | Enables Perplexity Web search | Off |

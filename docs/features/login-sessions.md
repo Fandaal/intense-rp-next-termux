@@ -4,7 +4,7 @@ icon: material/key
 
 # :material-key: Login & Sessions
 
-Managing how you log in to your active provider (DeepSeek / GLM Chat / Moonshot / QwenLM / Perplexity / HuggingChat / Google AI Studio) and keeping your session alive between restarts. These two features work together to make your life easier.
+Managing how you log in to your active provider (DeepSeek / GLM Chat / Moonshot / QwenLM / Perplexity / HuggingChat / Google AI Studio / Xiaomi MiMo) and keeping your session alive between restarts. These two features work together to make your life easier.
 
 ---
 
@@ -48,6 +48,9 @@ Next time you start IntenseRP, the driver can fill credentials and click login f
 
 !!! note "HuggingChat login"
     HuggingChat uses a Hugging Face username/email and password. If an account hits its monthly credits, disable that row in Credential Manager until the quota resets.
+
+!!! note "Xiaomi MiMo login"
+    MiMo uses Xiaomi account login. Auto Login can fill the form and agreement checkbox, but regional availability can still block the page before login. If MiMo fails with `ERR_CONNECTION_REFUSED`, use a permitted network setup or MiMo's proxy setting.
 
 ### How It Works
 

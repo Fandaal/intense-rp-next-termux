@@ -1,3 +1,4 @@
+import base64
 import codecs
 import time
 import json
@@ -5,6 +6,7 @@ import asyncio
 import re
 import httpx
 from typing import List, Union, Any, Dict, Callable, Optional
+from urllib.parse import urlsplit
 from dotenv import load_dotenv
 from drivers.base_driver import BaseDriver
 from drivers.providers import DriverProvider
@@ -37,8 +39,16 @@ from utils.model_ids import (
 load_dotenv()
 
 class DeepSeekDriver(BaseDriver):
+    REQUEST_CAPTURE_MODE_REPLAY = "replay"
+    REQUEST_CAPTURE_MODE_CDP_TEEING = "cdp_teeing"
     INTERCEPT_FIRST_CHUNK_TIMEOUT_S = 45.0
     INTERCEPT_IDLE_TIMEOUT_S = 75.0
+    COMPLETION_ROUTE_GLOB = "**/api/v0/chat/completion"
+    REGENERATE_ROUTE_GLOB = "**/api/v0/chat/regenerate"
+    COMPLETION_URL_PATHS = {
+        "/api/v0/chat/completion",
+        "/api/v0/chat/regenerate",
+    }
     CONVERSATION_URL_RE = re.compile(r"^https://chat\.deepseek\.com/a/chat/s/([^/?#]+)", re.IGNORECASE)
     MODEL_TYPE_PICKER_NEW = "new-radio"
     MODEL_TYPE_PICKER_LEGACY = "legacy-inline"
@@ -373,6 +383,27 @@ class DeepSeekDriver(BaseDriver):
         except Exception:
             value = self.INTERCEPT_FIRST_CHUNK_TIMEOUT_S
         return max(value, 5.0)
+
+    def _get_request_capture_mode(self) -> str:
+        try:
+            mode = str(
+                self.config_manager.get_setting("deepseek_behavior", "request_capture_mode")
+                or self.REQUEST_CAPTURE_MODE_REPLAY
+            ).strip().lower()
+        except Exception:
+            mode = self.REQUEST_CAPTURE_MODE_REPLAY
+
+        if mode == self.REQUEST_CAPTURE_MODE_CDP_TEEING:
+            return self.REQUEST_CAPTURE_MODE_CDP_TEEING
+        return self.REQUEST_CAPTURE_MODE_REPLAY
+
+    @classmethod
+    def _is_completion_request_url(cls, url: Any) -> bool:
+        try:
+            parsed = urlsplit(str(url or ""))
+        except Exception:
+            return False
+        return parsed.path in cls.COMPLETION_URL_PATHS
 
     def _extract_deepseek_macros_from_text(self, text: str) -> tuple[str, Dict[str, bool]]:
         return extract_macro_overrides(text, macro_actions=COMMON_REQUEST_MACRO_ACTIONS)
@@ -767,6 +798,18 @@ class DeepSeekDriver(BaseDriver):
         intercepted_response: httpx.Response | None = None
         intercepted_request_abort = asyncio.Event()
         intercepted_request_finished = asyncio.Event()
+        request_capture_mode = self._get_request_capture_mode()
+        use_cdp_teeing = request_capture_mode == self.REQUEST_CAPTURE_MODE_CDP_TEEING
+        route_handlers_registered = False
+        cdp_session: Any = None
+        cdp_listeners_registered = False
+        cdp_tasks: set[asyncio.Task] = set()
+        request_methods: dict[str, str] = {}
+        cdp_pending_response_urls: dict[str, str] = {}
+        cdp_active_request_id: Optional[str] = None
+        cdp_stream_started = False
+        cdp_stream_finished = False
+        cdp_had_data = False
 
         def get_intercepted_activity_count() -> int:
             return intercepted_activity_count
@@ -961,11 +1004,248 @@ class DeepSeekDriver(BaseDriver):
             ):
                 Logger.success("Response streaming completed.")
 
+        def _schedule_cdp_task(coro: Any, label: str) -> None:
+            try:
+                task = asyncio.create_task(coro)
+            except Exception as exc:
+                Logger.debug(f"DeepSeek: failed to schedule CDP handler for {label}: {exc}")
+                return
+
+            cdp_tasks.add(task)
+
+            def _on_done(done_task: asyncio.Task) -> None:
+                cdp_tasks.discard(done_task)
+                try:
+                    done_task.exception()
+                except asyncio.CancelledError:
+                    pass
+                except Exception as exc:
+                    Logger.debug(f"DeepSeek: CDP handler for {label} failed: {exc}")
+
+            task.add_done_callback(_on_done)
+
+        def request_aborted() -> bool:
+            return bool(
+                intercepted_request_abort.is_set()
+                or self.abort_requested
+                or self._stream_provider_abort_requested
+                or (abort_event and abort_event.is_set())
+            )
+
+        async def finish_cdp_stream(
+            request_id: str,
+            *,
+            aborted: bool = False,
+            encountered_error: bool = False,
+        ) -> None:
+            nonlocal cdp_stream_finished
+            if request_id != cdp_active_request_id or cdp_stream_finished:
+                return
+
+            cdp_stream_finished = True
+            if not aborted and not encountered_error:
+                await self._process_chunk(b"", response_queue, final=True)
+
+            await response_queue.put(None)
+            intercepted_request_finished.set()
+            request_methods.pop(request_id, None)
+            cdp_pending_response_urls.pop(request_id, None)
+
+            if not aborted and not encountered_error and not request_aborted():
+                Logger.success("DeepSeek CDP stream completed.")
+
+        async def feed_cdp_stream_chunk(request_id: str, data: bytes) -> None:
+            nonlocal intercepted_activity_count, cdp_had_data
+            if request_id != cdp_active_request_id or not data or cdp_stream_finished:
+                return
+
+            cdp_had_data = True
+            intercepted_activity_count += 1
+            if request_aborted():
+                await finish_cdp_stream(request_id, aborted=True)
+                return
+
+            await self._process_chunk(data, response_queue)
+            if request_aborted():
+                if self._stream_provider_abort_requested:
+                    try:
+                        await self._click_stop_button()
+                    except Exception as exc:
+                        Logger.debug(f"DeepSeek: failed to click Stop after provider abort: {exc}")
+                await finish_cdp_stream(request_id, aborted=True)
+
+        async def feed_base64_cdp_stream_chunk(request_id: str, encoded_data: Any) -> None:
+            if not encoded_data:
+                return
+            encoded_text = str(encoded_data)
+            try:
+                data = base64.b64decode(encoded_text, validate=True)
+            except Exception:
+                data = encoded_text.encode("utf-8", errors="ignore")
+            await feed_cdp_stream_chunk(request_id, data)
+
+        async def start_cdp_stream(request_id: str, url: str) -> None:
+            nonlocal cdp_stream_started
+            if (
+                request_id != cdp_active_request_id
+                or not cdp_session
+                or cdp_stream_started
+                or cdp_stream_finished
+            ):
+                return
+
+            cdp_stream_started = True
+            Logger.info("Teeing DeepSeek API response via CDP...")
+            Logger.debug(f"Teeing request to: {url}")
+            try:
+                result = await cdp_session.send(
+                    "Network.streamResourceContent",
+                    {"requestId": request_id},
+                )
+            except Exception as exc:
+                message_text = f"DeepSeek CDP response streaming failed: {exc}"
+                Logger.error(message_text)
+                await response_queue.put({"error": message_text})
+                await finish_cdp_stream(request_id, encountered_error=True)
+                return
+
+            if isinstance(result, dict):
+                await feed_base64_cdp_stream_chunk(request_id, result.get("bufferedData"))
+
+        async def handle_cdp_request_will_be_sent(params: Any) -> None:
+            nonlocal completion_claimed, cdp_active_request_id
+            if not isinstance(params, dict):
+                return
+            request_id = str(params.get("requestId") or "").strip()
+            request = params.get("request")
+            if not request_id or not isinstance(request, dict):
+                return
+
+            method = str(request.get("method") or "").upper()
+            request_methods[request_id] = method
+            url = str(request.get("url") or "")
+            if method != "POST" or not self._is_completion_request_url(url):
+                return
+            if not completion_armed.is_set():
+                return
+
+            async with completion_claim_lock:
+                if completion_claimed:
+                    return
+                completion_claimed = True
+                cdp_active_request_id = request_id
+                completion_started.set()
+
+            self._last_followup_request_headers = self._build_followup_request_headers(
+                request.get("headers")
+            )
+            Logger.info("Observing DeepSeek API request via CDP...")
+            Logger.debug(f"Observed request to: {url}")
+            pending_url = cdp_pending_response_urls.get(request_id)
+            if pending_url:
+                await start_cdp_stream(request_id, pending_url)
+
+        async def handle_cdp_response_received(params: Any) -> None:
+            if not isinstance(params, dict):
+                return
+            request_id = str(params.get("requestId") or "").strip()
+            response = params.get("response")
+            if not request_id or not isinstance(response, dict):
+                return
+            url = str(response.get("url") or "")
+            if not self._is_completion_request_url(url):
+                return
+            method = request_methods.get(request_id, "").upper()
+            if method and method != "POST":
+                return
+            cdp_pending_response_urls[request_id] = url
+            if request_id != cdp_active_request_id:
+                return
+            await start_cdp_stream(request_id, url)
+
+        async def handle_cdp_data_received(params: Any) -> None:
+            if not isinstance(params, dict):
+                return
+            request_id = str(params.get("requestId") or "").strip()
+            if request_id == cdp_active_request_id:
+                await feed_base64_cdp_stream_chunk(request_id, params.get("data"))
+
+        async def handle_cdp_loading_finished(params: Any) -> None:
+            if not isinstance(params, dict):
+                return
+            request_id = str(params.get("requestId") or "").strip()
+            if request_id == cdp_active_request_id:
+                await finish_cdp_stream(request_id)
+            else:
+                request_methods.pop(request_id, None)
+                cdp_pending_response_urls.pop(request_id, None)
+
+        async def handle_cdp_loading_failed(params: Any) -> None:
+            if not isinstance(params, dict):
+                return
+            request_id = str(params.get("requestId") or "").strip()
+            if request_id != cdp_active_request_id:
+                request_methods.pop(request_id, None)
+                cdp_pending_response_urls.pop(request_id, None)
+                return
+
+            if request_aborted():
+                await finish_cdp_stream(request_id, aborted=True)
+                return
+
+            error_text = str(params.get("errorText") or "network loading failed").strip()
+            if "ERR_ABORTED" in error_text.upper() and cdp_had_data:
+                Logger.debug(
+                    "DeepSeek CDP stream ended with net::ERR_ABORTED after data arrived; "
+                    "treating it as complete."
+                )
+                await finish_cdp_stream(request_id)
+                return
+
+            message_text = f"DeepSeek CDP stream failed: {error_text}"
+            Logger.error(message_text)
+            await response_queue.put({"error": message_text})
+            await finish_cdp_stream(request_id, encountered_error=True)
+
+        def on_cdp_request_will_be_sent(params: Any) -> None:
+            _schedule_cdp_task(handle_cdp_request_will_be_sent(params), "requestWillBeSent")
+
+        def on_cdp_response_received(params: Any) -> None:
+            _schedule_cdp_task(handle_cdp_response_received(params), "responseReceived")
+
+        def on_cdp_data_received(params: Any) -> None:
+            _schedule_cdp_task(handle_cdp_data_received(params), "dataReceived")
+
+        def on_cdp_loading_finished(params: Any) -> None:
+            _schedule_cdp_task(handle_cdp_loading_finished(params), "loadingFinished")
+
+        def on_cdp_loading_failed(params: Any) -> None:
+            _schedule_cdp_task(handle_cdp_loading_failed(params), "loadingFailed")
+
         # Set up interception
-        await self.page.route("**/api/v0/chat/completion", handle_route)
-        await self.page.route("**/api/v0/chat/regenerate", handle_route)
-        
         try:
+            if use_cdp_teeing:
+                try:
+                    cdp_session = await self.context.new_cdp_session(self.page)
+                    await cdp_session.send("Network.enable", {})
+                    cdp_session.on("Network.requestWillBeSent", on_cdp_request_will_be_sent)
+                    cdp_session.on("Network.responseReceived", on_cdp_response_received)
+                    cdp_session.on("Network.dataReceived", on_cdp_data_received)
+                    cdp_session.on("Network.loadingFinished", on_cdp_loading_finished)
+                    cdp_session.on("Network.loadingFailed", on_cdp_loading_failed)
+                    cdp_listeners_registered = True
+                    Logger.info("DeepSeek Request Capture Mode: CDP Teeing.")
+                except Exception as exc:
+                    message_text = f"DeepSeek CDP setup failed: {exc}"
+                    Logger.error(message_text)
+                    yield f"data: {json.dumps({'error': message_text})}\n\n"
+                    return
+            else:
+                await self.page.route(self.COMPLETION_ROUTE_GLOB, handle_route)
+                await self.page.route(self.REGENERATE_ROUTE_GLOB, handle_route)
+                route_handlers_registered = True
+                Logger.info("DeepSeek Request Capture Mode: Replay.")
+
             # Apply formatting
             formatted_message = self._format_messages(message_for_formatting)
             self._capture_diagnostics_prompt_snapshot(
@@ -1199,14 +1479,41 @@ class DeepSeekDriver(BaseDriver):
             self.current_send_deepthink = None
             self._last_generation_censored = False
             self._reset_stream_parser()
-            try:
-                await self.page.unroute("**/api/v0/chat/completion")
-            except Exception:
-                pass
-            try:
-                await self.page.unroute("**/api/v0/chat/regenerate")
-            except Exception:
-                pass
+            if route_handlers_registered:
+                try:
+                    await self.page.unroute(self.COMPLETION_ROUTE_GLOB, handle_route)
+                except Exception:
+                    pass
+                try:
+                    await self.page.unroute(self.REGENERATE_ROUTE_GLOB, handle_route)
+                except Exception:
+                    pass
+            if cdp_session and cdp_listeners_registered:
+                for event_name, listener in (
+                    ("Network.requestWillBeSent", on_cdp_request_will_be_sent),
+                    ("Network.responseReceived", on_cdp_response_received),
+                    ("Network.dataReceived", on_cdp_data_received),
+                    ("Network.loadingFinished", on_cdp_loading_finished),
+                    ("Network.loadingFailed", on_cdp_loading_failed),
+                ):
+                    try:
+                        cdp_session.remove_listener(event_name, listener)
+                    except Exception:
+                        pass
+            for task in list(cdp_tasks):
+                if not task.done():
+                    task.cancel()
+            tasks_to_wait = set(cdp_tasks)
+            if tasks_to_wait:
+                try:
+                    await asyncio.wait(tasks_to_wait, timeout=1.0)
+                except Exception:
+                    pass
+            if cdp_session:
+                try:
+                    await cdp_session.detach()
+                except Exception as exc:
+                    Logger.debug(f"DeepSeek: CDP detach failed: {exc}")
 
     async def abort_generation(self):
         """

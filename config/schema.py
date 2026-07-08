@@ -7,6 +7,7 @@ from .validators import (
     validate_ip_address_list,
     validate_email_list,
     validate_float_range,
+    validate_http_base_url,
     validate_integer_range,
 )
 from .formatting_presets import FORMATTING_PRESET_OPTIONS
@@ -27,18 +28,54 @@ DOCS_HOTSWAPS = "features/hotswaps/"
 DOCS_IP_WHITELIST = "advanced/ip-whitelist/"
 DOCS_LOGIN = "features/login-sessions/"
 DOCS_LOADOUTS = "experimental/loadouts/"
-DOCS_FULL_PARALLELIZATION = "experimental/full-parallelization/"
+DOCS_MIMO = "providers/mimo-behavior/"
 DOCS_MOONSHOT = "providers/moonshot-behavior/"
 DOCS_MULTI_SLOT_CACHE = "features/multi-slot-cache/"
 DOCS_NETWORK = "features/network-api/"
 DOCS_PERPLEXITY = "providers/perplexity-behavior/"
 DOCS_PROVIDER_SUPPORT = "advanced/provider-support/"
 DOCS_QWEN = "providers/qwen-behavior/"
-DOCS_PARALLEL_REQUEST_QUEUE = "experimental/parallel-request-queue/"
 DOCS_REMOTE_CONTROL = "experimental/remote-control/"
-DOCS_PROVIDERS_IN_PARALLEL = "experimental/providers-in-parallel/"
+DOCS_RUNTIME = "runtime/"
+DOCS_RUNTIME_BROWSER_ENVIRONMENT = "runtime/browser-environment/"
+DOCS_RUNTIME_BROWSER_INSTALLATION = "runtime/browser-installation/"
+DOCS_RUNTIME_PARALLELIZATION = "runtime/providers-in-parallel/"
+DOCS_RUNTIME_PROVIDER_STABILITY = "runtime/provider-stability/"
 DOCS_SYSTEM = "features/system/"
 DOCS_UNIVERSAL_MODEL_NAMES = "features/universal-model-names/"
+
+RUNTIME_PARALLEL_MODE_OPTIONS = [
+    ("provider_lanes", "One Instance per Provider"),
+    ("concurrent_provider_lanes", "One Instance per Provider + Concurrent Requests"),
+    ("full_parallel_lanes", "Multiple Instances per Provider + Concurrent Requests"),
+]
+
+REQUEST_CAPTURE_REPLAY = "replay"
+REQUEST_CAPTURE_CDP_TEEING = "cdp_teeing"
+
+REQUEST_CAPTURE_MODE_OPTIONS = [
+    {
+        "label": "Replay",
+        "value": REQUEST_CAPTURE_REPLAY,
+    },
+    {
+        "label": "CDP Teeing",
+        "value": REQUEST_CAPTURE_CDP_TEEING,
+    },
+]
+
+REQUEST_CAPTURE_CDP_ONLY_OPTIONS = [
+    {
+        "label": "Replay",
+        "value": REQUEST_CAPTURE_REPLAY,
+        "enabled": False,
+        "tooltip": "Replay isn't available for this provider.",
+    },
+    {
+        "label": "CDP Teeing",
+        "value": REQUEST_CAPTURE_CDP_TEEING,
+    },
+]
 
 class SettingType(Enum):
     BOOLEAN = "boolean"
@@ -56,6 +93,8 @@ class SettingType(Enum):
     INPUT_PAIR = "input_pair"
     INPUT_LIST = "input_list"
     MULTI_SELECT_DROPDOWN = "multi_select_dropdown"
+    PROVIDER_LANE_SELECTOR = "provider_lane_selector"
+    SWITCHER = "switcher"
     REDIRECT = "redirect"
 
 @dataclass
@@ -76,7 +115,7 @@ class SettingField:
     required: bool = False
     nullable: bool = False
     depends: Optional[str] = None
-    options: Optional[List[str]] = None # For dropdowns
+    options: Optional[List[Any]] = None # For dropdowns/switchers
     transient: bool = False # For UI-only fields (not persisted)
     action: Optional[str] = None # For buttons (function name to call)
     sub_fields: Optional[List["SettingField"]] = None # For ROW type
@@ -318,6 +357,17 @@ SCHEMA = [
         key="deepseek_behavior",
         fields=[
             SettingField(
+                key="request_capture_mode",
+                label="Request Capture Mode",
+                type=SettingType.SWITCHER,
+                default=REQUEST_CAPTURE_REPLAY,
+                options=REQUEST_CAPTURE_MODE_OPTIONS,
+                tooltip=(
+                    "Choose how IntenseRP should capture provider responses. "
+                    "Replay is the default; CDP Teeing is the newer alternative."
+                ),
+            ),
+            SettingField(
                 key="enable_deepthink",
                 label="Enable DeepThink",
                 type=SettingType.BOOLEAN,
@@ -374,12 +424,12 @@ SCHEMA = [
             ),
             SettingField(
                 key="anti_censorship",
-                label="Anti-Censorship",
+                label="Blocked-Response Handling",
                 type=SettingType.BOOLEAN,
                 default=False,
-                tooltip="Suppress the refusal message when content filtering is triggered.",
+                tooltip="Handle detected refusal messages without forwarding the refusal text.",
                 docs_path=DOCS_DEEPSEEK,
-                docs_anchor="anti-censorship",
+                docs_anchor="blocked-response-handling",
             ),
             SettingField(
                 key="clean_regeneration",
@@ -435,11 +485,22 @@ SCHEMA = [
         key="glm_behavior",
         fields=[
             SettingField(
+                key="request_capture_mode",
+                label="Request Capture Mode",
+                type=SettingType.SWITCHER,
+                default=REQUEST_CAPTURE_REPLAY,
+                options=REQUEST_CAPTURE_MODE_OPTIONS,
+                tooltip=(
+                    "Choose how IntenseRP should capture provider responses. "
+                    "Replay is the default; CDP Teeing is the newer alternative."
+                ),
+            ),
+            SettingField(
                 key="model",
                 label="Model",
                 type=SettingType.DROPDOWN,
-                default="GLM-5",
-                options=["GLM-5.1", "GLM-5-Turbo", "GLM-5V-Turbo", "GLM-5", "GLM-4.7"],
+                default="GLM-5.2",
+                options=["GLM-5.2", "GLM-5.1", "GLM-5-Turbo", "GLM-5V-Turbo", "GLM-4.7"],
                 tooltip="Select which GLM model to use in the web UI. Not related to the API model IDs.",
                 docs_path=DOCS_GLM,
                 docs_anchor="modes-model-ids",
@@ -452,6 +513,17 @@ SCHEMA = [
                 tooltip="Toggle the Deep Think button on the GLM interface.",
                 docs_path=DOCS_GLM,
                 docs_anchor="enable-deep-think",
+            ),
+            SettingField(
+                key="deepthink_effort",
+                label="Deep Think Effort",
+                type=SettingType.DROPDOWN,
+                default="Max",
+                options=["High", "Max"],
+                tooltip="Select GLM-5.2's Deep Think effort when Deep Think is enabled.",
+                visible_depends="glm_behavior.model==GLM-5.2&&glm_behavior.enable_deepthink",
+                docs_path=DOCS_GLM,
+                docs_anchor="deep-think-effort",
             ),
             SettingField(
                 key="send_deepthink",
@@ -690,6 +762,17 @@ SCHEMA = [
         key="moonshot_behavior",
         fields=[
             SettingField(
+                key="request_capture_mode",
+                label="Request Capture Mode",
+                type=SettingType.SWITCHER,
+                default=REQUEST_CAPTURE_REPLAY,
+                options=REQUEST_CAPTURE_MODE_OPTIONS,
+                tooltip=(
+                    "Choose how IntenseRP should capture provider responses. "
+                    "Replay is the default; CDP Teeing is the newer alternative."
+                ),
+            ),
+            SettingField(
                 key="enable_deepthink",
                 label="Enable Thinking",
                 type=SettingType.BOOLEAN,
@@ -758,12 +841,12 @@ SCHEMA = [
             ),
             SettingField(
                 key="anti_censorship",
-                label="Anti-Censorship",
+                label="Blocked-Response Handling",
                 type=SettingType.BOOLEAN,
                 default=False,
-                tooltip="Suppress refusal-like messages in the stream when a content-filter-style event is detected.",
+                tooltip="Handle detected refusal-like stream events without forwarding the refusal text.",
                 docs_path=DOCS_MOONSHOT,
-                docs_anchor="anti-censorship",
+                docs_anchor="blocked-response-handling",
             ),
             SettingField(
                 key="clean_regeneration",
@@ -818,6 +901,17 @@ SCHEMA = [
         name="QwenLM Behavior",
         key="qwen_behavior",
         fields=[
+            SettingField(
+                key="request_capture_mode",
+                label="Request Capture Mode",
+                type=SettingType.SWITCHER,
+                default=REQUEST_CAPTURE_REPLAY,
+                options=REQUEST_CAPTURE_MODE_OPTIONS,
+                tooltip=(
+                    "Choose how IntenseRP should capture provider responses. "
+                    "Replay is the default; CDP Teeing is the newer alternative."
+                ),
+            ),
             SettingField(
                 key="model",
                 label="Model",
@@ -1018,9 +1112,198 @@ SCHEMA = [
         ],
     ),
     SettingCategory(
+        name="Xiaomi MiMo Behavior",
+        key="mimo_behavior",
+        fields=[
+            SettingField(
+                key="request_capture_mode",
+                label="Request Capture Mode",
+                type=SettingType.SWITCHER,
+                default=REQUEST_CAPTURE_CDP_TEEING,
+                options=REQUEST_CAPTURE_CDP_ONLY_OPTIONS,
+                tooltip=(
+                    "Choose how IntenseRP should capture provider responses. "
+                    "Replay is disabled for MiMo, so CDP Teeing is selected."
+                ),
+            ),
+            SettingField(
+                key="model",
+                label="Model",
+                type=SettingType.DROPDOWN,
+                default="MiMo-V2.5-Pro",
+                options=[
+                    "MiMo-V2.5-Pro",
+                    "MiMo-V2.5",
+                ],
+                tooltip="Select which MiMo model to use in the web UI. Not related to the API model IDs.",
+                docs_path=DOCS_MIMO,
+                docs_anchor="real-mimo-model-selection-web-ui",
+            ),
+            SettingField(
+                key="thinking_forced_note",
+                label="Thinking",
+                type=SettingType.HINT,
+                default=(
+                    "MiMo does not expose a Thinking toggle in the web UI. The driver can either "
+                    "forward the streamed <think> text or filter it out before it reaches the API client."
+                ),
+                tooltip=None,
+                hint_variant="info",
+            ),
+            SettingField(
+                key="send_deepthink",
+                label="Send Thinking",
+                type=SettingType.BOOLEAN,
+                default=False,
+                tooltip="Forward MiMo <think>...</think> text to the API client.",
+                docs_path=DOCS_MIMO,
+                docs_anchor="send-thinking",
+            ),
+            SettingField(
+                key="count_tokens",
+                label="Count Tokens",
+                type=SettingType.BOOLEAN,
+                default=True,
+                tooltip="Forward MiMo token usage metadata when the stream includes it.",
+                docs_path=DOCS_MIMO,
+                docs_anchor="count-tokens",
+            ),
+            SettingField(
+                key="search_forced_off_note",
+                label="Search",
+                type=SettingType.HINT,
+                default="MiMo does not currently expose a Search toggle in the web UI.",
+                tooltip=None,
+                hint_variant="info",
+            ),
+            SettingField(
+                key="send_as_text_file",
+                label="Send As Text File",
+                type=SettingType.BOOLEAN,
+                default=False,
+                tooltip="Upload the prompt as a text file instead of typing it into MiMo.",
+                docs_path=DOCS_MIMO,
+                docs_anchor="file-upload-mode",
+            ),
+            SettingField(
+                key="text_file_message",
+                label="Text File Message",
+                type=SettingType.TEXTAREA,
+                default="Please read the attached file and respond to it.",
+                tooltip="Text pasted alongside the uploaded file. MiMo requires text with file uploads.",
+                depends="mimo_behavior.send_as_text_file",
+                docs_path=DOCS_MIMO,
+                docs_anchor="text-file-message",
+            ),
+            SettingField(
+                key="file_upload_timeout",
+                label="File Upload Timeout",
+                type=SettingType.INTEGER,
+                default=30,
+                tooltip="Max seconds to wait for MiMo to finish parsing the uploaded text file.",
+                depends="mimo_behavior.send_as_text_file",
+                docs_path=DOCS_MIMO,
+                docs_anchor="file-upload-timeout",
+            ),
+            SettingField(
+                key="message_send_timeout",
+                label="Message Send Timeout (s)",
+                type=SettingType.INTEGER,
+                default=8,
+                tooltip="Max seconds to wait for the send button to become available after text entry.",
+                docs_path=DOCS_MIMO,
+                docs_anchor="message-send-timeout",
+            ),
+            SettingField(
+                key="auto_decline_cookies",
+                label="Decline Cookies Automatically",
+                type=SettingType.BOOLEAN,
+                default=True,
+                tooltip="Click MiMo's Decline All cookie button when the cookie consent popup appears.",
+                docs_path=DOCS_MIMO,
+                docs_anchor="decline-cookies-automatically",
+            ),
+            SettingField(
+                key="use_proxy",
+                label="Use Proxy",
+                type=SettingType.BOOLEAN,
+                default=False,
+                tooltip=(
+                    "Route only MiMo's provider browser through a proxy. Takes effect after "
+                    "restarting the provider browser."
+                ),
+                docs_path=DOCS_MIMO,
+                docs_anchor="proxy",
+            ),
+            SettingField(
+                key="proxy_url",
+                label="Proxy URL",
+                type=SettingType.STRING,
+                default="",
+                tooltip=(
+                    "HTTP, HTTPS, SOCKS4, or SOCKS5 proxy URL for MiMo. Examples: "
+                    "http://127.0.0.1:8080 or socks5://user:pass@127.0.0.1:1080."
+                ),
+                depends="mimo_behavior.use_proxy",
+                visible_depends="mimo_behavior.use_proxy",
+                docs_path=DOCS_MIMO,
+                docs_anchor="proxy-url",
+            ),
+            SettingField(
+                key="clean_regeneration",
+                label="Reuse Matching Chat",
+                type=SettingType.BOOLEAN,
+                default=False,
+                tooltip="Regenerate the last message instead of creating a new chat when the prompt and settings match.",
+                docs_path=DOCS_MIMO,
+                docs_anchor="reuse-matching-chat",
+            ),
+            SettingField(
+                key="multi_slot_cache",
+                label="Search Older Matching Chats",
+                type=SettingType.BOOLEAN,
+                default=False,
+                tooltip="Reuse up to 7 older cached MiMo chats for duplicate prompts instead of only the most recent one.",
+                depends="mimo_behavior.clean_regeneration",
+                force_when_dep_unmet=False,
+                docs_path=DOCS_MULTI_SLOT_CACHE,
+                docs_anchor="how-it-works",
+            ),
+            SettingField(
+                key="completion_request_timeout",
+                label="Completion Request Timeout (s)",
+                type=SettingType.INTEGER,
+                default=150,
+                tooltip="Max seconds to wait after clicking Send or Regenerate for MiMo's chat request to appear.",
+                docs_path=DOCS_MIMO,
+                docs_anchor="completion-request-timeout",
+            ),
+            SettingField(
+                key="first_chunk_timeout",
+                label="First Chunk Timeout (s)",
+                type=SettingType.INTEGER,
+                default=150,
+                tooltip="Max seconds to wait for MiMo's response stream to start before timing out.",
+                docs_path=DOCS_MIMO,
+                docs_anchor="first-chunk-timeout",
+            ),
+        ],
+    ),
+    SettingCategory(
         name="Perplexity Behavior",
         key="perplexity_behavior",
         fields=[
+            SettingField(
+                key="request_capture_mode",
+                label="Request Capture Mode",
+                type=SettingType.SWITCHER,
+                default=REQUEST_CAPTURE_CDP_TEEING,
+                options=REQUEST_CAPTURE_CDP_ONLY_OPTIONS,
+                tooltip=(
+                    "Choose how IntenseRP should capture provider responses. "
+                    "Replay is disabled for Perplexity, so CDP Teeing is selected."
+                ),
+            ),
             SettingField(
                 key="model",
                 label="Model",
@@ -1166,6 +1449,17 @@ SCHEMA = [
         name="HuggingChat Behavior",
         key="huggingchat_behavior",
         fields=[
+            SettingField(
+                key="request_capture_mode",
+                label="Request Capture Mode",
+                type=SettingType.SWITCHER,
+                default=REQUEST_CAPTURE_CDP_TEEING,
+                options=REQUEST_CAPTURE_CDP_ONLY_OPTIONS,
+                tooltip=(
+                    "Choose how IntenseRP should capture provider responses. "
+                    "Replay is disabled for HuggingChat, so CDP Teeing is selected."
+                ),
+            ),
             SettingField(
                 key="model",
                 label="Model",
@@ -1436,25 +1730,21 @@ SCHEMA = [
         key="aistudio_behavior",
         fields=[
             SettingField(
+                key="request_capture_mode",
+                label="Request Capture Mode",
+                type=SettingType.SWITCHER,
+                default=REQUEST_CAPTURE_REPLAY,
+                options=REQUEST_CAPTURE_MODE_OPTIONS,
+                tooltip=(
+                    "Choose how IntenseRP should capture provider responses. "
+                    "Replay is the default; CDP Teeing is the newer alternative."
+                ),
+            ),
+            SettingField(
                 key="model_divider",
                 label="Model & Thinking",
                 type=SettingType.DIVIDER,
                 default=None,
-            ),
-            SettingField(
-                key="provider_lock_warning",
-                label="AI Studio is temporarily locked",
-                type=SettingType.HINT,
-                default=(
-                    "AI Studio currently detects Patchright/automated browsers and blocks "
-                    "automated message sends. You can still configure these settings, but "
-                    "IntenseRP will not launch or route to AI Studio unless Advanced -> "
-                    "Provider Stability -> Ignore Provider Locks is enabled."
-                ),
-                tooltip=None,
-                hint_variant="warn",
-                docs_path=DOCS_AISTUDIO,
-                docs_anchor="temporary-provider-lock",
             ),
             SettingField(
                 key="model",
@@ -1587,15 +1877,15 @@ SCHEMA = [
             ),
             SettingField(
                 key="anti_censorship",
-                label="Anti-Censorship",
+                label="Blocked-Response Handling",
                 type=SettingType.BOOLEAN,
                 default=False,
                 tooltip=(
-                    "Detect AI Studio hard-censorship, replace the blocked assistant turn, "
+                    "Detect blocked AI Studio turns, replace the blocked assistant turn, "
                     "and send up to 3 continue nudges automatically."
                 ),
                 docs_path=DOCS_AISTUDIO,
-                docs_anchor="anti-censorship",
+                docs_anchor="blocked-response-handling",
             ),
             SettingField(
                 key="caars_enabled",
@@ -1603,7 +1893,7 @@ SCHEMA = [
                 type=SettingType.BOOLEAN,
                 default=False,
                 tooltip=(
-                    "Run a cheap savior model first, replace its assistant turn, "
+                    "Run a secondary model first, replace its assistant turn, "
                     "then switch back and continue with the real model."
                 ),
                 depends="aistudio_behavior.anti_censorship",
@@ -1653,6 +1943,32 @@ SCHEMA = [
                 depends="aistudio_behavior.anti_censorship",
                 docs_path=DOCS_AISTUDIO,
                 docs_anchor="continue-nudge",
+            ),
+            SettingField(
+                key="anti_censorship_edit_save_timeout",
+                label="Edit Save Timeout",
+                type=SettingType.INTEGER,
+                default=10,
+                tooltip=(
+                    "Seconds to wait for AI Studio to finish saving the edited assistant turn "
+                    "before sending the continue nudge."
+                ),
+                depends="aistudio_behavior.anti_censorship",
+                docs_path=DOCS_AISTUDIO,
+                docs_anchor="edit-save-timeout",
+            ),
+            SettingField(
+                key="anti_censorship_edit_save_retries",
+                label="Edit Save Retries",
+                type=SettingType.INTEGER,
+                default=2,
+                tooltip=(
+                    "Extra save attempts for the edited assistant turn when AI Studio is slow "
+                    "to expose or accept the save action."
+                ),
+                depends="aistudio_behavior.anti_censorship",
+                docs_path=DOCS_AISTUDIO,
+                docs_anchor="edit-save-retries",
             ),
             SettingField(
                 key="sampling_divider",
@@ -1715,6 +2031,19 @@ SCHEMA = [
                 ),
                 docs_path=DOCS_AISTUDIO,
                 docs_anchor="auto-login-redirect-timeout",
+            ),
+            SettingField(
+                key="humanize_mouse_movements",
+                label="Humanize Mouse Movements",
+                type=SettingType.BOOLEAN,
+                default=True,
+                tooltip=(
+                    "Recommended for AI Studio. Uses slower Playwright-native pointer movement, "
+                    "varied click points, and tiny pauses around UI actions. Requests take longer, "
+                    "but sends are much more reliable."
+                ),
+                docs_path=DOCS_AISTUDIO,
+                docs_anchor="humanize-mouse-movements",
             ),
             SettingField(
                 key="assume_english_ui",
@@ -1852,6 +2181,18 @@ SCHEMA = [
                 docs_path=DOCS_CONSOLE,
                 docs_anchor="file-logging",
             ),
+            SettingField(
+                key="extra_debug_logs",
+                label="Extra Debug Logs",
+                type=SettingType.BOOLEAN,
+                default=False,
+                tooltip=(
+                    "Reveal additional developer-focused debug messages. "
+                    "Mostly useful when troubleshooting tricky desktop or provider behavior."
+                ),
+                docs_path=DOCS_CONSOLE,
+                docs_anchor="extra-debug-logs",
+            ),
         ],
     ),
     SettingCategory(
@@ -1951,7 +2292,7 @@ SCHEMA = [
                     "English helps with providers that expect English UI text, "
                     "but saved site/account language can still win."
                 ),
-                docs_path=DOCS_SYSTEM,
+                docs_path=DOCS_RUNTIME_BROWSER_ENVIRONMENT,
                 docs_anchor="browser-locale-and-timezone",
             ),
             SettingField(
@@ -1964,8 +2305,64 @@ SCHEMA = [
                     "Optional browser timezone override. Leave this on System Default "
                     "unless you specifically want provider pages to report New York time."
                 ),
-                docs_path=DOCS_SYSTEM,
+                docs_path=DOCS_RUNTIME_BROWSER_ENVIRONMENT,
                 docs_anchor="browser-locale-and-timezone",
+            ),
+            SettingField(
+                key="browser_resize_viewport_with_window",
+                label="Resize Viewport With Window",
+                type=SettingType.BOOLEAN,
+                default=False,
+                tooltip=(
+                    "Let the provider page viewport follow the real browser window size "
+                    "instead of Playwright's fixed viewport. This can help if maximizing "
+                    "the browser leaves empty space or clips the page. Restart the provider "
+                    "browser after changing this."
+                ),
+                docs_path=DOCS_RUNTIME_BROWSER_ENVIRONMENT,
+                docs_anchor="resize-viewport-with-window",
+            ),
+            SettingField(
+                key="browser_proxy_url",
+                label="Browser Proxy URL",
+                type=SettingType.STRING,
+                default="",
+                tooltip=(
+                    "Optional HTTP, HTTPS, SOCKS4, or SOCKS5 proxy used by provider browser "
+                    "contexts. Example: socks5://127.0.0.1:1080. Leave blank to connect directly."
+                ),
+                docs_path=DOCS_RUNTIME_BROWSER_ENVIRONMENT,
+                docs_anchor="browser-proxy-url",
+            ),
+            SettingField(
+                key="browser_download_mirror_url",
+                label="Chromium Download Mirror",
+                type=SettingType.STRING,
+                default="",
+                tooltip=(
+                    "Optional Playwright/Patchright Chromium download host used only when "
+                    "IntenseRP installs or reinstalls its browser. Leave blank to use "
+                    "Patchright's default CDNs."
+                ),
+                validator=validate_http_base_url,
+                docs_path=DOCS_RUNTIME_BROWSER_INSTALLATION,
+                docs_anchor="chromium-download-mirror",
+            ),
+            SettingField(
+                key="browser_download_mirror_warning",
+                label="Use only trusted mirrors",
+                type=SettingType.HINT,
+                default=(
+                    "This replaces Patchright's default browser download CDNs for install "
+                    "and reinstall actions. A broken mirror can make browser installation "
+                    "fail, and an untrusted mirror can provide malware."
+                    "Clear this field to return to the official defaults."
+                ),
+                tooltip=None,
+                hint_variant="warn",
+                visible_depends="system_settings.browser_download_mirror_url",
+                docs_path=DOCS_RUNTIME_BROWSER_INSTALLATION,
+                docs_anchor="chromium-download-mirror",
             ),
             SettingField(
                 key="delete_persistent_profile_row",
@@ -2032,6 +2429,7 @@ SCHEMA = [
                 type=SettingType.BOOLEAN,
                 default=True,
                 tooltip="Show a notification when the provider browser is closed or crashes unexpectedly.",
+                docs_path=DOCS_RUNTIME_PROVIDER_STABILITY,
             ),
             SettingField(
                 key="ignore_provider_locks",
@@ -2043,7 +2441,7 @@ SCHEMA = [
                     "and launch anyway. Only enable this if you are sure your setup can "
                     "use the locked provider without breaking requests."
                 ),
-                docs_path=DOCS_SYSTEM,
+                docs_path=DOCS_RUNTIME_PROVIDER_STABILITY,
                 docs_anchor="provider-locks",
             ),
             SettingField(
@@ -2051,14 +2449,14 @@ SCHEMA = [
                 label="Locked providers may fail hard",
                 type=SettingType.HINT,
                 default=(
-                    "This bypasses provider safety locks. Right now that mainly means "
-                    "Google AI Studio, which may detect automated browsers and prevent "
-                    "messages from sending at all."
+                    "This bypasses provider safety locks. Only use it when a future "
+                    "temporary lock is active and you are sure that provider works in "
+                    "your setup."
                 ),
                 tooltip=None,
                 hint_variant="warn",
                 visible_depends="system_settings.ignore_provider_locks",
-                docs_path=DOCS_SYSTEM,
+                docs_path=DOCS_RUNTIME_PROVIDER_STABILITY,
                 docs_anchor="provider-locks",
             ),
             SettingField(
@@ -2154,6 +2552,114 @@ SCHEMA = [
         ]
     ),
     SettingCategory(
+        name="Browser & Runtime",
+        key="runtime",
+        fields=[
+            SettingField(
+                key="providers_in_parallel",
+                label="Run Providers in Parallel",
+                type=SettingType.BOOLEAN,
+                default=False,
+                tooltip=(
+                    "Launch one browser per selected provider and route requests by "
+                    "their model IDs. Applies on the next browser start and can use a lot of RAM."
+                ),
+                docs_path=DOCS_RUNTIME_PARALLELIZATION,
+            ),
+            SettingField(
+                key="parallelization_mode",
+                label="Providers in Parallel Mode",
+                type=SettingType.DROPDOWN,
+                default="provider_lanes",
+                options=[label for _key, label in RUNTIME_PARALLEL_MODE_OPTIONS],
+                tooltip=(
+                    "Choose whether selected provider lanes only stay warm, whether different providers "
+                    "can answer queued API requests at the same time, or whether selected providers "
+                    "can launch multiple account-backed browser instances."
+                ),
+                front_tooltip=(
+                    "Controls request concurrency. The first mode keeps provider browsers ready, "
+                    "the second lets different providers answer at the same time, and the third "
+                    "also allows multiple instances per provider."
+                ),
+                docs_path=DOCS_RUNTIME_PARALLELIZATION,
+            ),
+            SettingField(
+                key="parallel_provider_lanes",
+                label="Provider Lanes",
+                type=SettingType.PROVIDER_LANE_SELECTOR,
+                default={"providers": [], "instances": {}},
+                options=provider_options(),
+                depends="runtime.providers_in_parallel",
+                force_when_dep_unmet={"providers": [], "instances": {}},
+                tooltip=(
+                    "Choose which providers should stay available in the parallel runtime. "
+                    "The current provider is always enabled. In the multiple-instances mode, "
+                    "enabled providers also get a small instance count input."
+                ),
+                front_tooltip=(
+                    "Select the providers to keep open in parallel. The current provider is forced on."
+                ),
+                docs_path=DOCS_RUNTIME_PARALLELIZATION,
+            ),
+            SettingField(
+                key="parallel_concurrent_launch",
+                label="Launch Provider Lanes Concurrently",
+                type=SettingType.BOOLEAN,
+                default=False,
+                tooltip=(
+                    "Speed up parallel startup by launching active provider lanes "
+                    "at the same time. This can make browser startup heavier while it is running."
+                ),
+                front_tooltip="Launch active parallel provider lanes at the same time.",
+                visible_depends="runtime.providers_in_parallel",
+                depends="runtime.providers_in_parallel",
+                force_when_dep_unmet=False,
+                docs_path=DOCS_RUNTIME_PARALLELIZATION,
+            ),
+            SettingField(
+                key="parallel_launch_in_batches",
+                label="Launch in Batches",
+                type=SettingType.BOOLEAN,
+                default=False,
+                tooltip=(
+                    "When concurrent launch is enabled, start only a limited number of lanes "
+                    "at once and wait for that batch to finish before starting the next one."
+                ),
+                front_tooltip="Limit how many parallel lanes start at the same time.",
+                visible_depends=(
+                    "runtime.providers_in_parallel&&runtime.parallel_concurrent_launch"
+                ),
+                depends=(
+                    "runtime.providers_in_parallel&&runtime.parallel_concurrent_launch"
+                ),
+                force_when_dep_unmet=False,
+                docs_path=DOCS_RUNTIME_PARALLELIZATION,
+            ),
+            SettingField(
+                key="parallel_launch_batch_size",
+                label="Max Lanes per Batch",
+                type=SettingType.INTEGER,
+                default=2,
+                tooltip=(
+                    "Maximum number of parallel provider lanes to launch in each batch. "
+                    "Only applies when concurrent launch and Launch in Batches are enabled."
+                ),
+                validator=validate_integer_range(1, 32, label="Max lanes per batch"),
+                visible_depends=(
+                    "runtime.providers_in_parallel&&runtime.parallel_concurrent_launch"
+                    "&&runtime.parallel_launch_in_batches"
+                ),
+                depends=(
+                    "runtime.providers_in_parallel&&runtime.parallel_concurrent_launch"
+                    "&&runtime.parallel_launch_in_batches"
+                ),
+                force_when_dep_unmet=2,
+                docs_path=DOCS_RUNTIME_PARALLELIZATION,
+            ),
+        ],
+    ),
+    SettingCategory(
         name="Experimental",
         key="experimental",
         fields=[
@@ -2168,252 +2674,6 @@ SCHEMA = [
                 ),
                 affects=["chevron_dropdown"],
                 docs_path=DOCS_LOADOUTS,
-            ),
-            SettingField(
-                key="providers_in_parallel",
-                label="Run Providers in Parallel",
-                type=SettingType.BOOLEAN,
-                default=False,
-                tooltip=(
-                    "Experimental. Launch one browser per selected provider and route requests by "
-                    "their model IDs. Applies on the next browser start and can use a lot of RAM."
-                ),
-                docs_path=DOCS_PROVIDERS_IN_PARALLEL,
-            ),
-            SettingField(
-                key="providers_in_parallel_note",
-                label="Providers in Parallel",
-                type=SettingType.HINT,
-                default=(
-                    "This opens extra browser windows, keeps them idle in memory, and routes by "
-                    "model IDs while active. Change the selection here, then restart the browser for it to take effect."
-                ),
-                tooltip=None,
-                hint_variant="warn",
-                visible_depends="experimental.providers_in_parallel",
-                docs_path=DOCS_PROVIDERS_IN_PARALLEL,
-            ),
-            SettingField(
-                key="parallelize_request_queue",
-                label="Parallelize API Request Queue",
-                type=SettingType.BOOLEAN,
-                default=False,
-                tooltip=(
-                    "Very experimental. Allow multiple queued API requests to run at the same time "
-                    "across different active provider lanes. Requires Providers in Parallel and "
-                    "applies on the next browser start."
-                ),
-                front_tooltip="Run queued API requests concurrently across active parallel provider lanes.",
-                visible_depends="experimental.providers_in_parallel",
-                depends="experimental.providers_in_parallel",
-                force_when_dep_unmet=True,
-                docs_path=DOCS_PARALLEL_REQUEST_QUEUE,
-            ),
-            SettingField(
-                key="parallelize_request_queue_note",
-                label="Parallel Request Queue",
-                type=SettingType.HINT,
-                default=(
-                    "This is intentionally extra experimental. Today it runs one request per active "
-                    "provider lane, but it still depends on Providers in Parallel and may use more "
-                    "RAM and CPU than the normal setup."
-                ),
-                tooltip=None,
-                hint_variant="warn",
-                visible_depends="experimental.providers_in_parallel&&experimental.parallelize_request_queue",
-                docs_path=DOCS_PARALLEL_REQUEST_QUEUE,
-            ),
-            SettingField(
-                key="full_parallelization",
-                label="Full Parallelization",
-                type=SettingType.BOOLEAN,
-                default=False,
-                tooltip=(
-                    "Extremely experimental. Launch multiple account-backed browser "
-                    "instances per enabled parallel provider. Requires the parallelized API queue."
-                ),
-                front_tooltip="Launch multiple account-backed browser lanes per enabled parallel provider.",
-                visible_depends="experimental.providers_in_parallel&&experimental.parallelize_request_queue",
-                depends="experimental.providers_in_parallel&&experimental.parallelize_request_queue",
-                force_when_dep_unmet=False,
-                docs_path=DOCS_FULL_PARALLELIZATION,
-            ),
-            SettingField(
-                key="full_parallelization_note",
-                label="Full Parallelization",
-                type=SettingType.HINT,
-                default=(
-                    "This is heavier than the other parallel features combined. Each extra lane "
-                    "launches another provider browser/profile and uses saved accounts when available."
-                ),
-                tooltip=None,
-                hint_variant="warn",
-                visible_depends="experimental.full_parallelization",
-                docs_path=DOCS_FULL_PARALLELIZATION,
-            ),
-            SettingField(
-                key="parallel_enable_deepseek",
-                label="DeepSeek",
-                type=SettingType.BOOLEAN,
-                default=False,
-                tooltip="Include DeepSeek in the parallel browser pool.",
-                visible_depends="experimental.providers_in_parallel",
-                depends="providers_credentials.provider!=DeepSeek",
-                force_when_dep_unmet=True,
-                docs_path=DOCS_PROVIDERS_IN_PARALLEL,
-            ),
-            SettingField(
-                key="parallel_instances_deepseek",
-                label="DeepSeek Instances",
-                type=SettingType.INTEGER,
-                default=1,
-                tooltip="How many DeepSeek account/profile lanes to launch when Full Parallelization is enabled.",
-                validator=validate_integer_range(1, 32, label="DeepSeek instances"),
-                visible_depends="experimental.full_parallelization&&experimental.parallel_enable_deepseek",
-                depends="experimental.full_parallelization&&experimental.parallel_enable_deepseek",
-                force_when_dep_unmet=1,
-                docs_path=DOCS_FULL_PARALLELIZATION,
-            ),
-            SettingField(
-                key="parallel_enable_glm",
-                label="GLM Chat",
-                type=SettingType.BOOLEAN,
-                default=False,
-                tooltip="Include GLM Chat in the parallel browser pool.",
-                visible_depends="experimental.providers_in_parallel",
-                depends="providers_credentials.provider!=GLM Chat",
-                force_when_dep_unmet=True,
-                docs_path=DOCS_PROVIDERS_IN_PARALLEL,
-            ),
-            SettingField(
-                key="parallel_instances_glm",
-                label="GLM Chat Instances",
-                type=SettingType.INTEGER,
-                default=1,
-                tooltip="How many GLM Chat account/profile lanes to launch when Full Parallelization is enabled.",
-                validator=validate_integer_range(1, 32, label="GLM Chat instances"),
-                visible_depends="experimental.full_parallelization&&experimental.parallel_enable_glm",
-                depends="experimental.full_parallelization&&experimental.parallel_enable_glm",
-                force_when_dep_unmet=1,
-                docs_path=DOCS_FULL_PARALLELIZATION,
-            ),
-            SettingField(
-                key="parallel_enable_moonshot",
-                label="Moonshot",
-                type=SettingType.BOOLEAN,
-                default=False,
-                tooltip="Include Moonshot in the parallel browser pool.",
-                visible_depends="experimental.providers_in_parallel",
-                depends="providers_credentials.provider!=Moonshot",
-                force_when_dep_unmet=True,
-                docs_path=DOCS_PROVIDERS_IN_PARALLEL,
-            ),
-            SettingField(
-                key="parallel_instances_moonshot",
-                label="Moonshot Instances",
-                type=SettingType.INTEGER,
-                default=1,
-                tooltip="How many Moonshot account/profile lanes to launch when Full Parallelization is enabled.",
-                validator=validate_integer_range(1, 32, label="Moonshot instances"),
-                visible_depends="experimental.full_parallelization&&experimental.parallel_enable_moonshot",
-                depends="experimental.full_parallelization&&experimental.parallel_enable_moonshot",
-                force_when_dep_unmet=1,
-                docs_path=DOCS_FULL_PARALLELIZATION,
-            ),
-            SettingField(
-                key="parallel_enable_qwen",
-                label="QwenLM",
-                type=SettingType.BOOLEAN,
-                default=False,
-                tooltip="Include QwenLM in the parallel browser pool.",
-                visible_depends="experimental.providers_in_parallel",
-                depends="providers_credentials.provider!=QwenLM",
-                force_when_dep_unmet=True,
-                docs_path=DOCS_PROVIDERS_IN_PARALLEL,
-            ),
-            SettingField(
-                key="parallel_instances_qwen",
-                label="QwenLM Instances",
-                type=SettingType.INTEGER,
-                default=1,
-                tooltip="How many QwenLM account/profile lanes to launch when Full Parallelization is enabled.",
-                validator=validate_integer_range(1, 32, label="QwenLM instances"),
-                visible_depends="experimental.full_parallelization&&experimental.parallel_enable_qwen",
-                depends="experimental.full_parallelization&&experimental.parallel_enable_qwen",
-                force_when_dep_unmet=1,
-                docs_path=DOCS_FULL_PARALLELIZATION,
-            ),
-            SettingField(
-                key="parallel_enable_perplexity",
-                label="Perplexity",
-                type=SettingType.BOOLEAN,
-                default=False,
-                tooltip="Include Perplexity in the parallel browser pool.",
-                visible_depends="experimental.providers_in_parallel",
-                depends="providers_credentials.provider!=Perplexity",
-                force_when_dep_unmet=True,
-                docs_path=DOCS_PROVIDERS_IN_PARALLEL,
-            ),
-            SettingField(
-                key="parallel_instances_perplexity",
-                label="Perplexity Instances",
-                type=SettingType.INTEGER,
-                default=1,
-                tooltip="How many Perplexity account/profile lanes to launch when Full Parallelization is enabled.",
-                validator=validate_integer_range(1, 32, label="Perplexity instances"),
-                visible_depends="experimental.full_parallelization&&experimental.parallel_enable_perplexity",
-                depends="experimental.full_parallelization&&experimental.parallel_enable_perplexity",
-                force_when_dep_unmet=1,
-                docs_path=DOCS_FULL_PARALLELIZATION,
-            ),
-            SettingField(
-                key="parallel_enable_huggingchat",
-                label="HuggingChat",
-                type=SettingType.BOOLEAN,
-                default=False,
-                tooltip="Include HuggingChat in the parallel browser pool.",
-                visible_depends="experimental.providers_in_parallel",
-                depends="providers_credentials.provider!=HuggingChat",
-                force_when_dep_unmet=True,
-                docs_path=DOCS_PROVIDERS_IN_PARALLEL,
-            ),
-            SettingField(
-                key="parallel_instances_huggingchat",
-                label="HuggingChat Instances",
-                type=SettingType.INTEGER,
-                default=1,
-                tooltip="How many HuggingChat account/profile lanes to launch when Full Parallelization is enabled.",
-                validator=validate_integer_range(1, 32, label="HuggingChat instances"),
-                visible_depends="experimental.full_parallelization&&experimental.parallel_enable_huggingchat",
-                depends="experimental.full_parallelization&&experimental.parallel_enable_huggingchat",
-                force_when_dep_unmet=1,
-                docs_path=DOCS_FULL_PARALLELIZATION,
-            ),
-            SettingField(
-                key="parallel_enable_aistudio",
-                label="Google AI Studio",
-                type=SettingType.BOOLEAN,
-                default=False,
-                tooltip=(
-                    "Include Google AI Studio in the parallel browser pool. AI Studio is "
-                    "temporarily locked unless Ignore Provider Locks is enabled."
-                ),
-                visible_depends="experimental.providers_in_parallel",
-                depends="system_settings.ignore_provider_locks&&providers_credentials.provider!=Google AI Studio",
-                force_when_dep_unmet=False,
-                docs_path=DOCS_PROVIDERS_IN_PARALLEL,
-            ),
-            SettingField(
-                key="parallel_instances_aistudio",
-                label="Google AI Studio Instances",
-                type=SettingType.INTEGER,
-                default=1,
-                tooltip="How many Google AI Studio account/profile lanes to launch when Full Parallelization is enabled.",
-                validator=validate_integer_range(1, 32, label="Google AI Studio instances"),
-                visible_depends="system_settings.ignore_provider_locks&&experimental.full_parallelization&&experimental.parallel_enable_aistudio",
-                depends="system_settings.ignore_provider_locks&&experimental.full_parallelization&&experimental.parallel_enable_aistudio",
-                force_when_dep_unmet=1,
-                docs_path=DOCS_FULL_PARALLELIZATION,
             ),
             SettingField(
                 key="classic_title",
@@ -2495,6 +2755,19 @@ SCHEMA = [
                 type=SettingType.BOOLEAN,
                 default=True,
                 tooltip="Automatically check for updates when the app starts.",
+                docs_path=DOCS_SYSTEM,
+                docs_anchor="updates",
+            ),
+            SettingField(
+                key="legacy_update_restore_config_logs",
+                label="Use Legacy Update Data Restore",
+                type=SettingType.BOOLEAN,
+                default=False,
+                tooltip=(
+                    "Use the older update flow that copies config_data and logs from the "
+                    "old install into the new one. Leave this off unless you're "
+                    "troubleshooting updater behavior."
+                ),
                 docs_path=DOCS_SYSTEM,
                 docs_anchor="updates",
             ),
@@ -2690,6 +2963,20 @@ SCHEMA = [
                 docs_anchor="show-ip",
             ),
             SettingField(
+                key="dry_run_mode",
+                label="Dry Run Mode",
+                type=SettingType.BOOLEAN,
+                default=False,
+                tooltip=(
+                    "Start only the API server and capture incoming request payloads instead "
+                    "of launching a provider browser. This applies when services start; stop "
+                    "the current browser/API first if you are switching into dry run."
+                ),
+                front_tooltip="Capture request structure without launching a provider browser.",
+                docs_path=DOCS_NETWORK,
+                docs_anchor="dry-run-mode",
+            ),
+            SettingField(
                 key="enable_umm",
                 label="Use Universal Model Names",
                 type=SettingType.BOOLEAN,
@@ -2717,7 +3004,8 @@ SCHEMA = [
                     "`reasoning.effort`) to control provider reasoning for that request. "
                     "No effort, Minimum, and Low map to chat/off for most providers; "
                     "Medium and above map to reasoning/on. Google AI Studio maps efforts "
-                    "to its Thinking Level controls."
+                    "to its Thinking Level controls, and GLM-5.2 can map High/Max efforts "
+                    "to its Deep Think effort menu."
                 ),
                 front_tooltip="Allow API requests to set supported providers' reasoning level.",
                 docs_path=DOCS_NETWORK,
@@ -2797,7 +3085,7 @@ SETTINGS_SECTIONS = [
         key="provider_login",
         label="Provider and Login",
         icon="key.svg",
-        card_keys=["provider_choice", "sign_in_accounts", "saved_sessions", "browser_environment"],
+        card_keys=["provider_choice", "sign_in_accounts", "saved_sessions"],
     ),
     SettingSection(
         key="provider_behavior",
@@ -2811,6 +3099,7 @@ SETTINGS_SECTIONS = [
         icon="share-2.svg",
         card_keys=[
             "server_access",
+            "server_dry_run",
             "server_model_ids",
             "server_request_controls",
             "server_security",
@@ -2829,6 +3118,12 @@ SETTINGS_SECTIONS = [
         card_keys=["window_behavior", "main_window", "updates"],
     ),
     SettingSection(
+        key="runtime",
+        label="Browser and Runtime",
+        icon="circle-gauge.svg",
+        card_keys=["browser_installation", "browser_environment", "provider_stability", "runtime_parallelization"],
+    ),
+    SettingSection(
         key="logs_troubleshooting",
         label="Logs and Troubleshooting",
         icon="terminal.svg",
@@ -2838,7 +3133,7 @@ SETTINGS_SECTIONS = [
         key="advanced",
         label="Advanced",
         icon="flask-conical.svg",
-        card_keys=["provider_stability", "config_storage", "experimental_features"],
+        card_keys=["config_storage", "advanced_diagnostics", "experimental_features"],
     ),
 ]
 
@@ -2873,11 +3168,24 @@ SETTINGS_CARDS = {
         key="browser_environment",
         title="Browser Environment",
         description=(
-            "Launch-time browser overrides for provider pages, especially helpful for non-English systems."
+            "Launch-time browser overrides for provider pages, window sizing, and network routing."
         ),
         field_refs=[
             ("system_settings", "browser_locale"),
             ("system_settings", "browser_timezone"),
+            ("system_settings", "browser_resize_viewport_with_window"),
+            ("system_settings", "browser_proxy_url"),
+        ],
+    ),
+    "browser_installation": SettingCard(
+        key="browser_installation",
+        title="Browser Installation",
+        description=(
+            "Download settings for the Playwright/Patchright Chromium bundle IntenseRP manages."
+        ),
+        field_refs=[
+            ("system_settings", "browser_download_mirror_url"),
+            ("system_settings", "browser_download_mirror_warning"),
         ],
     ),
     "provider_defaults": SettingCard(
@@ -2893,6 +3201,15 @@ SETTINGS_CARDS = {
             ("network_settings", "available_on_lan"),
             ("network_settings", "show_ip"),
         ],
+    ),
+    "server_dry_run": SettingCard(
+        key="server_dry_run",
+        title="Dry Run",
+        description=(
+            "Inspect incoming request payloads and formatted prompts without sending "
+            "anything to a provider."
+        ),
+        field_refs=[("network_settings", "dry_run_mode")],
     ),
     "server_model_ids": SettingCard(
         key="server_model_ids",
@@ -2980,6 +3297,7 @@ SETTINGS_CARDS = {
             ("application_settings", "update_status_info"),
             ("application_settings", "check_for_updates_btn"),
             ("application_settings", "check_for_updates_on_startup"),
+            ("application_settings", "legacy_update_restore_config_logs"),
         ],
     ),
     "log_to_files": SettingCard(
@@ -3051,80 +3369,90 @@ SETTINGS_CARDS = {
             ("system_settings", "config_storage_custom_path"),
         ],
     ),
+    "advanced_diagnostics": SettingCard(
+        key="advanced_diagnostics",
+        title="Diagnostics",
+        field_refs=[
+            ("diagnostics", "extra_debug_logs"),
+        ],
+    ),
     "experimental_features": SettingCard(
         key="experimental_features",
         title="Experimental Features",
         field_refs=[
             ("experimental", "enable_loadouts"),
-            ("experimental", "providers_in_parallel"),
-            ("experimental", "providers_in_parallel_note"),
-            ("experimental", "parallelize_request_queue"),
-            ("experimental", "parallelize_request_queue_note"),
-            ("experimental", "full_parallelization"),
-            ("experimental", "full_parallelization_note"),
-            ("experimental", "parallel_enable_deepseek"),
-            ("experimental", "parallel_instances_deepseek"),
-            ("experimental", "parallel_enable_glm"),
-            ("experimental", "parallel_instances_glm"),
-            ("experimental", "parallel_enable_moonshot"),
-            ("experimental", "parallel_instances_moonshot"),
-            ("experimental", "parallel_enable_qwen"),
-            ("experimental", "parallel_instances_qwen"),
-            ("experimental", "parallel_enable_perplexity"),
-            ("experimental", "parallel_instances_perplexity"),
-            ("experimental", "parallel_enable_huggingchat"),
-            ("experimental", "parallel_instances_huggingchat"),
-            ("experimental", "parallel_enable_aistudio"),
-            ("experimental", "parallel_instances_aistudio"),
             ("experimental", "enable_remote_control"),
             ("experimental", "remote_control_password"),
         ],
+    ),
+    "runtime_parallelization": SettingCard(
+        key="runtime_parallelization",
+        title="Providers in Parallel",
+        description=(
+            "Choose which provider browsers stay open and how much queued API work can run at once."
+        ),
+        field_refs=[
+            ("runtime", "providers_in_parallel"),
+            ("runtime", "parallelization_mode"),
+            ("runtime", "parallel_provider_lanes"),
+            ("runtime", "parallel_concurrent_launch"),
+            ("runtime", "parallel_launch_in_batches"),
+            ("runtime", "parallel_launch_batch_size"),
+        ],
+        special="runtime_parallelization",
     ),
 }
 
 
 PROVIDER_BEHAVIOR_GROUPS = {
     "deepseek_behavior": [
-        {"title": "Core", "icon": "settings.svg", "fields": ["enable_deepthink", "send_deepthink", "enable_search"]},
+        {"title": "Core", "icon": "settings.svg", "fields": ["request_capture_mode", "enable_deepthink", "send_deepthink", "enable_search"]},
         {"title": "Uploads", "icon": "upload.svg", "fields": ["send_as_text_file", "file_upload_timeout"]},
         {"title": "Retry and Reuse", "icon": "rotate-ccw.svg", "fields": ["clean_regeneration", "auto_delete_chats", "auto_delete_chats_warning", "multi_slot_cache", "first_chunk_timeout"]},
-        {"title": "Filtering", "icon": "shield-ban.svg", "fields": ["anti_censorship"]},
+        {"title": "Blocked Responses", "icon": "shield-ban.svg", "fields": ["anti_censorship"]},
     ],
     "glm_behavior": [
-        {"title": "Core", "icon": "settings.svg", "fields": ["model", "enable_deepthink", "send_deepthink", "count_tokens", "search_forced_off_note", "enable_search", "enable_advanced_search", "enable_tools"]},
+        {"title": "Core", "icon": "settings.svg", "fields": ["request_capture_mode", "model", "enable_deepthink", "deepthink_effort", "send_deepthink", "count_tokens", "search_forced_off_note", "enable_search", "enable_advanced_search", "enable_tools"]},
         {"title": "Uploads", "icon": "upload.svg", "fields": ["send_as_text_file", "file_upload_timeout", "text_file_filler"]},
         {"title": "Retry and Reuse", "icon": "rotate-ccw.svg", "fields": ["clean_regeneration", "auto_delete_chats", "auto_delete_chats_warning", "repetition_buster", "multi_slot_cache"]},
         {"title": "Quirks", "icon": "bug.svg", "fields": ["ui_click_timeout", "post_action_delay", "message_send_timeout", "completion_request_timeout", "first_chunk_timeout", "refresh_after_generation"]},
     ],
     "moonshot_behavior": [
-        {"title": "Core", "icon": "settings.svg", "fields": ["enable_deepthink", "send_deepthink", "search_and_think_note", "enable_search"]},
+        {"title": "Core", "icon": "settings.svg", "fields": ["request_capture_mode", "enable_deepthink", "send_deepthink", "search_and_think_note", "enable_search"]},
         {"title": "Uploads", "icon": "upload.svg", "fields": ["send_as_text_file", "file_upload_timeout", "text_file_filler"]},
         {"title": "Retry and Reuse", "icon": "rotate-ccw.svg", "fields": ["clean_regeneration", "auto_delete_chats", "auto_delete_chats_warning", "multi_slot_cache"]},
-        {"title": "Filtering", "icon": "shield-ban.svg", "fields": ["anti_censorship"]},
+        {"title": "Blocked Responses", "icon": "shield-ban.svg", "fields": ["anti_censorship"]},
     ],
     "qwen_behavior": [
-        {"title": "Core", "icon": "settings.svg", "fields": ["model", "enable_deepthink", "send_deepthink", "count_tokens", "search_forced_off_note", "enable_search", "enable_tools"]},
+        {"title": "Core", "icon": "settings.svg", "fields": ["request_capture_mode", "model", "enable_deepthink", "send_deepthink", "count_tokens", "search_forced_off_note", "enable_search", "enable_tools"]},
         {"title": "Uploads", "icon": "upload.svg", "fields": ["send_as_text_file", "text_file_message", "file_upload_timeout", "message_send_timeout"]},
         {"title": "Retry and Reuse", "icon": "rotate-ccw.svg", "fields": ["clean_regeneration", "auto_delete_chats", "auto_delete_chats_warning", "multi_slot_cache"]},
         {"title": "Quirks", "icon": "bug.svg", "fields": ["completion_request_timeout", "first_chunk_timeout"]},
     ],
+    "mimo_behavior": [
+        {"title": "Core", "icon": "settings.svg", "fields": ["request_capture_mode", "model", "thinking_forced_note", "send_deepthink", "count_tokens", "search_forced_off_note", "auto_decline_cookies"]},
+        {"title": "Proxy", "icon": "globe.svg", "fields": ["use_proxy", "proxy_url"]},
+        {"title": "Uploads", "icon": "upload.svg", "fields": ["send_as_text_file", "text_file_message", "file_upload_timeout", "message_send_timeout"]},
+        {"title": "Retry and Reuse", "icon": "rotate-ccw.svg", "fields": ["clean_regeneration", "multi_slot_cache"]},
+        {"title": "Quirks", "icon": "bug.svg", "fields": ["completion_request_timeout", "first_chunk_timeout"]},
+    ],
     "perplexity_behavior": [
-        {"title": "Core", "icon": "settings.svg", "fields": ["model", "subscription_note", "enable_deepthink", "send_deepthink", "search_forced_off_note", "enable_search"]},
+        {"title": "Core", "icon": "settings.svg", "fields": ["request_capture_mode", "model", "subscription_note", "enable_deepthink", "send_deepthink", "search_forced_off_note", "enable_search"]},
         {"title": "Spaces", "icon": "sparkles.svg", "fields": ["use_spaces", "paste_system_instructions_into_space"]},
         {"title": "Uploads", "icon": "upload.svg", "fields": ["send_as_text_file", "text_file_message", "file_upload_timeout", "message_send_timeout"]},
     ],
     "huggingchat_behavior": [
-        {"title": "Core", "icon": "settings.svg", "fields": ["model", "inference_provider", "subscription_note", "auto_disable_ratelimited_accounts", "enable_deepthink", "thinking_effort", "send_deepthink", "search_forced_off_note", "enable_search"]},
+        {"title": "Core", "icon": "settings.svg", "fields": ["request_capture_mode", "model", "inference_provider", "subscription_note", "auto_disable_ratelimited_accounts", "enable_deepthink", "thinking_effort", "send_deepthink", "search_forced_off_note", "enable_search"]},
         {"title": "System Prompt", "icon": "type.svg", "fields": ["use_system_prompt_field", "paste_leading_system_messages"]},
         {"title": "Uploads", "icon": "upload.svg", "fields": ["send_as_text_file", "text_file_message", "file_upload_timeout", "file_upload_settle_delay", "message_send_timeout"]},
         {"title": "Retry and Reuse", "icon": "rotate-ccw.svg", "fields": ["clean_regeneration", "auto_delete_chats", "auto_delete_chats_warning", "multi_slot_cache"]},
         {"title": "Quirks", "icon": "bug.svg", "fields": ["completion_request_timeout", "first_chunk_timeout", "model_apply_timeout", "post_action_delay"]},
     ],
     "aistudio_behavior": [
-        {"title": "Core", "icon": "settings.svg", "fields": ["provider_lock_warning", "model", "enable_deepthink", "thinking_level", "send_deepthink"]},
+        {"title": "Core", "icon": "settings.svg", "fields": ["request_capture_mode", "model", "enable_deepthink", "thinking_level", "send_deepthink"]},
         {"title": "Tools and Uploads", "icon": "upload.svg", "fields": ["enable_search", "enable_url_context", "use_system_prompt_field", "send_as_text_file", "text_file_message", "file_upload_timeout"]},
-        {"title": "Filtering", "icon": "shield-ban.svg", "fields": ["anti_censorship", "caars_enabled", "caars_savior_model", "anti_censorship_replacement_message", "anti_censorship_continue_nudge"]},
+        {"title": "Blocked Responses", "icon": "shield-ban.svg", "fields": ["anti_censorship", "caars_enabled", "caars_savior_model", "anti_censorship_replacement_message", "anti_censorship_continue_nudge", "anti_censorship_edit_save_timeout", "anti_censorship_edit_save_retries"]},
         {"title": "Sampling", "icon": "sliders-horizontal.svg", "fields": ["temperature", "top_p", "max_output_tokens"]},
-        {"title": "Automation", "icon": "sparkles.svg", "fields": ["auto_login_redirect_timeout", "assume_english_ui", "assume_english_ui_warning", "assume_paid_model_access", "assume_paid_model_access_warning", "paid_model_access_emails", "clean_regeneration", "preflight_next_chat"]},
+        {"title": "Automation", "icon": "sparkles.svg", "fields": ["auto_login_redirect_timeout", "humanize_mouse_movements", "assume_english_ui", "assume_english_ui_warning", "assume_paid_model_access", "assume_paid_model_access_warning", "paid_model_access_emails", "clean_regeneration", "preflight_next_chat"]},
     ],
 }

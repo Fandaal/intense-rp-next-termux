@@ -13,8 +13,8 @@ This page covers the "maintenance" side of IntenseRP Next v2: where settings liv
 These controls are spread across a few of the newer Settings sections:
 
 - :material-arrow-right: **Settings** → **Provider and Login** → **Saved Sessions** (profiles + session cleanup)
-- :material-arrow-right: **Settings** → **Provider and Login** → **Browser Environment** (locale + optional timezone override)
-- :material-arrow-right: **Settings** → **Advanced** → **Provider Stability** (provider locks + crash warnings)
+- :material-arrow-right: **Settings** → **Browser & Runtime** → **Browser Environment** (locale, optional timezone override, and browser proxy URL)
+- :material-arrow-right: **Settings** → **Browser & Runtime** → **Provider Stability** (provider locks + crash warnings)
 - :material-arrow-right: **Settings** → **Advanced** → **Config Storage** (config directory location)
 - :material-arrow-right: **Settings** → **Interface** → **Main Window** / **Updates** (queue panel, hotswap button, version checks)
 - :material-arrow-right: **Settings** → **Logs and Troubleshooting** → **Logging Levels** (per-target log severity)
@@ -34,7 +34,7 @@ When enabled, IntenseRP launches Chromium using a **persistent browser context**
 ```
 [config_dir]/playwright_profiles/accounts/<provider>/<identity>/
 ```
-The `<provider>` is one of `deepseek`, `glm_chat`, `moonshot_kimi`, `qwen_lm`, `perplexity`, `huggingchat`, or `aistudio`. The `<identity>` is either a hashed email/username hash (when an account is selected) or `manual` (when no account is selected).
+The `<provider>` is one of `deepseek`, `glm_chat`, `moonshot_kimi`, `qwenlm`, `perplexity`, `huggingchat`, `aistudio`, or `mimo`. The `<identity>` is either a hashed email/username hash (when an account is selected) or `manual` (when no account is selected).
 
 Next time you start the app, it loads that same profile, so you usually won't see a login page at all.
 
@@ -47,12 +47,13 @@ Next time you start the app, it loads that same profile, so you usually won't se
 
 IntenseRP can now nudge provider pages toward a more predictable browser environment at launch time.
 
-:material-arrow-right: **Settings** → **Provider and Login** → **Browser Environment**
+:material-arrow-right: **Settings** → **Browser & Runtime** → **Browser Environment**
 
-There are two knobs here:
+There are three knobs here:
 
 - **Preferred Browser Locale** defaults to **English (en-US)**. This uses Playwright's locale emulation, which affects things like `navigator.language`, the `Accept-Language` header, and locale-sensitive formatting.
 - **Browser Timezone** is optional and defaults to **System Default**. Right now the built-in override is **New York (`America/New_York`)**.
+- **Browser Proxy URL** is optional. It routes provider browser contexts through an HTTP, HTTPS, SOCKS4, or SOCKS5 proxy.
 
 This is intentionally a best-effort hint. Locale can help with providers that otherwise open in a non-English UI, especially on fresh sessions. IntenseRP requires the locale to be English for all drivers to work (because of some hooks we rely on), so this can be reasonable to set even if you don't care about the locale itself.
 
@@ -63,18 +64,21 @@ This is intentionally a best-effort hint. Locale can help with providers that ot
 !!! note "Practical recommendation"
     Keeping the locale on **English (en-US)** is pretty reasonable for IntenseRP, because **all** drivers currently expect English UI text anyway. The timezone override is more situational, so it's left off by default.
 
+!!! tip "MiMo regional access"
+    Xiaomi MiMo also has a provider-specific proxy setting under **Provider Behavior -> Xiaomi MiMo -> Proxy**. Use that if only MiMo needs a permitted network route.
+
 ---
 
 ## :material-lock-alert: Provider Locks
 
 Provider locks are temporary safety blocks for providers that are implemented, but currently known to fail in a way that makes normal automation misleading or unusable.
 
-:material-arrow-right: **Settings** -> **Advanced** -> **Provider Stability** -> **Ignore Provider Locks**
+:material-arrow-right: **Settings** -> **Browser & Runtime** -> **Provider Stability** -> **Ignore Provider Locks**
 
-Right now, this mainly affects **Google AI Studio**. AI Studio currently appears to detect Patchright/automated browser sessions and can prevent IntenseRP from sending messages at all. With the lock active, AI Studio stays configurable under **Provider Behavior**, but it is hidden from normal provider selection and blocked in API routing.
+Right now, there is no default provider lock active. Google AI Studio is selectable again because its **Humanize Mouse Movements** reliability mode is enabled by default.
 
 !!! warning "The override is not a fix"
-    **Ignore Provider Locks** only bypasses IntenseRP's safety lock. It does not make the provider more automation-friendly. Use it only when you are sure your setup can send messages from that provider without issues.
+    **Ignore Provider Locks** only skips IntenseRP's safety lock if a future temporary lock is added. It does not make a provider more automation-friendly. Use it only when you are sure your setup can send messages from that provider without issues.
 
 ---
 
@@ -188,7 +192,7 @@ During migration, IntenseRP will:
 
 ---
 
-## :material-content-save: Backup & Restore
+## :material-content-save: Backup & Restore { #backup--restore }
 
 IntenseRP Next v2 includes a built-in backup/import tool that packages your active config directory into a `.zip`.
 
@@ -198,10 +202,12 @@ IntenseRP Next v2 includes a built-in backup/import tool that packages your acti
 2. Click **Backup to .zip** and choose a save location
 3. To restore, click **Import from .zip** and select your backup zip
 
-After backup/import, settings reload automatically. Import replaces the contents of your active `[config_dir]`.
+After backup/import, settings reload automatically. A complete import replaces the contents of your active `[config_dir]`.
+
+If the backup is missing an optional selected category, such as Profiles or Credentials, IntenseRP imports the data it found and leaves that missing local category alone.
 
 !!! warning "Import overwrites your current config"
-    Import replaces your active config directory contents. Create a backup zip first if you want an easy rollback.
+    A complete import replaces your active config directory contents. Create a backup zip first if you want an easy rollback.
 
 !!! tip "Stop services for reliable imports"
     If Persistent Sessions are enabled and the browser is running, profile files can be in use. Click **Stop** in the main window before importing.
@@ -287,6 +293,10 @@ You'll get an "Update Available" dialog and can choose a method based on how you
     - Stages an update payload
     - Runs a small updater and restarts the app
 
+    By default, Auto-Update keeps your existing `config_data/` and `logs/` as whole local folders instead of copying them from the old app folder into the new one. The updater also removes those folder names from the staged update payload if they somehow appear there, so a release package can't replace your local config or logs by accident.
+
+    If you need the older behavior for troubleshooting, enable **Use Legacy Update Data Restore** in the Updates settings. That mode copies/merges `config_data/` and `logs/` from the old app backup into the new install, which is slower for large browser profiles.
+
     !!! warning "Not available on source runs"
         If you're running `python main.py`, Auto-Update is disabled.
 
@@ -330,6 +340,28 @@ You can force-show the "Update Installed" dialog (without actually installing an
 
     ```bash
     python main.py --fakeUpdate
+    ```
+
+### Debug: `--localUpdateDebug`
+
+You can force-show a white "Debug Update Available" dialog and run Auto-Update from a local build artifact:
+
+```bash
+--localUpdateDebug path/to/release.zip
+```
+
+The argument must point to a `.zip` release package, like the one created by `scripts/build_windows.ps1`. The archive still needs the normal release layout, including the app folder and `optional/updater.exe`.
+
+!!! warning "This really runs the updater"
+    This is for testing updater weirdness before release, but it isn't a dry run. If you click through the install flow, it will stage that ZIP and update the current packaged install.
+
+!!! note "Older artifacts can behave oddly"
+    The updater executable is loaded from the staged ZIP. If you test with an older artifact, that older `optional/updater.exe` may not understand the launch arguments used by your current app build.
+
+=== ":material-microsoft-windows: Packaged build (Windows)"
+
+    ```powershell
+    .\intenserp-next-v2.exe --localUpdateDebug .\dist\intenserp-next-v2-win32-x64.zip
     ```
 
 ---

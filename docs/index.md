@@ -14,7 +14,10 @@ icon: material/home
 
 **IntenseRP Next v2** is a local desktop app that lets OpenAI-compatible clients, like SillyTavern, talk to supported provider web chats through a real browser.
 
-In plain terms, you log into a provider website, IntenseRP automates that page, and your client talks to IntenseRP through a local `/v1` API as usual. It's still a bit hacky by nature, because provider web UIs were not built to be APIs, but v2 is built to make that flow much steadier and easier to live with.
+In plain terms, you log into a provider website, IntenseRP automates that page, and your client talks to IntenseRP through a local `/v1` API as usual. It's fragile by nature, because provider web UIs were not built to be APIs, but v2 was built to make that flow steadier and easier to live with.
+
+!!! warning "Archived project"
+    IntenseRP Next v2 is being archived and is no longer actively maintained. The docs remain here for existing users and historical reference.
 
 <div class="grid cards" markdown>
 
@@ -62,14 +65,13 @@ v2 is a full rewrite, in simple words! The important part for users is not the r
 - A cleaner OpenAI-compatible API for clients like SillyTavern.
 - Support for a lot more providers than just DeepSeek, with more on the way.
 
-!!! note "Work in Progress"
-    IntenseRP is still moving quickly. Provider websites can also change without warning, because apparently websites enjoy breaking stuff. If something suddenly breaks, check the [GitHub repository](https://github.com/LyubomirT/intense-rp-next), the [News page](news.md), or the [Troubleshooting checklist](hands/troubleshooting.md), as the fix might already be out or in the works. If it's not yet known, please report it in the [GitHub Issues](https://github.com/LyubomirT/intense-rp-next/issues) or on our [Discord server](https://discord.gg/4Gvjk2RdsK) so I can get it fixed as soon as possible!
+!!! note "Maintenance status"
+    Provider websites can change without warning. Because this project is being archived, breakages may not be fixed. Check the [GitHub repository](https://github.com/LyubomirT/intense-rp-next), the [News page](news.md), or the [Troubleshooting checklist](hands/troubleshooting.md) for historical context before relying on an existing release.
 
-## Community & Support
+## Community & Project Status
 
-Need help, want to report a bug, or just want to keep up with updates?
+Need project context, old troubleshooting notes, or community links?
 
 [Contact The Dev](hands/contact.md){ .md-button }
 [Join Discord](https://discord.gg/4Gvjk2RdsK){ .md-button }
-[Report a Bug](https://github.com/LyubomirT/intense-rp-next/issues){ .md-button }
-[Support the Project](hands/support.md){ .md-button }
+[Project Status](hands/support.md){ .md-button }

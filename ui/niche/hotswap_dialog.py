@@ -26,6 +26,7 @@ PROVIDER_ICON_MAP: dict[str, str] = {
     "Perplexity": "providers/perplexity.svg",
     "HuggingChat": "providers/huggingface.svg",
     "Google AI Studio": "providers/aistudio.svg",
+    "Xiaomi MiMo": "providers/xiaomi.svg",
 }
 
 ALL_PROVIDERS: list[str] = provider_options()

@@ -25,12 +25,20 @@ from config.loadouts import (
 )
 from config.manager import ConfigManager
 from config.location import infer_preset_from_config_dir, migrate_config_dir, resolve_config_dir, write_pointer_file
-from config.schema import SCHEMA, SettingType, SETTINGS_SECTIONS, SETTINGS_CARDS, PROVIDER_BEHAVIOR_GROUPS
+from config.schema import (
+    PROVIDER_BEHAVIOR_GROUPS,
+    RUNTIME_PARALLEL_MODE_OPTIONS,
+    SCHEMA,
+    SETTINGS_CARDS,
+    SETTINGS_SECTIONS,
+    SettingType,
+)
 from drivers.providers import DriverProvider, provider_options
 from ui.core.brand import BrandColors
-from ui.widgets.components import Tumbler, StyledLineEdit, StyledTextEdit, StyledComboBox, Divider, Description, HintCard, StyledButton, MultiColumnRow, SettingRow, ToggleRow, InputPairsWidget, InputListWidget, DirectoryEntry
+from ui.widgets.components import Tumbler, StyledLineEdit, StyledTextEdit, StyledComboBox, Divider, Description, HintCard, StyledButton, MultiColumnRow, SettingRow, ToggleRow, InputPairsWidget, InputListWidget, DirectoryEntry, SegmentedSwitcher
 from ui.widgets.marshmallow_dropdown import MarshmallowDropdown, MarshmallowMultiSelectDropdown, MarshmallowOption
 from ui.widgets.redirect_card import RedirectCard
+from ui.widgets.runtime_parallelization import RuntimeProviderLaneDropdown
 from ui.widgets.tooltip_text import render_tooltip_text
 from ui.widgets.smooth_scroll_area import SmoothScrollArea
 from ui.ece.credential_manager_dialog import CredentialManagerDialog
@@ -42,6 +50,9 @@ from utils.api_key_generator import generate_api_key
 from utils.ip_utils import normalize_ip_list
 from utils.update_checker import check_for_updates, read_local_version
 from utils.docs_links import build_docs_url
+from utils.providers_in_parallel import (
+    MAX_FULL_PARALLEL_PROVIDER_INSTANCES,
+)
 
 INFO_BUBBLE_HOVER_EVENTS = frozenset({
     QEvent.Enter,
@@ -831,6 +842,7 @@ class SettingsWindow(QMainWindow):
         "perplexity_behavior": "providers/perplexity.svg",
         "huggingchat_behavior": "providers/huggingface.svg",
         "aistudio_behavior": "providers/aistudio.svg",
+        "mimo_behavior": "providers/xiaomi.svg",
         "diagnostics": "bug.svg",
         "logfiles": "file.svg",
         "application_settings": "settings.svg",
@@ -839,6 +851,7 @@ class SettingsWindow(QMainWindow):
         "console_dumping": "download.svg",
         "network_settings": "share-2.svg",
         "experimental": "flask-conical.svg",
+        "runtime": "circle-gauge.svg",
     }
 
     BEHAVIOR_CATEGORY_BY_PROVIDER = {
@@ -906,6 +919,7 @@ class SettingsWindow(QMainWindow):
         self._loadout_editor_selected_names = {}
         self._loadout_editor_draft_by_provider = {}
         self._loadout_editor_formatting_card_key = "loadout_editor"
+        self._runtime_parallelization_widgets = {}
         self._persistent_profile_entries = {}
         self._persistent_profile_options_loaded = False
         self._active_docs_focus_container = None
@@ -1364,6 +1378,7 @@ class SettingsWindow(QMainWindow):
                         "Perplexity": "providers/perplexity.svg",
                         "HuggingChat": "providers/huggingface.svg",
                         "Google AI Studio": "providers/aistudio.svg",
+                        "Xiaomi MiMo": "providers/xiaomi.svg",
                     }.get(provider_name)
                     if not icon_file:
                         continue
@@ -1390,6 +1405,13 @@ class SettingsWindow(QMainWindow):
                         force=not self._persistent_profile_options_loaded,
                     )
                 )
+        elif field.type == SettingType.SWITCHER:
+            widget = SegmentedSwitcher(
+                field.options or [],
+                default_value=str(field.default or ""),
+            )
+            if not getattr(field, "transient", False):
+                widget.valueChanged.connect(self._on_setting_changed)
         elif field.type == SettingType.INPUT_PAIR:
             widget = InputPairsWidget(alternative_actions=field.alternative_actions)
             widget.pairsChanged.connect(self._on_setting_changed)
@@ -1614,6 +1636,8 @@ class SettingsWindow(QMainWindow):
                     value_text = str(value)
                     if widget.findText(value_text) >= 0:
                         widget.setCurrentText(value_text)
+            elif field.type == SettingType.SWITCHER and isinstance(widget, SegmentedSwitcher):
+                widget.set_value(str(value or field.default or ""), emit=False, animate=False)
             elif field.type == SettingType.INPUT_PAIR:
                 widget.set_pairs(value or [])
             elif field.type == SettingType.INPUT_LIST:
@@ -1636,6 +1660,7 @@ class SettingsWindow(QMainWindow):
 
         self._sync_config_storage_from_active_dir()
         self._sync_provider_behavior_default_page(force=True)
+        self._sync_runtime_parallelization_widgets_from_config()
         self._refresh_loadout_editor_widgets()
         self._sync_application_settings_info()
         if refresh_profiles:
@@ -2498,6 +2523,8 @@ class SettingsWindow(QMainWindow):
             return self._build_loadout_editor_card(section_key, card_def)
         if getattr(card_def, "special", None) == "provider_behavior":
             return self._build_provider_behavior_card(section_key, card_def)
+        if getattr(card_def, "special", None) == "runtime_parallelization":
+            return self._build_runtime_parallelization_card(section_key, card_def)
         return self._build_standard_card(section_key, card_def)
 
     def _provider_icon_file(self, provider: DriverProvider | None) -> str | None:
@@ -2509,7 +2536,426 @@ class SettingsWindow(QMainWindow):
             DriverProvider.PERPLEXITY: "providers/perplexity.svg",
             DriverProvider.HUGGINGCHAT: "providers/huggingface.svg",
             DriverProvider.AI_STUDIO: "providers/aistudio.svg",
+            DriverProvider.MIMO: "providers/xiaomi.svg",
         }.get(provider)
+
+    def _all_runtime_parallel_providers(self) -> list[DriverProvider]:
+        return [
+            DriverProvider.DEEPSEEK,
+            DriverProvider.GLM_CHAT,
+            DriverProvider.MOONSHOT,
+            DriverProvider.QWEN_LM,
+            DriverProvider.PERPLEXITY,
+            DriverProvider.HUGGINGCHAT,
+            DriverProvider.AI_STUDIO,
+            DriverProvider.MIMO,
+        ]
+
+    def _available_runtime_parallel_providers(self) -> list[DriverProvider]:
+        allowed = {
+            DriverProvider.from_setting(option)
+            for option in provider_options(include_locked=False, config_manager=self.config_manager)
+        }
+        current = self._get_selected_provider()
+        if current is not None:
+            allowed.add(current)
+        return [provider for provider in self._all_runtime_parallel_providers() if provider in allowed]
+
+    def _runtime_parallel_mode_from_config(self) -> str:
+        saved_mode = str(self.config_manager.get_setting("runtime", "parallelization_mode") or "").strip()
+        valid_modes = {key for key, _label in RUNTIME_PARALLEL_MODE_OPTIONS}
+        if saved_mode in valid_modes:
+            return saved_mode
+        for key, label in RUNTIME_PARALLEL_MODE_OPTIONS:
+            if saved_mode == label:
+                return key
+        return "provider_lanes"
+
+    def _runtime_parallel_mode_key(self) -> str:
+        combo = self._runtime_parallelization_widgets.get("mode")
+        if isinstance(combo, StyledComboBox):
+            data = combo.currentData()
+            if data:
+                return str(data)
+            text = combo.currentText()
+            for key, label in RUNTIME_PARALLEL_MODE_OPTIONS:
+                if label == text:
+                    return key
+        return self._runtime_parallel_mode_from_config()
+
+    def _set_combo_current_data(self, combo: StyledComboBox, key: str) -> None:
+        for index in range(combo.count()):
+            if str(combo.itemData(index) or "") == str(key or ""):
+                combo.setCurrentIndex(index)
+                return
+
+    def _normalize_runtime_lane_value(self, value) -> tuple[list[DriverProvider], dict[DriverProvider, int]]:
+        if not isinstance(value, dict):
+            value = {}
+
+        raw_providers = value.get("providers")
+        if not isinstance(raw_providers, list):
+            raw_providers = []
+
+        raw_instances = value.get("instances")
+        if not isinstance(raw_instances, dict):
+            raw_instances = {}
+
+        provider_set: set[DriverProvider] = set()
+        for raw_provider in raw_providers:
+            provider = DriverProvider.from_setting(raw_provider)
+            if provider is not None:
+                provider_set.add(provider)
+
+        selected = [
+            provider
+            for provider in self._all_runtime_parallel_providers()
+            if provider in provider_set
+        ]
+
+        counts: dict[DriverProvider, int] = {}
+        for provider in self._all_runtime_parallel_providers():
+            raw_count = raw_instances.get(provider.value, raw_instances.get(provider.name, 1))
+            try:
+                count = int(raw_count)
+            except (TypeError, ValueError):
+                count = 1
+            counts[provider] = max(1, min(MAX_FULL_PARALLEL_PROVIDER_INSTANCES, count))
+
+        return selected, counts
+
+    def _runtime_lane_value_from_widget(self, lanes: RuntimeProviderLaneDropdown) -> dict:
+        current_provider = self._get_selected_provider()
+        selected = [
+            provider.value
+            for provider in lanes.selected_providers()
+            if provider != current_provider
+        ]
+        counts = {
+            provider.value: max(1, min(MAX_FULL_PARALLEL_PROVIDER_INSTANCES, int(count)))
+            for provider, count in lanes.instance_counts().items()
+        }
+        return {"providers": selected, "instances": counts}
+
+    def _normalized_runtime_lane_value_for_compare(self, value) -> dict:
+        selected, counts = self._normalize_runtime_lane_value(value)
+        return {
+            "providers": [provider.value for provider in selected],
+            "instances": {
+                provider.value: counts.get(provider, 1)
+                for provider in self._all_runtime_parallel_providers()
+            },
+        }
+
+    def _selected_parallel_providers_from_config(self) -> list[DriverProvider]:
+        current = self._get_selected_provider()
+        selected, _counts = self._normalize_runtime_lane_value(
+            self.config_manager.get_setting("runtime", "parallel_provider_lanes")
+        )
+        if current is not None and current not in selected:
+            selected.append(current)
+        return selected
+
+    def _parallel_instance_counts_from_config(self) -> dict[DriverProvider, int]:
+        _selected, counts = self._normalize_runtime_lane_value(
+            self.config_manager.get_setting("runtime", "parallel_provider_lanes")
+        )
+        return counts
+
+    def _build_runtime_parallelization_card(self, section_key: str, card_def):
+        card = QWidget()
+        card.setStyleSheet(
+            f"""
+            QWidget {{
+                background-color: {BrandColors.SIDEBAR_BG};
+                border-radius: 8px;
+            }}
+            """
+        )
+        layout = QVBoxLayout(card)
+        layout.setContentsMargins(BrandColors.CARD_PADDING + 4, 18, BrandColors.CARD_PADDING + 4, BrandColors.CARD_PADDING)
+        layout.setSpacing(6)
+
+        title = QLabel(card_def.title)
+        title.setStyleSheet(
+            f"""
+            color: {BrandColors.TEXT_PRIMARY};
+            font-size: {BrandColors.FONT_SIZE_TITLE};
+            font-weight: 700;
+            background-color: transparent;
+            """
+        )
+        layout.addWidget(title)
+
+        divider = QFrame()
+        divider.setFixedHeight(1)
+        divider.setStyleSheet(f"background-color: {BrandColors.INPUT_BORDER}; border: none;")
+        layout.addWidget(divider)
+
+        content_widget = QWidget()
+        content_widget.setStyleSheet("background-color: transparent;")
+        content_layout = QVBoxLayout(content_widget)
+        content_layout.setContentsMargins(0, 0, 0, 0)
+        content_layout.setSpacing(6)
+        self._card_content_layouts[card_def.key] = content_layout
+
+        if getattr(card_def, "description", None):
+            desc = QLabel(render_tooltip_text(card_def.description))
+            desc.setWordWrap(True)
+            desc.setTextFormat(Qt.RichText)
+            desc.setStyleSheet(
+                f"""
+                color: {BrandColors.TEXT_SECONDARY};
+                font-size: {BrandColors.FONT_SIZE_REGULAR};
+                background-color: transparent;
+                padding-top: 4px;
+                padding-bottom: 6px;
+                """
+            )
+            content_layout.addWidget(desc)
+
+        master_field = self._resolve_field_def("runtime", "providers_in_parallel")
+        if master_field is not None:
+            master_entry = self._build_field_entry(master_field, "runtime", section_key, card_def.key)
+            if master_entry is not None:
+                content_layout.addWidget(master_entry)
+            master_widget = self.field_widgets.get("runtime.providers_in_parallel")
+            if isinstance(master_widget, Tumbler):
+                master_widget.stateChanged.connect(self._on_runtime_parallelization_master_changed)
+
+        mode_field = self._resolve_field_def("runtime", "parallelization_mode")
+        lanes_field = self._resolve_field_def("runtime", "parallel_provider_lanes")
+        if mode_field is None or lanes_field is None:
+            Logger.warning("Runtime parallelization schema fields are missing")
+            layout.addWidget(content_widget)
+            self._register_runtime_parallelization_field_locations(section_key, card_def.key)
+            return card
+
+        mode_docs_url = self._get_field_docs_url(mode_field)
+        mode_label = mode_field.label
+        mode_tooltip = mode_field.tooltip or ""
+        mode_description = self._get_field_inline_description(mode_field)
+
+        mode = StyledComboBox()
+        for key, label in RUNTIME_PARALLEL_MODE_OPTIONS:
+            mode.addItem(label, key)
+        mode.setProperty("fullKey", "runtime.parallelization_mode")
+        mode.setProperty("settingInfoTitle", mode_label)
+        mode.setProperty("settingInfoBody", mode_tooltip or mode_description or "")
+        mode.setProperty("docsUrl", mode_docs_url)
+        self.field_widgets["runtime.parallelization_mode"] = mode
+        self._tag_docs_widget(mode, mode_docs_url)
+        mode.currentIndexChanged.connect(self._on_runtime_parallelization_mode_changed)
+        mode_row = SettingRow(
+            mode_label,
+            mode,
+            mode_tooltip,
+            description=mode_description,
+            docs_url=mode_docs_url,
+            docs_handler=self._open_docs_from_sender,
+        )
+        self._runtime_parallelization_widgets["mode"] = mode
+        self._runtime_parallelization_widgets["mode_row"] = mode_row
+        self.setting_rows["runtime.parallelization_mode"] = mode_row
+        self._register_navigation_anchor(mode_row)
+        self._install_info_filters(mode_row)
+        content_layout.addWidget(mode_row)
+
+        lanes_docs_url = self._get_field_docs_url(lanes_field)
+        lanes_label = lanes_field.label
+        lanes_tooltip = lanes_field.tooltip or ""
+        lanes_description = self._get_field_inline_description(lanes_field)
+
+        lanes = RuntimeProviderLaneDropdown(max_instances=MAX_FULL_PARALLEL_PROVIDER_INSTANCES)
+        lanes.setProperty("fullKey", "runtime.parallel_provider_lanes")
+        lanes.setProperty("settingInfoTitle", lanes_label)
+        lanes.setProperty("settingInfoBody", lanes_tooltip or lanes_description or "")
+        lanes.setProperty("docsUrl", lanes_docs_url)
+        self.field_widgets["runtime.parallel_provider_lanes"] = lanes
+        self._tag_docs_widget(lanes, lanes_docs_url)
+        lanes.stateChanged.connect(self._on_runtime_parallelization_lane_changed)
+        lanes_row = SettingRow(
+            lanes_label,
+            lanes,
+            lanes_tooltip,
+            description=lanes_description,
+            docs_url=lanes_docs_url,
+            docs_handler=self._open_docs_from_sender,
+        )
+        self._runtime_parallelization_widgets["lanes"] = lanes
+        self._runtime_parallelization_widgets["lanes_row"] = lanes_row
+        self.setting_rows["runtime.parallel_provider_lanes"] = lanes_row
+        self._register_navigation_anchor(lanes_row)
+        self._install_info_filters(lanes_row)
+        content_layout.addWidget(lanes_row)
+
+        startup_divider = Divider("Startup")
+        self._runtime_parallelization_widgets["startup_divider"] = startup_divider
+        content_layout.addWidget(startup_divider)
+        for field_key in (
+            "parallel_concurrent_launch",
+            "parallel_launch_in_batches",
+            "parallel_launch_batch_size",
+        ):
+            field = self._resolve_field_def("runtime", field_key)
+            if field is None:
+                continue
+            entry = self._build_field_entry(field, "runtime", section_key, card_def.key)
+            if entry is not None:
+                content_layout.addWidget(entry)
+
+        layout.addWidget(content_widget)
+        self._sync_runtime_parallelization_widgets_from_config()
+        self._register_runtime_parallelization_field_locations(section_key, card_def.key)
+        return card
+
+    def _register_runtime_parallelization_field_locations(self, section_key: str, card_key: str) -> None:
+        mode_display_key = "runtime.parallelization_mode"
+        lanes_display_key = "runtime.parallel_provider_lanes"
+        mode_row = self._runtime_parallelization_widgets.get("mode_row")
+        lanes_row = self._runtime_parallelization_widgets.get("lanes_row")
+        if mode_row is not None:
+            self._display_rows[mode_display_key] = mode_row
+        if lanes_row is not None:
+            self._display_rows[lanes_display_key] = lanes_row
+
+    def _sync_runtime_parallelization_widgets_from_config(self) -> None:
+        if not self._runtime_parallelization_widgets:
+            return
+
+        previous_suppress = self._suppress_dirty_tracking
+        self._suppress_dirty_tracking = True
+        try:
+            master = self._runtime_parallelization_widgets.get("master")
+            if master is None:
+                master = self.field_widgets.get("runtime.providers_in_parallel")
+                if master is not None:
+                    self._runtime_parallelization_widgets["master"] = master
+            if isinstance(master, Tumbler):
+                master.blockSignals(True)
+                master.setChecked(bool(self.config_manager.get_setting("runtime", "providers_in_parallel")))
+                master.blockSignals(False)
+
+            mode = self._runtime_parallelization_widgets.get("mode")
+            if isinstance(mode, StyledComboBox):
+                mode.blockSignals(True)
+                self._set_combo_current_data(mode, self._runtime_parallel_mode_from_config())
+                mode.blockSignals(False)
+
+            lanes = self._runtime_parallelization_widgets.get("lanes")
+            if isinstance(lanes, RuntimeProviderLaneDropdown):
+                lanes.blockSignals(True)
+                lanes.set_providers(self._available_runtime_parallel_providers())
+                lanes.set_current_provider(self._get_selected_provider())
+                lanes.set_full_mode(self._runtime_parallel_mode_key() == "full_parallel_lanes")
+                lanes.set_state(
+                    selected=self._selected_parallel_providers_from_config(),
+                    counts=self._parallel_instance_counts_from_config(),
+                )
+                lanes.blockSignals(False)
+
+            for field_key in (
+                "parallel_concurrent_launch",
+                "parallel_launch_in_batches",
+                "parallel_launch_batch_size",
+            ):
+                field = self._resolve_field_def("runtime", field_key)
+                if field is not None:
+                    self._apply_field_value(self._category_defs_by_key["runtime"], field)
+
+            self._sync_runtime_parallelization_enabled_state()
+        finally:
+            self._suppress_dirty_tracking = previous_suppress
+
+    def _sync_runtime_parallelization_current_provider(self) -> None:
+        lanes = self._runtime_parallelization_widgets.get("lanes")
+        if not isinstance(lanes, RuntimeProviderLaneDropdown):
+            return
+        lanes.blockSignals(True)
+        try:
+            lanes.set_providers(self._available_runtime_parallel_providers())
+            lanes.set_current_provider(self._get_selected_provider())
+        finally:
+            lanes.blockSignals(False)
+        self._update_dirty_markers()
+
+    def _sync_runtime_parallelization_enabled_state(self) -> None:
+        master = self.field_widgets.get("runtime.providers_in_parallel")
+        enabled = bool(master.isChecked()) if isinstance(master, Tumbler) else bool(
+            self.config_manager.get_setting("runtime", "providers_in_parallel")
+        )
+
+        mode = self._runtime_parallelization_widgets.get("mode")
+        mode_row = self._runtime_parallelization_widgets.get("mode_row")
+        lanes = self._runtime_parallelization_widgets.get("lanes")
+        lanes_row = self._runtime_parallelization_widgets.get("lanes_row")
+        startup_divider = self._runtime_parallelization_widgets.get("startup_divider")
+
+        target = mode_row if isinstance(mode_row, QWidget) else mode
+        self._set_widget_enabled_if_changed(target, enabled)
+        target = lanes_row if isinstance(lanes_row, QWidget) else lanes
+        self._set_widget_enabled_if_changed(target, enabled)
+        self._set_widget_visible_if_changed(startup_divider, enabled)
+
+        if isinstance(lanes, RuntimeProviderLaneDropdown):
+            lanes.set_full_mode(self._runtime_parallel_mode_key() == "full_parallel_lanes")
+
+    def _on_runtime_parallelization_master_changed(self) -> None:
+        if self._suppress_dirty_tracking:
+            return
+        QTimer.singleShot(0, self._sync_runtime_parallelization_enabled_state)
+        QTimer.singleShot(0, self._update_dirty_markers)
+
+    def _on_runtime_parallelization_mode_changed(self, *_args) -> None:
+        lanes = self._runtime_parallelization_widgets.get("lanes")
+        if isinstance(lanes, RuntimeProviderLaneDropdown):
+            lanes.set_full_mode(self._runtime_parallel_mode_key() == "full_parallel_lanes")
+        if not self._suppress_dirty_tracking:
+            QTimer.singleShot(0, self._update_dirty_markers)
+
+    def _on_runtime_parallelization_lane_changed(self) -> None:
+        if not self._suppress_dirty_tracking:
+            QTimer.singleShot(0, self._update_dirty_markers)
+
+    def _runtime_parallelization_dirty_rows(self) -> set[str]:
+        dirty_rows: set[str] = set()
+
+        mode = self._runtime_parallelization_widgets.get("mode")
+        if isinstance(mode, StyledComboBox):
+            if self._runtime_parallel_mode_key() != self._runtime_parallel_mode_from_config():
+                dirty_rows.add("runtime.parallelization_mode")
+
+        lanes = self._runtime_parallelization_widgets.get("lanes")
+        if isinstance(lanes, RuntimeProviderLaneDropdown):
+            expected = self._runtime_lane_value_from_widget(lanes)
+            saved = self._normalized_runtime_lane_value_for_compare(
+                self.config_manager.get_setting("runtime", "parallel_provider_lanes")
+            )
+            if expected != saved:
+                dirty_rows.add("runtime.parallel_provider_lanes")
+
+        return dirty_rows
+
+    def _update_runtime_parallelization_dirty_markers(self) -> bool:
+        dirty_rows = self._runtime_parallelization_dirty_rows()
+        for key in ("runtime.parallelization_mode", "runtime.parallel_provider_lanes"):
+            row = self._display_rows.get(key)
+            if hasattr(row, "set_dirty"):
+                row.set_dirty(key in dirty_rows)
+        return bool(dirty_rows)
+
+    def _apply_runtime_parallelization_to_config(self) -> None:
+        mode = self._runtime_parallelization_widgets.get("mode")
+        if isinstance(mode, StyledComboBox):
+            self.config_manager.set_setting("runtime", "parallelization_mode", self._runtime_parallel_mode_key())
+
+        lanes = self._runtime_parallelization_widgets.get("lanes")
+        if isinstance(lanes, RuntimeProviderLaneDropdown):
+            self.config_manager.set_setting(
+                "runtime",
+                "parallel_provider_lanes",
+                self._runtime_lane_value_from_widget(lanes),
+            )
 
     @staticmethod
     def _format_reasoning_effort_provider_summary(count: int) -> str:
@@ -2537,6 +2983,7 @@ class SettingsWindow(QMainWindow):
             DriverProvider.PERPLEXITY,
             DriverProvider.HUGGINGCHAT,
             DriverProvider.AI_STUDIO,
+            DriverProvider.MIMO,
         ):
             behavior_key = self.BEHAVIOR_CATEGORY_BY_PROVIDER.get(provider)
             if not behavior_key:
@@ -2562,6 +3009,7 @@ class SettingsWindow(QMainWindow):
             DriverProvider.PERPLEXITY,
             DriverProvider.HUGGINGCHAT,
             DriverProvider.AI_STUDIO,
+            DriverProvider.MIMO,
         ):
             behavior_key = self.BEHAVIOR_CATEGORY_BY_PROVIDER.get(provider)
             if not behavior_key:
@@ -2671,6 +3119,7 @@ class SettingsWindow(QMainWindow):
             DriverProvider.PERPLEXITY,
             DriverProvider.HUGGINGCHAT,
             DriverProvider.AI_STUDIO,
+            DriverProvider.MIMO,
         ):
             behavior_key = self.BEHAVIOR_CATEGORY_BY_PROVIDER.get(provider)
             if not behavior_key:
@@ -3898,8 +4347,12 @@ class SettingsWindow(QMainWindow):
             value = int(text_value) if text_value else 0
         elif field_def.type == SettingType.TEXTAREA:
             value = widget.toPlainText()
+        elif full_key == "runtime.parallelization_mode" and isinstance(widget, StyledComboBox):
+            value = self._runtime_parallel_mode_key()
         elif field_def.type == SettingType.DROPDOWN:
             value = widget.currentText()
+        elif field_def.type == SettingType.SWITCHER and isinstance(widget, SegmentedSwitcher):
+            value = widget.current_value()
         elif field_def.type == SettingType.INPUT_PAIR:
             value = []
             for pair in widget.get_pairs():
@@ -3914,6 +4367,8 @@ class SettingsWindow(QMainWindow):
             value = widget.get_items()
         elif field_def.type == SettingType.MULTI_SELECT_DROPDOWN:
             value = widget.selected_keys()
+        elif field_def.type == SettingType.PROVIDER_LANE_SELECTOR and isinstance(widget, RuntimeProviderLaneDropdown):
+            value = self._runtime_lane_value_from_widget(widget)
 
         is_enabled = self._is_dependency_met(getattr(field_def, "depends", None)) if getattr(field_def, "depends", None) else True
         if (not is_enabled) and (full_key in self._dep_override_cache):
@@ -3960,6 +4415,8 @@ class SettingsWindow(QMainWindow):
 
         if loadouts_enabled:
             any_dirty = any_dirty or self._loadout_base_values_dirty() or self._loadout_editor_has_structural_changes()
+
+        any_dirty = self._update_runtime_parallelization_dirty_markers() or any_dirty
 
         self.unsaved_changes = any_dirty
 
@@ -4085,6 +4542,9 @@ class SettingsWindow(QMainWindow):
         full_key = str(sender.property("fullKey") or "").strip() if sender is not None else ""
         if full_key == "system_settings.ignore_provider_locks":
             QTimer.singleShot(0, self.refresh_dynamic_dropdown_options)
+            QTimer.singleShot(0, self._sync_runtime_parallelization_widgets_from_config)
+        elif full_key == "providers_credentials.provider":
+            QTimer.singleShot(0, self._sync_runtime_parallelization_current_provider)
         if full_key and self._is_loadout_controlled_full_key(full_key):
             field_def = self.field_defs.get(full_key)
             if field_def is not None:
@@ -4151,6 +4611,8 @@ class SettingsWindow(QMainWindow):
             return widget.text()
         if isinstance(widget, StyledComboBox):
             return widget.currentText()
+        if isinstance(widget, SegmentedSwitcher):
+            return widget.current_value()
         if isinstance(widget, StyledTextEdit):
             return widget.toPlainText()
         if isinstance(widget, InputPairsWidget):
@@ -4170,6 +4632,8 @@ class SettingsWindow(QMainWindow):
                 widget.setText("" if value is None else str(value))
             elif isinstance(widget, StyledComboBox):
                 widget.setCurrentText("" if value is None else str(value))
+            elif isinstance(widget, SegmentedSwitcher):
+                widget.set_value("" if value is None else str(value), emit=False, animate=False)
             elif isinstance(widget, StyledTextEdit):
                 widget.setPlainText("" if value is None else str(value))
             elif isinstance(widget, InputPairsWidget):
@@ -4332,6 +4796,7 @@ class SettingsWindow(QMainWindow):
                     self._set_widget_visible_if_changed(widget, should_show)
 
         self._apply_forced_overrides()
+        self._sync_runtime_parallelization_enabled_state()
         if not self._suppress_dirty_tracking:
             self._update_dirty_markers()
 
@@ -4751,6 +5216,7 @@ class SettingsWindow(QMainWindow):
                     remote_version=str(result.remote_version or "unknown"),
                     remote_auto_updateable=getattr(result, "remote_auto_updateable", None),
                     remote_severity=getattr(result, "remote_severity", None),
+                    remote_summary=getattr(result, "remote_summary", None),
                 ),
                 parent=self,
             )
@@ -5233,14 +5699,20 @@ class SettingsWindow(QMainWindow):
                         value = int(text_val) if text_val else 0
                     elif field.type == SettingType.TEXTAREA:
                         value = widget.toPlainText()
+                    elif key == "runtime.parallelization_mode" and isinstance(widget, StyledComboBox):
+                        value = self._runtime_parallel_mode_key()
                     elif field.type == SettingType.DROPDOWN:
                         value = widget.currentText()
+                    elif field.type == SettingType.SWITCHER and isinstance(widget, SegmentedSwitcher):
+                        value = widget.current_value()
                     elif field.type == SettingType.INPUT_PAIR:
                         value = widget.get_pairs()
                     elif field.type == SettingType.INPUT_LIST:
                         value = widget.get_items()
                     elif field.type == SettingType.MULTI_SELECT_DROPDOWN:
                         value = widget.selected_keys()
+                    elif field.type == SettingType.PROVIDER_LANE_SELECTOR and isinstance(widget, RuntimeProviderLaneDropdown):
+                        value = self._runtime_lane_value_from_widget(widget)
                     elif field.type in [SettingType.BUTTON, SettingType.DIVIDER, SettingType.DESCRIPTION, SettingType.HINT, SettingType.ROW, SettingType.REDIRECT]:
                         continue # These don't have values to save
                         
@@ -5276,12 +5748,13 @@ class SettingsWindow(QMainWindow):
                     
                     if not validation_errors:
                         self.config_manager.set_setting(category.key, field.key, value)
-        
+
         if validation_errors:
             error_msg = "\n".join(validation_errors)
             QMessageBox.warning(self, "Validation Error", f"Please fix the following errors:\n\n{error_msg}")
             return
 
+        self._apply_runtime_parallelization_to_config()
         self.config_manager.set_loadouts(self._flatten_loadout_editor_draft())
 
         perform_migration = False

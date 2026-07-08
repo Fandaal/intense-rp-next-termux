@@ -7,6 +7,7 @@ import string
 from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Any, Callable, Iterable, List, Optional, Union
+from urllib.parse import unquote, urlparse
 
 import httpx
 from patchright.async_api import Browser, BrowserContext, Page, async_playwright
@@ -86,7 +87,7 @@ class BaseDriver(ABC):
         self.on_crash_callback = None
         self.monitoring_active = False
         self._monitor_task: Optional[asyncio.Task] = None
-        self.notify_user_callback: Optional[Callable[[str, str, str], None]] = None
+        self.notify_user_callback: Optional[Callable[..., None]] = None
         self.request_user_text_callback: Optional[Callable[..., Any]] = None
         self.profile_compatibility_warning_callback: Optional[Callable[[dict[str, Any]], None]] = None
 
@@ -701,13 +702,33 @@ class BaseDriver(ABC):
             Logger.error(f"Account rotation: driver restart failed: {e}")
             return False
 
-    def notify_user(self, title: str, message: str, level: str = "info") -> None:
+    def notify_user(
+        self,
+        title: str,
+        message: str,
+        level: str = "info",
+        *,
+        dialog_message: str | None = None,
+    ) -> None:
         cb = getattr(self, "notify_user_callback", None)
         if not cb:
             return
 
         try:
-            cb(str(title or ""), str(message or ""), str(level or "info"))
+            if dialog_message is None:
+                cb(str(title or ""), str(message or ""), str(level or "info"))
+            else:
+                cb(
+                    str(title or ""),
+                    str(message or ""),
+                    str(level or "info"),
+                    str(dialog_message or ""),
+                )
+        except TypeError:
+            try:
+                cb(str(title or ""), str(message or ""), str(level or "info"))
+            except Exception:
+                return
         except Exception:
             return
 
@@ -923,7 +944,74 @@ class BaseDriver(ABC):
         if timezone_id:
             options["timezone_id"] = timezone_id
 
+        try:
+            resize_viewport_with_window = bool(
+                self.config_manager.get_setting(
+                    "system_settings",
+                    "browser_resize_viewport_with_window",
+                )
+            )
+        except Exception:
+            resize_viewport_with_window = False
+        if resize_viewport_with_window:
+            options["no_viewport"] = True
+
+        proxy = self._get_browser_proxy_option()
+        if proxy:
+            options["proxy"] = proxy
+
         return options
+
+    def _parse_browser_proxy_option(
+        self,
+        raw_proxy: str,
+        *,
+        setting_label: str = "Browser proxy URL",
+    ) -> dict[str, str] | None:
+        raw_proxy = str(raw_proxy or "").strip()
+        if not raw_proxy:
+            return None
+
+        parsed = urlparse(raw_proxy)
+        scheme = parsed.scheme.lower()
+        if scheme not in {"http", "https", "socks4", "socks5"}:
+            Logger.warning(
+                f"{setting_label} ignored: use http://, https://, socks4://, or socks5://."
+            )
+            return None
+
+        host = parsed.hostname or ""
+        if not host:
+            Logger.warning(f"{setting_label} ignored: missing proxy host.")
+            return None
+
+        try:
+            port = parsed.port
+        except ValueError:
+            Logger.warning(f"{setting_label} ignored: invalid proxy port.")
+            return None
+
+        host_part = f"[{host}]" if ":" in host and not host.startswith("[") else host
+        server = f"{scheme}://{host_part}"
+        if port:
+            server = f"{server}:{port}"
+
+        proxy: dict[str, str] = {"server": server}
+        if parsed.username:
+            proxy["username"] = unquote(parsed.username)
+        if parsed.password:
+            proxy["password"] = unquote(parsed.password)
+        return proxy
+
+    def _get_browser_proxy_option(self) -> dict[str, str] | None:
+        try:
+            raw_proxy = str(
+                self.config_manager.get_setting("system_settings", "browser_proxy_url") or ""
+            ).strip()
+        except Exception:
+            raw_proxy = ""
+
+        return self._parse_browser_proxy_option(raw_proxy)
 
     def _get_browser_launch_args(self) -> list[str]:
         """
@@ -1093,7 +1181,14 @@ class BaseDriver(ABC):
         Run the browser installation using the patchright CLI (async).
         """
         try:
-            await install_chromium_browser(status_callback=status_callback)
+            download_host = self.config_manager.get_setting(
+                "system_settings",
+                "browser_download_mirror_url",
+            )
+            await install_chromium_browser(
+                status_callback=status_callback,
+                download_host=download_host,
+            )
             return True
         except Exception:
             raise
@@ -1373,6 +1468,8 @@ class BaseDriver(ABC):
                     "Provider browser timezone override enabled: "
                     f"{browser_context_options['timezone_id']}"
                 )
+            if browser_context_options.get("no_viewport"):
+                Logger.info("Provider browser viewport will follow browser window size.")
 
             if persistent_sessions:
                 user_data_dir = self._get_persistent_profile_dir()

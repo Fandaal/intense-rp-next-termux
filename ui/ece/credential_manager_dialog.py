@@ -595,6 +595,7 @@ class CredentialManagerDialog(QDialog):
             _ProviderEntry(label="Perplexity", provider=DriverProvider.PERPLEXITY),
             _ProviderEntry(label="HuggingChat", provider=DriverProvider.HUGGINGCHAT),
             _ProviderEntry(label="AI Studio", provider=DriverProvider.AI_STUDIO),
+            _ProviderEntry(label="Xiaomi MiMo", provider=DriverProvider.MIMO),
         ]
 
         provider_icon_map: Dict[DriverProvider, str] = {
@@ -605,6 +606,7 @@ class CredentialManagerDialog(QDialog):
             DriverProvider.PERPLEXITY: "providers/perplexity.svg",
             DriverProvider.HUGGINGCHAT: "providers/huggingface.svg",
             DriverProvider.AI_STUDIO: "providers/aistudio.svg",
+            DriverProvider.MIMO: "providers/xiaomi.svg",
         }
 
         initial_provider = DriverProvider.from_setting(

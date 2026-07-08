@@ -16,8 +16,8 @@ Quick answers to the questions that come up the most. If you need a step-by-step
 ??? question "Is this an official DeepSeek or SillyTavern project?"
     Nope. This is a third-party tool and is not affiliated with DeepSeek, SillyTavern, or any provider.
 
-??? question "Do I need a paid provider API key?"
-    No. IntenseRP uses provider web apps you log into in the browser (DeepSeek / GLM / Moonshot / QwenLM / Perplexity / HuggingChat / Google AI Studio). This project does not use paid official provider APIs.
+??? question "Does this use provider API keys?"
+    No. IntenseRP uses provider web apps you log into in the browser (DeepSeek / GLM / Moonshot / QwenLM / Perplexity / HuggingChat / Google AI Studio). If you need a production-grade or officially supported integration, use the provider's official API.
 
 ??? question "What platforms are supported?"
     Windows and Linux are the supported targets right now. A graphical desktop is required because it launches a real browser.
@@ -40,15 +40,9 @@ Quick answers to the questions that come up the most. If you need a step-by-step
     Yes - keep the provider browser window open while you use IntenseRP. You can minimize it, but if you close it you'll usually need to press Start again.
 
 ??? question "Which model should I pick?"
-    Use the preset that matches your active provider:
+    Use `<provider>-auto` for your active provider. The current prefixes are `deepseek`, `glm`, `moonshot`, `qwen`, `perplexity`, `huggingchat`, `aistudio`, and `mimo`.
 
-    - DeepSeek: `deepseek-auto` / `deepseek-chat` / `deepseek-reasoner`
-    - GLM Chat: `glm-auto` / `glm-chat` / `glm-reasoner`
-    - Moonshot: `moonshot-auto` / `moonshot-chat` / `moonshot-reasoner`
-    - QwenLM: `qwen-auto` / `qwen-chat` / `qwen-reasoner`
-    - Perplexity: `perplexity-auto` / `perplexity-chat` / `perplexity-reasoner`
-    - HuggingChat: `huggingchat-auto` / `huggingchat-chat` / `huggingchat-reasoner`
-    - Google AI Studio: `aistudio-auto` / `aistudio-chat` / `aistudio-reasoner`
+    If you want to force the behavior, use the same prefix with `-chat` or `-reasoner` instead.
 
 ??? question "Why are responses slow sometimes?"
     Two common reasons:

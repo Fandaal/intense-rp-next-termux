@@ -7,7 +7,7 @@ icon: material/api
 This page documents how the built-in OpenAI-compatible API behaves at runtime: what routes exist, how streaming works, and why requests are queued instead of running in parallel.
 
 !!! note "Implementation detail"
-    This is based on the current FastAPI + driver implementation (`api.py`, `deepseek_driver.py`, `glm_driver.py`, `moonshot_driver.py`, `qwen_driver.py`, `perplexity_driver.py`, `huggingchat_driver.py`, `aistudio_driver.py`, `main.py`). If a provider changes their web app, behavior may need to change as well.
+    This is based on the current FastAPI + driver implementation (`api.py`, `deepseek_driver.py`, `glm_driver.py`, `moonshot_driver.py`, `qwen_driver.py`, `perplexity_driver.py`, `huggingchat_driver.py`, `aistudio_driver.py`, `mimo_driver.py`, `main.py`). If a provider changes their web app, behavior may need to change as well.
 
 ---
 
@@ -29,6 +29,18 @@ Authorization: Bearer YOUR_KEY
 
 ---
 
+## :material-flask: Dry Run Mode
+
+**Settings -> API Server -> Dry Run -> Dry Run Mode** starts the API server without launching a provider browser. The display window opens immediately and waits for an incoming request.
+
+When a chat or text completion request arrives, IntenseRP captures the raw JSON body, renders the formatted prompt through the same formatting pipeline used for real provider sends, updates the display, and returns HTTP `418 I'm a teapot`. No request is queued and no provider page is touched.
+
+Dry Run Mode applies only when services start. If a browser is already running, stop services and start again with Dry Run Mode enabled.
+
+All parallel runtime paths are skipped in this mode, meaning you can't submit multiple requests simultaneously, and each new captured request simply replaces the previous one in the display.
+
+---
+
 ## :material-robot: Models and what they mean
 
 The API reports provider-specific "model" IDs, but they are best thought of as **behavior presets**.
@@ -45,7 +57,7 @@ If **Settings -> API Server -> Model IDs -> Use Universal Model Names** is enabl
 
 Provider-prefixed behavior IDs still continue to work either way. **Providers in Parallel** still rejects `intenserp-*`, but it can expose UMM real-model IDs when this setting is enabled.
 
-For GLM Chat, Google AI Studio, QwenLM, Perplexity, and HuggingChat, Universal Model Names also exposes real model IDs in `/v1/models`. They are lowercase, with spaces and dots converted to `-`, and they keep the normal `-auto`, `-reasoner`, and `-chat` suffixes. For example, **GLM-5.1** appears as `glm-5-1-auto`, `glm-5-1-reasoner`, and `glm-5-1-chat`.
+For GLM Chat, Google AI Studio, QwenLM, Perplexity, HuggingChat, and Xiaomi MiMo, Universal Model Names also exposes real model IDs in `/v1/models`. They are lowercase, with spaces and dots converted to `-`, and they keep the normal `-auto`, `-reasoner`, and `-chat` suffixes. For example, **GLM-5.1** appears as `glm-5-1-auto`, `glm-5-1-reasoner`, and `glm-5-1-chat`.
 
 In Providers in Parallel, only conflicting real-model IDs get provider prefixes so they can route to the right browser. For example, Google AI Studio's **Gemini 3.1 Pro** can appear as `aistudio-gemini-3-1-pro-reasoner` if another active provider also exposes `gemini-3-1-pro-reasoner`.
 
@@ -117,14 +129,26 @@ HuggingChat can also accept HuggingChat-only request fields such as `inference_p
 
 Google AI Studio model IDs are also behavior presets:
 
-!!! warning "Temporarily locked by default"
-    AI Studio model IDs are only exposed and routed when Google AI Studio is unlocked. By default, IntenseRP blocks them because AI Studio currently appears to detect Patchright/automated browser sessions and can prevent automated sends.
+!!! warning "Keep Humanize Mouse Movements enabled"
+    AI Studio model IDs are exposed normally again. For reliable sends, leave **Settings -> Provider Behavior -> Google AI Studio -> Humanize Mouse Movements** enabled; it slows UI actions down, but avoids the too-fast interaction pattern that was breaking Google AI Studio.
 
 | Model ID | Thinking Level | Send Thinking |
 |---|---|---|
 | `aistudio-auto` | Uses your settings | Uses your settings |
 | `aistudio-chat` | Lowers Thinking Level on supported AI Studio models | Forced off |
 | `aistudio-reasoner` | Uses your configured Thinking Level | Uses your settings |
+
+### Xiaomi MiMo
+
+MiMo model IDs are behavior presets:
+
+| Model ID | Thinking Output | Send Thinking |
+|---|---|---|
+| `mimo-auto` | MiMo decides internally | Uses your settings |
+| `mimo-chat` | MiMo decides internally | Forced off |
+| `mimo-reasoner` | MiMo decides internally | Forced on |
+
+MiMo's web UI does not expose a thinking toggle; these modes control whether IntenseRP forwards or filters MiMo's streamed `<think>` text.
 
 ### Request `reasoning_effort`
 
@@ -150,8 +174,8 @@ Top-level `reasoning_effort` wins if both are present.
 
 When this compatibility setting is enabled, **Reasoning Effort Providers** controls where it applies. For selected providers, the resolved effort takes priority over the reasoning part of the `model` ID for that request. Providers left unchecked ignore the request field and keep using the model ID suffix, Provider Behavior settings, or loadout values.
 
-!!! tip "AI Studio benefits most when it is unlocked"
-     AI Studio is the only provider so far with a built-in reasoning effort parameter, so it benefits the most from this setting when you are deliberately using it. For other providers, the API effort is just a toggle that turns reasoning on or off based on the value sent.
+!!! tip "AI Studio and GLM-5.2 benefit most here"
+     AI Studio has a built-in Thinking Level control, and GLM-5.2 has a Deep Think effort menu. For most other providers, the API effort is just a toggle that turns reasoning on or off based on the value sent.
 
 For most providers, effort values are simplified into the existing reasoning toggle:
 
@@ -162,18 +186,20 @@ For most providers, effort values are simplified into the existing reasoning tog
 
 For Google AI Studio, explicit efforts are mapped to Thinking Level instead: `minimum`/`minimal` -> `Minimal`, `low` -> `Low`, `medium` -> `Medium`, and `high`/`max`/`xhigh` -> `High`. If no effort is sent, IntenseRP still treats that as chat/off mode because clients like SillyTavern use "Auto" by omitting the field.
 
+For GLM-5.2, enabled efforts also select the Deep Think effort menu: `medium`/`high` -> `High`, and `max`/`xhigh` -> `Max`. Disabled and low-effort values still force Deep Think off.
+
 !!! note "AI Studio rounding"
     AI Studio models don't expose the same controls. IntenseRP may round to the closest available Thinking Level. The old Gemini 2.5 manual thinking-budget mappings are still kept in the driver, but requests that resolve to Gemini 2.5 are rejected because those models have become paid in AI Studio.
 
 !!! info "What these IDs are (and are not)"
     Provider-prefixed and `intenserp-*` IDs are behavior presets. IntenseRP uses them to decide which provider UI toggles to click before sending.
 
-    For providers with a real web UI model picker (GLM Chat, QwenLM, Perplexity, HuggingChat, Google AI Studio), the extra real-model IDs can override the **Provider Behavior** model for a single request.
+    For providers with a real web UI model picker (GLM Chat, QwenLM, Perplexity, HuggingChat, Google AI Studio, Xiaomi MiMo), the extra real-model IDs can override the **Provider Behavior** model for a single request.
 
-!!! note "AI Studio anti-censorship retries"
-    When **Settings -> Provider Behavior -> Google AI Studio -> Anti-Censorship** is enabled, IntenseRP may temporarily hold a blocked AI Studio attempt, edit the blocked turn in the web UI, and send up to 3 continue nudges. Once a retry starts producing real assistant text, that recovered attempt streams normally again.
+!!! note "AI Studio blocked-response retries"
+    When **Settings -> Provider Behavior -> Google AI Studio -> Blocked-Response Handling** is enabled, IntenseRP may temporarily hold a blocked AI Studio attempt, edit the blocked turn in the web UI, and send up to 3 continue nudges. If a retry produces usable assistant text, that attempt streams normally.
 
-    If **CAARS** is enabled, AI Studio first runs a hidden savior-model prelude in the browser, edits that turn, then streams only the main model's continuation back to the API.
+    If **CAARS** is enabled, AI Studio first runs a secondary-model prelude in the browser, edits that turn, then streams only the main model's continuation back to the API.
 
 ---
 
@@ -217,8 +243,8 @@ By default, IntenseRP processes **one generation at a time**.
 !!! tip "Why no parallel requests?"
     The current provider implementation drives a single live browser session and installs network interception on that page. Running multiple generations in parallel would conflict with UI state and interception handlers, so requests are serialized on purpose.
 
-!!! note "Experimental parallel modes"
-    **Providers in Parallel**, **Parallel Request Queue**, and **Full Parallelization** can add more runtime lanes. Those modes are documented under [:material-flask-outline: Experimental](../experimental.md) because they are much heavier and still rougher than the normal queue.
+!!! note "Providers in Parallel"
+    **Browser & Runtime -> Providers in Parallel** can add more browser lanes and allow queued API work to overlap. Those modes are heavier than the normal single-provider queue, so use them when the extra throughput is worth the extra browser weight.
 
 What this means in practice:
 
@@ -267,7 +293,7 @@ data: [DONE]
 ```
 
 !!! note "Usage in streams"
-    For GLM Chat and QwenLM, if **Count Tokens** is enabled in the provider Behavior settings, IntenseRP emits one extra final chunk with `usage` (and `choices: []`) right before `data: [DONE]`.
+    For GLM Chat, QwenLM, and Xiaomi MiMo, if **Count Tokens** is enabled in the provider Behavior settings, IntenseRP emits one extra final chunk with `usage` (and `choices: []`) right before `data: [DONE]`.
 
 ### Text completions stream shape
 
@@ -300,7 +326,7 @@ If a streaming client disconnects, IntenseRP will:
 When you set `stream: false`, the server still generates via streaming internally, but it accumulates all `delta.content` pieces into one final response:
 
 - `choices[0].message.content` is the concatenated text
-- `usage` GLM Chat and QwenLM can populate it when **Count Tokens** is enabled in the provider Behavior settings
+- `usage` GLM Chat, QwenLM, and Xiaomi MiMo can populate it when **Count Tokens** is enabled in the provider Behavior settings
 
 !!! note "Compatibility fields"
     `temperature`, `top_p`, `max_tokens`, and `reasoning_effort` are accepted for OpenAI compatibility.

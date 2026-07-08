@@ -95,6 +95,15 @@ This can sometimes restore GLM's front-end state and make Reuse Matching Chat le
 !!! warning "Tradeoff"
     This reloads the GLM page after every request, which can feel slower and may briefly flicker the UI.
 
+### Automatic Refresh on Empty Streams
+
+GLM can sometimes finish a completion response without sending any complete `data:` event. In GLM's own UI, that turns into `Oops, something went wrong. Please refresh the page or try again later. Error code: 20001`.
+
+When IntenseRP sees that same empty-stream condition, it refreshes the GLM page and returns a retryable API error instead of leaving remote clients waiting on a stuck chat.
+
+!!! note "Why it doesn't replay automatically"
+    After a send-like click, IntenseRP can't safely prove whether GLM received the prompt before the stream failed. It refreshes the page, then asks the client to retry so it doesn't accidentally duplicate a request.
+
 ---
 
 ## :material-file-upload: File Upload Timeout (recap)
@@ -168,7 +177,7 @@ The GLM driver expects the web UI to be in **English (en-US)**. If GLM's interfa
 
 ## :material-format-list-bulleted: Model Fallback Behavior
 
-IntenseRP lets you pick which GLM model to use (GLM-5.1, GLM-5-Turbo, GLM-5V-Turbo, GLM-5, GLM-4.7) via **Settings -> Provider Behavior -> GLM Chat -> Model**.
+IntenseRP lets you pick a GLM web UI model via **Settings -> Provider Behavior -> GLM Chat -> Model**. The Settings dropdown is the exact current list.
 
 But GLM's web UI doesn't always have every model available. Models come and go depending on rollouts, A/B testing, or maintenance. If IntenseRP can't find your selected model in the dropdown:
 

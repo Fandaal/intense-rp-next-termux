@@ -25,7 +25,6 @@ class IconType(Enum):
     BACKUP = "download-cloud.svg"
     BUG_REPORT = "bug.svg"
     BROWSER_MANAGER = "globe.svg"
-    DONATE = "heart.svg"
     DISCORD = "discord.svg"
     GITHUB = "github.svg"
     DOCS = "book-open-check.svg"

@@ -21,15 +21,9 @@ In normal single-provider mode, `GET /v1/models` returns:
 
 So if you switch or hotswap providers, you don't also have to go change the model name in SillyTavern or another client. Nice and boring, in a good way.
 
-For providers with a real model picker, IntenseRP also lists the available real models as request-level overrides:
+For providers with a real model picker, IntenseRP also lists the available real models as request-level overrides. This applies to GLM Chat, Google AI Studio, QwenLM, Perplexity, HuggingChat, and Xiaomi MiMo.
 
-- GLM Chat
-- Google AI Studio
-- QwenLM
-- Perplexity
-- HuggingChat
-
-Those IDs are lowercase, with spaces and dots converted to `-`, and they keep the normal suffixes. For example, a GLM model named **GLM-5.1** appears as `glm-5-1-auto`, `glm-5-1-reasoner`, and `glm-5-1-chat`.
+Those IDs are lowercase, with spaces and dots converted to `-`, and they keep the normal suffixes. For example, a GLM model named **GLM-5.1** appears as `glm-5-1-auto`, `glm-5-1-reasoner`, and `glm-5-1-chat`. MiMo's **MiMo-V2.5-Pro** appears as `mimo-v2-5-pro-auto`, `mimo-v2-5-pro-reasoner`, and `mimo-v2-5-pro-chat`.
 
 In **Providers in Parallel**, only conflicting real-model IDs get a provider prefix. So a unique Perplexity or HuggingChat model can stay short, while an overlap like **Gemini 3.1 Pro** under both Google AI Studio and Perplexity becomes provider-prefixed for those providers.
 

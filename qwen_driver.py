@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import json
 import os
 import re
@@ -7,6 +8,7 @@ import tempfile
 import time
 import unicodedata
 from typing import Any, Callable, Dict, List, Optional, Union
+from urllib.parse import urlsplit
 
 import httpx
 from dotenv import load_dotenv
@@ -56,7 +58,226 @@ QWEN_REQUEST_MACRO_ACTIONS: Dict[str, tuple[str, Any]] = {
 }
 
 
+class _QwenStreamConsumer:
+    """Convert Qwen's raw SSE bytes into OpenAI-style stream chunks."""
+
+    def __init__(
+        self,
+        *,
+        driver: "QwenLMDriver",
+        response_queue: asyncio.Queue,
+        count_tokens_enabled: bool,
+    ) -> None:
+        self.driver = driver
+        self.response_queue = response_queue
+        self.count_tokens_enabled = count_tokens_enabled
+        self.text_buffer = bytearray()
+        self.text_buffer_pos = 0
+        self.thinking_emitted = IncrementalTextAccumulator()
+        self.answer_started = False
+        self.openai_usage: dict[str, Any] | None = None
+        self.openai_usage_emitted = False
+        self.openai_finish_emitted = False
+        self.encountered_error = False
+        self.finished = False
+
+    @staticmethod
+    def _normalize_openai_usage(raw: Any) -> dict[str, Any] | None:
+        if not isinstance(raw, dict):
+            return None
+
+        def _to_int(value: Any) -> int | None:
+            try:
+                return int(value)
+            except Exception:
+                return None
+
+        prompt_tokens = _to_int(raw.get("input_tokens"))
+        completion_tokens = _to_int(raw.get("output_tokens"))
+        total_tokens = _to_int(raw.get("total_tokens"))
+
+        if prompt_tokens is None and completion_tokens is None and total_tokens is None:
+            return None
+
+        prompt_tokens = 0 if prompt_tokens is None else max(prompt_tokens, 0)
+        completion_tokens = 0 if completion_tokens is None else max(completion_tokens, 0)
+        if total_tokens is None:
+            total_tokens = prompt_tokens + completion_tokens
+        else:
+            total_tokens = max(total_tokens, 0)
+
+        usage: dict[str, Any] = {
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": total_tokens,
+        }
+
+        prompt_details = raw.get("input_tokens_details")
+        if isinstance(prompt_details, dict):
+            usage["prompt_tokens_details"] = prompt_details
+
+        completion_details = raw.get("output_tokens_details")
+        if isinstance(completion_details, dict):
+            usage["completion_tokens_details"] = completion_details
+
+        return usage
+
+    def _enqueue_openai_delta(self, content: str, finish_reason: str | None = None) -> None:
+        if (not content) and (not finish_reason):
+            return
+        model_name = self.driver.current_model or "qwen-auto"
+        self.response_queue.put_nowait(
+            make_openai_delta_sse(
+                model_name,
+                content,
+                finish_reason=finish_reason,
+            )
+        )
+
+    def _enqueue_openai_usage(self, usage: dict[str, Any]) -> None:
+        if self.openai_usage_emitted:
+            return
+        model_name = self.driver.current_model or "qwen-auto"
+        self.response_queue.put_nowait(make_openai_usage_sse(model_name, usage))
+        self.openai_usage_emitted = True
+
+    def _process_sse_line(self, line: str) -> None:
+        line = line.strip()
+        if not line.startswith("data:"):
+            return
+
+        data_str = line[len("data:") :].strip()
+        if not data_str or data_str == "[DONE]":
+            return
+
+        try:
+            payload = json.loads(data_str)
+        except Exception:
+            return
+
+        if not isinstance(payload, dict):
+            return
+
+        error_message = self.driver._qwen_provider_error_message(payload)
+        if error_message:
+            Logger.warning(error_message)
+            self.encountered_error = True
+            self.response_queue.put_nowait({"error": error_message})
+            return
+
+        if self.count_tokens_enabled:
+            normalized = self._normalize_openai_usage(payload.get("usage"))
+            if normalized:
+                self.openai_usage = normalized
+
+        choices = payload.get("choices")
+        if not isinstance(choices, list) or not choices:
+            return
+
+        choice0 = choices[0]
+        if not isinstance(choice0, dict):
+            return
+
+        delta = choice0.get("delta")
+        if not isinstance(delta, dict):
+            return
+
+        phase = str(delta.get("phase") or "").strip().lower()
+        role = str(delta.get("role") or "").strip().lower()
+        status = str(delta.get("status") or "").strip().lower()
+
+        if (
+            phase == "web_search"
+            or role == "function"
+            or delta.get("function_call") is not None
+            or delta.get("tool_calls") is not None
+        ):
+            # Ignore tool-call chatter + raw search results for stability.
+            return
+
+        if phase == "thinking_summary":
+            if not self.driver.current_send_deepthink:
+                return
+            summary_text = self.driver._extract_qwen_thinking_summary_text(delta)
+            if not summary_text:
+                return
+
+            if not self.driver.thinking_active:
+                self._enqueue_openai_delta("<think>")
+                self.driver.thinking_active = True
+
+            missing = self.thinking_emitted.missing_suffix(summary_text)
+            if (
+                self.thinking_emitted.has_text
+                and missing
+                and missing == summary_text
+                and not missing.startswith(("\n", "\r"))
+            ):
+                missing = "\n\n" + missing
+            if missing:
+                self._enqueue_openai_delta(missing)
+                self.thinking_emitted.append(missing)
+            return
+
+        if phase == "answer":
+            if self.driver.thinking_active and self.driver.current_send_deepthink and not self.answer_started:
+                self._enqueue_openai_delta("</think>")
+                self.driver.thinking_active = False
+
+            content = delta.get("content")
+            if isinstance(content, str) and content:
+                self._enqueue_openai_delta(content)
+                self.answer_started = True
+
+            if status == "finished":
+                if not self.openai_finish_emitted:
+                    if self.driver.thinking_active and self.driver.current_send_deepthink:
+                        self._enqueue_openai_delta("</think>")
+                        self.driver.thinking_active = False
+                    self._enqueue_openai_delta("", finish_reason="stop")
+                    self.openai_finish_emitted = True
+                    if self.count_tokens_enabled and self.openai_usage:
+                        self._enqueue_openai_usage(self.openai_usage)
+
+    def feed_bytes(self, chunk: bytes) -> None:
+        if self.finished or self.encountered_error or not chunk:
+            return
+
+        self.text_buffer.extend(chunk)
+
+        while True:
+            nl = self.text_buffer.find(b"\n", self.text_buffer_pos)
+            if nl == -1:
+                break
+            raw_line = self.text_buffer[self.text_buffer_pos:nl]
+            self.text_buffer_pos = nl + 1
+            try:
+                line = raw_line.decode("utf-8", errors="ignore")
+            except Exception:
+                continue
+            self._process_sse_line(line)
+            if self.encountered_error:
+                break
+
+        if self.text_buffer_pos > 8192:
+            del self.text_buffer[: self.text_buffer_pos]
+            self.text_buffer_pos = 0
+
+    def finish(self) -> None:
+        if self.finished:
+            return
+
+        self.finished = True
+        tail = bytes(self.text_buffer[self.text_buffer_pos :])
+        if tail.strip() and not self.encountered_error:
+            self._process_sse_line(tail.decode("utf-8", errors="ignore"))
+        self.text_buffer.clear()
+        self.text_buffer_pos = 0
+
+
 class QwenLMDriver(BaseDriver):
+    REQUEST_CAPTURE_MODE_REPLAY = "replay"
+    REQUEST_CAPTURE_MODE_CDP_TEEING = "cdp_teeing"
     CHAT_URL = "https://chat.qwen.ai/"
     AUTH_URL = "https://chat.qwen.ai/auth"
     SETTINGS_URL = "https://chat.qwen.ai/api/v2/users/user/settings"
@@ -65,6 +286,12 @@ class QwenLMDriver(BaseDriver):
     COMPLETION_REQUEST_TIMEOUT_S = 150.0
     INTERCEPT_FIRST_CHUNK_TIMEOUT_S = 150.0
     INTERCEPT_IDLE_TIMEOUT_S = 75.0
+    DATA_INSPECTION_FAILED_CODE = "data_inspection_failed"
+    DATA_INSPECTION_FAILED_MESSAGE = (
+        "QwenLM data_inspection_failed: Qwen censored this request (sadly :<), "
+        "so the message has been aborted."
+    )
+    COMPLETIONS_URL_PATH = "/api/v2/chat/completions"
 
     COMPLETIONS_ROUTE_GLOB = "**/api/v2/chat/completions*"
 
@@ -167,8 +394,46 @@ class QwenLMDriver(BaseDriver):
         self._completion_request_timeout_s = max(completion_request_timeout, 5.0)
         self._first_chunk_timeout_s = max(first_chunk_timeout, 5.0)
 
+    def _get_request_capture_mode(self) -> str:
+        try:
+            mode = str(
+                self.config_manager.get_setting("qwen_behavior", "request_capture_mode")
+                or self.REQUEST_CAPTURE_MODE_REPLAY
+            ).strip().lower()
+        except Exception:
+            mode = self.REQUEST_CAPTURE_MODE_REPLAY
+
+        if mode == self.REQUEST_CAPTURE_MODE_CDP_TEEING:
+            return self.REQUEST_CAPTURE_MODE_CDP_TEEING
+        return self.REQUEST_CAPTURE_MODE_REPLAY
+
+    @classmethod
+    def _is_completion_request_url(cls, url: Any) -> bool:
+        try:
+            parsed = urlsplit(str(url or ""))
+        except Exception:
+            return False
+
+        return parsed.path.rstrip("/") == cls.COMPLETIONS_URL_PATH
+
     def get_start_url(self) -> str:
         return self.CHAT_URL
+
+    @classmethod
+    def _qwen_provider_error_message(cls, payload: Any) -> str | None:
+        """Return an IntenseRP-facing message for terminal Qwen stream errors."""
+        if not isinstance(payload, dict):
+            return None
+
+        error = payload.get("error")
+        if not isinstance(error, dict):
+            return None
+
+        code = str(error.get("code") or "").strip().lower()
+        if code == cls.DATA_INSPECTION_FAILED_CODE:
+            return cls.DATA_INSPECTION_FAILED_MESSAGE
+
+        return None
 
     async def after_start(self, status_callback: Optional[Callable[[str], None]] = None) -> None:
         await self.check_ui_language(status_callback=status_callback)
@@ -3051,19 +3316,53 @@ class QwenLMDriver(BaseDriver):
             },
         )
 
+        try:
+            count_tokens_setting = self.config_manager.get_setting("qwen_behavior", "count_tokens")
+        except Exception:
+            count_tokens_setting = None
+        count_tokens_enabled = True if count_tokens_setting is None else bool(count_tokens_setting)
+        stream_consumer = _QwenStreamConsumer(
+            driver=self,
+            response_queue=response_queue,
+            count_tokens_enabled=count_tokens_enabled,
+        )
+
+        request_capture_mode = self._get_request_capture_mode()
+        use_cdp_teeing = request_capture_mode == self.REQUEST_CAPTURE_MODE_CDP_TEEING
+        route_handlers_registered = False
+        cdp_session: Any = None
+        cdp_listeners_registered = False
+        cdp_tasks: set[asyncio.Task] = set()
+        request_methods: dict[str, str] = {}
+        cdp_pending_response_urls: dict[str, str] = {}
+        cdp_active_request_id: Optional[str] = None
+        cdp_stream_started = False
+        cdp_stream_finished = False
+        cdp_had_data = False
+        intercepted_request_finished = asyncio.Event()
+        provider_activity_count = 0
+
+        def get_provider_activity_count() -> int:
+            return provider_activity_count
+
         async def handle_route(route):
-            nonlocal completion_claimed
+            nonlocal completion_claimed, provider_activity_count
             request = route.request
 
             try:
                 method = str(request.method or "").upper()
             except Exception:
                 method = ""
-            if method == "OPTIONS":
-                await route.continue_()
-                return
+            try:
+                request_url = str(request.url or "")
+            except Exception:
+                request_url = ""
 
-            if not completion_armed.is_set():
+            if (
+                method != "POST"
+                or not self._is_completion_request_url(request_url)
+                or not completion_armed.is_set()
+            ):
                 await route.continue_()
                 return
 
@@ -3075,7 +3374,7 @@ class QwenLMDriver(BaseDriver):
                 completion_started.set()
 
             Logger.info("Intercepting QwenLM API request...")
-            Logger.debug(f"Intercepted request to: {request.url}")
+            Logger.debug(f"Intercepted request to: {request_url}")
 
             headers = await request.all_headers()
             headers.pop("content-length", None)
@@ -3087,173 +3386,6 @@ class QwenLMDriver(BaseDriver):
             response_headers: Dict[str, str] = {}
             full_response_body = bytearray()
             aborted = False
-            text_buffer = bytearray()
-            text_buffer_pos = 0
-
-            thinking_emitted = IncrementalTextAccumulator()
-            answer_started = False
-            openai_usage: dict[str, Any] | None = None
-            openai_usage_emitted = False
-            openai_finish_emitted = False
-
-            try:
-                count_tokens_setting = self.config_manager.get_setting("qwen_behavior", "count_tokens")
-            except Exception:
-                count_tokens_setting = None
-            count_tokens_enabled = True if count_tokens_setting is None else bool(count_tokens_setting)
-
-            def _normalize_openai_usage(raw: Any) -> dict[str, Any] | None:
-                if not isinstance(raw, dict):
-                    return None
-
-                def _to_int(value: Any) -> int | None:
-                    try:
-                        return int(value)
-                    except Exception:
-                        return None
-
-                prompt_tokens = _to_int(raw.get("input_tokens"))
-                completion_tokens = _to_int(raw.get("output_tokens"))
-                total_tokens = _to_int(raw.get("total_tokens"))
-
-                if prompt_tokens is None and completion_tokens is None and total_tokens is None:
-                    return None
-
-                prompt_tokens = 0 if prompt_tokens is None else max(prompt_tokens, 0)
-                completion_tokens = 0 if completion_tokens is None else max(completion_tokens, 0)
-                if total_tokens is None:
-                    total_tokens = prompt_tokens + completion_tokens
-                else:
-                    total_tokens = max(total_tokens, 0)
-
-                usage: dict[str, Any] = {
-                    "prompt_tokens": prompt_tokens,
-                    "completion_tokens": completion_tokens,
-                    "total_tokens": total_tokens,
-                }
-
-                prompt_details = raw.get("input_tokens_details")
-                if isinstance(prompt_details, dict):
-                    usage["prompt_tokens_details"] = prompt_details
-
-                completion_details = raw.get("output_tokens_details")
-                if isinstance(completion_details, dict):
-                    usage["completion_tokens_details"] = completion_details
-
-                return usage
-
-            def enqueue_openai_delta(content: str, finish_reason: str | None = None) -> None:
-                if (not content) and (not finish_reason):
-                    return
-                model_name = self.current_model or "qwen-auto"
-                response_queue.put_nowait(
-                    make_openai_delta_sse(
-                        model_name,
-                        content,
-                        finish_reason=finish_reason,
-                    )
-                )
-
-            def enqueue_openai_usage(usage: dict[str, Any]) -> None:
-                nonlocal openai_usage_emitted
-                if openai_usage_emitted:
-                    return
-                model_name = self.current_model or "qwen-auto"
-                response_queue.put_nowait(make_openai_usage_sse(model_name, usage))
-                openai_usage_emitted = True
-
-            def process_sse_line(line: str) -> None:
-                nonlocal thinking_emitted, answer_started, openai_usage, openai_finish_emitted
-                line = line.strip()
-                if not line.startswith("data:"):
-                    return
-
-                data_str = line[len("data:") :].strip()
-                if not data_str or data_str == "[DONE]":
-                    return
-
-                try:
-                    payload = json.loads(data_str)
-                except Exception:
-                    return
-
-                if not isinstance(payload, dict):
-                    return
-
-                if count_tokens_enabled:
-                    normalized = _normalize_openai_usage(payload.get("usage"))
-                    if normalized:
-                        openai_usage = normalized
-
-                choices = payload.get("choices")
-                if not isinstance(choices, list) or not choices:
-                    return
-
-                choice0 = choices[0]
-                if not isinstance(choice0, dict):
-                    return
-
-                delta = choice0.get("delta")
-                if not isinstance(delta, dict):
-                    return
-
-                phase = str(delta.get("phase") or "").strip().lower()
-                role = str(delta.get("role") or "").strip().lower()
-                status = str(delta.get("status") or "").strip().lower()
-
-                if (
-                    phase == "web_search"
-                    or role == "function"
-                    or delta.get("function_call") is not None
-                    or delta.get("tool_calls") is not None
-                ):
-                    # Ignore tool-call chatter + raw search results for stability
-                    return
-
-                if phase == "thinking_summary":
-                    if not self.current_send_deepthink:
-                        return
-                    summary_text = self._extract_qwen_thinking_summary_text(delta)
-                    if not summary_text:
-                        return
-
-                    if not self.thinking_active:
-                        enqueue_openai_delta("<think>")
-                        self.thinking_active = True
-
-                    missing = thinking_emitted.missing_suffix(summary_text)
-                    if (
-                        thinking_emitted.has_text
-                        and missing
-                        and missing == summary_text
-                        and not missing.startswith(("\n", "\r"))
-                    ):
-                        missing = "\n\n" + missing
-                    if missing:
-                        enqueue_openai_delta(missing)
-                        thinking_emitted.append(missing)
-                    return
-
-                if phase == "answer":
-                    if self.thinking_active and self.current_send_deepthink and not answer_started:
-                        enqueue_openai_delta("</think>")
-                        self.thinking_active = False
-
-                    content = delta.get("content")
-                    if isinstance(content, str) and content:
-                        enqueue_openai_delta(content)
-                        answer_started = True
-
-                    if status == "finished":
-                        if not openai_finish_emitted:
-                            if self.thinking_active and self.current_send_deepthink:
-                                enqueue_openai_delta("</think>")
-                                self.thinking_active = False
-                            enqueue_openai_delta("", finish_reason="stop")
-                            openai_finish_emitted = True
-                            if count_tokens_enabled and openai_usage:
-                                enqueue_openai_usage(openai_usage)
-                    return
 
             json_body = None
             raw_post_data = request.post_data
@@ -3267,7 +3399,7 @@ class QwenLMDriver(BaseDriver):
                 client = await self._get_http_client()
                 async with client.stream(
                     "POST",
-                    request.url,
+                    request_url,
                     headers=headers,
                     cookies=cookie_dict,
                     json=json_body,
@@ -3277,35 +3409,19 @@ class QwenLMDriver(BaseDriver):
                         response_headers[k] = v
 
                     async for chunk in response.aiter_bytes():
+                        if chunk:
+                            provider_activity_count += 1
                         if self.abort_requested or (abort_event and abort_event.is_set()):
                             Logger.debug("Abort detected during QwenLM streaming, stopping...")
                             aborted = True
                             break
 
                         full_response_body.extend(chunk)
-                        text_buffer.extend(chunk)
+                        stream_consumer.feed_bytes(chunk)
+                        if stream_consumer.encountered_error:
+                            break
 
-                        while True:
-                            nl = text_buffer.find(b"\n", text_buffer_pos)
-                            if nl == -1:
-                                break
-                            raw_line = text_buffer[text_buffer_pos:nl]
-                            text_buffer_pos = nl + 1
-                            try:
-                                line = raw_line.decode("utf-8", errors="ignore")
-                            except Exception:
-                                continue
-                            process_sse_line(line)
-
-                        if text_buffer_pos > 8192:
-                            del text_buffer[:text_buffer_pos]
-                            text_buffer_pos = 0
-
-                    tail = bytes(text_buffer[text_buffer_pos:])
-                    if tail.strip():
-                        process_sse_line(tail.decode("utf-8", errors="ignore"))
-                    text_buffer.clear()
-                    text_buffer_pos = 0
+                    stream_consumer.finish()
 
             except httpx.ReadError as e:
                 if not aborted and not self.abort_requested:
@@ -3325,12 +3441,249 @@ class QwenLMDriver(BaseDriver):
                 Logger.error(f"QwenLM: error fulfilling route: {e}")
 
             await response_queue.put(None)
-            if not aborted and not self.abort_requested:
+            intercepted_request_finished.set()
+            if not aborted and not stream_consumer.encountered_error and not self.abort_requested:
                 Logger.success("QwenLM response streaming completed.")
 
-        await self.page.route(self.COMPLETIONS_ROUTE_GLOB, handle_route)
+        def _schedule_cdp_task(coro: Any, label: str) -> None:
+            try:
+                task = asyncio.create_task(coro)
+            except Exception as exc:
+                Logger.debug(f"QwenLM: failed to schedule CDP handler for {label}: {exc}")
+                return
+
+            cdp_tasks.add(task)
+
+            def _on_done(done_task: asyncio.Task) -> None:
+                cdp_tasks.discard(done_task)
+                try:
+                    done_task.exception()
+                except asyncio.CancelledError:
+                    pass
+                except Exception as exc:
+                    Logger.debug(f"QwenLM: CDP handler for {label} failed: {exc}")
+
+            task.add_done_callback(_on_done)
+
+        def request_aborted() -> bool:
+            return bool(self.abort_requested or (abort_event and abort_event.is_set()))
+
+        async def finish_cdp_stream(
+            request_id: str,
+            *,
+            aborted: bool = False,
+            encountered_error: bool = False,
+        ) -> None:
+            nonlocal cdp_stream_finished
+            if request_id != cdp_active_request_id or cdp_stream_finished:
+                return
+
+            cdp_stream_finished = True
+            stream_consumer.finish()
+            await response_queue.put(None)
+            intercepted_request_finished.set()
+            request_methods.pop(request_id, None)
+            cdp_pending_response_urls.pop(request_id, None)
+
+            if (
+                not aborted
+                and not encountered_error
+                and not stream_consumer.encountered_error
+                and not request_aborted()
+            ):
+                Logger.success("QwenLM CDP stream completed.")
+
+        async def feed_cdp_stream_chunk(request_id: str, data: bytes) -> None:
+            nonlocal provider_activity_count, cdp_had_data
+            if request_id != cdp_active_request_id or not data or cdp_stream_finished:
+                return
+
+            cdp_had_data = True
+            provider_activity_count += 1
+            if request_aborted():
+                await finish_cdp_stream(request_id, aborted=True)
+                return
+
+            stream_consumer.feed_bytes(data)
+            if stream_consumer.encountered_error:
+                await finish_cdp_stream(request_id, encountered_error=True)
+                return
+
+            if request_aborted():
+                await finish_cdp_stream(request_id, aborted=True)
+
+        async def feed_base64_cdp_stream_chunk(request_id: str, encoded_data: Any) -> None:
+            if not encoded_data:
+                return
+            encoded_text = str(encoded_data)
+            try:
+                data = base64.b64decode(encoded_text, validate=True)
+            except Exception:
+                data = encoded_text.encode("utf-8", errors="ignore")
+            await feed_cdp_stream_chunk(request_id, data)
+
+        async def start_cdp_stream(request_id: str, url: str) -> None:
+            nonlocal cdp_stream_started
+            if (
+                request_id != cdp_active_request_id
+                or not cdp_session
+                or cdp_stream_started
+                or cdp_stream_finished
+            ):
+                return
+
+            cdp_stream_started = True
+            Logger.info("Teeing QwenLM API response via CDP...")
+            Logger.debug(f"Teeing request to: {url}")
+            try:
+                result = await cdp_session.send(
+                    "Network.streamResourceContent",
+                    {"requestId": request_id},
+                )
+            except Exception as exc:
+                message_text = f"QwenLM CDP response streaming failed: {exc}"
+                Logger.error(message_text)
+                await response_queue.put({"error": message_text})
+                await finish_cdp_stream(request_id, encountered_error=True)
+                return
+
+            if isinstance(result, dict):
+                await feed_base64_cdp_stream_chunk(request_id, result.get("bufferedData"))
+
+        async def handle_cdp_request_will_be_sent(params: Any) -> None:
+            nonlocal completion_claimed, cdp_active_request_id
+            if not isinstance(params, dict):
+                return
+            request_id = str(params.get("requestId") or "").strip()
+            request = params.get("request")
+            if not request_id or not isinstance(request, dict):
+                return
+
+            method = str(request.get("method") or "").upper()
+            request_methods[request_id] = method
+            url = str(request.get("url") or "")
+            if method != "POST" or not self._is_completion_request_url(url):
+                return
+            if not completion_armed.is_set():
+                return
+
+            async with completion_claim_lock:
+                if completion_claimed:
+                    return
+                completion_claimed = True
+                cdp_active_request_id = request_id
+                completion_started.set()
+
+            Logger.info("Observing QwenLM API request via CDP...")
+            Logger.debug(f"Observed request to: {url}")
+            pending_url = cdp_pending_response_urls.get(request_id)
+            if pending_url:
+                await start_cdp_stream(request_id, pending_url)
+
+        async def handle_cdp_response_received(params: Any) -> None:
+            if not isinstance(params, dict):
+                return
+            request_id = str(params.get("requestId") or "").strip()
+            response = params.get("response")
+            if not request_id or not isinstance(response, dict):
+                return
+            url = str(response.get("url") or "")
+            if not self._is_completion_request_url(url):
+                return
+            method = request_methods.get(request_id, "").upper()
+            if method and method != "POST":
+                return
+            cdp_pending_response_urls[request_id] = url
+            if request_id != cdp_active_request_id:
+                return
+            await start_cdp_stream(request_id, url)
+
+        async def handle_cdp_data_received(params: Any) -> None:
+            if not isinstance(params, dict):
+                return
+            request_id = str(params.get("requestId") or "").strip()
+            if request_id == cdp_active_request_id:
+                await feed_base64_cdp_stream_chunk(request_id, params.get("data"))
+
+        async def handle_cdp_loading_finished(params: Any) -> None:
+            if not isinstance(params, dict):
+                return
+            request_id = str(params.get("requestId") or "").strip()
+            if request_id == cdp_active_request_id:
+                await finish_cdp_stream(request_id)
+            else:
+                request_methods.pop(request_id, None)
+                cdp_pending_response_urls.pop(request_id, None)
+
+        async def handle_cdp_loading_failed(params: Any) -> None:
+            if not isinstance(params, dict):
+                return
+            request_id = str(params.get("requestId") or "").strip()
+            if request_id != cdp_active_request_id:
+                request_methods.pop(request_id, None)
+                cdp_pending_response_urls.pop(request_id, None)
+                return
+
+            if request_aborted():
+                await finish_cdp_stream(request_id, aborted=True)
+                return
+
+            error_text = str(params.get("errorText") or "network loading failed").strip()
+            if "ERR_ABORTED" in error_text.upper() and cdp_had_data:
+                Logger.debug(
+                    "QwenLM CDP stream ended with net::ERR_ABORTED after data arrived; "
+                    "treating it as complete."
+                )
+                await finish_cdp_stream(request_id)
+                return
+
+            message_text = f"QwenLM CDP stream failed: {error_text}"
+            Logger.error(message_text)
+            await response_queue.put({"error": message_text})
+            await finish_cdp_stream(request_id, encountered_error=True)
+
+        def on_cdp_request_will_be_sent(params: Any) -> None:
+            _schedule_cdp_task(handle_cdp_request_will_be_sent(params), "requestWillBeSent")
+
+        def on_cdp_response_received(params: Any) -> None:
+            _schedule_cdp_task(handle_cdp_response_received(params), "responseReceived")
+
+        def on_cdp_data_received(params: Any) -> None:
+            _schedule_cdp_task(handle_cdp_data_received(params), "dataReceived")
+
+        def on_cdp_loading_finished(params: Any) -> None:
+            _schedule_cdp_task(handle_cdp_loading_finished(params), "loadingFinished")
+
+        def on_cdp_loading_failed(params: Any) -> None:
+            _schedule_cdp_task(handle_cdp_loading_failed(params), "loadingFailed")
 
         try:
+            if use_cdp_teeing:
+                if not self.context or not self.page:
+                    message_text = "QwenLM CDP setup failed: browser context is not available."
+                    Logger.error(message_text)
+                    yield f"data: {json.dumps({'error': message_text})}\n\n"
+                    return
+                try:
+                    cdp_session = await self.context.new_cdp_session(self.page)
+                    await cdp_session.send("Network.enable", {})
+                    cdp_session.on("Network.requestWillBeSent", on_cdp_request_will_be_sent)
+                    cdp_session.on("Network.responseReceived", on_cdp_response_received)
+                    cdp_session.on("Network.dataReceived", on_cdp_data_received)
+                    cdp_session.on("Network.loadingFinished", on_cdp_loading_finished)
+                    cdp_session.on("Network.loadingFailed", on_cdp_loading_failed)
+                    cdp_listeners_registered = True
+                    Logger.info("QwenLM Request Capture Mode: CDP Teeing.")
+                except Exception as exc:
+                    message_text = f"QwenLM CDP setup failed: {exc}"
+                    Logger.error(message_text)
+                    yield f"data: {json.dumps({'error': message_text})}\n\n"
+                    return
+            else:
+                await self.page.route(self.COMPLETIONS_ROUTE_GLOB, handle_route)
+                route_handlers_registered = True
+                Logger.info("QwenLM Request Capture Mode: Replay.")
+
             clean_regeneration = bool(self.config_manager.get_setting("qwen_behavior", "clean_regeneration"))
             multi_slot_cache_enabled = bool(
                 clean_regeneration
@@ -3491,6 +3844,7 @@ class QwenLMDriver(BaseDriver):
                 first_chunk_timeout_s=self._first_chunk_timeout_s,
                 idle_timeout_s=self.INTERCEPT_IDLE_TIMEOUT_S,
                 on_timeout=self._abort_generation_ui,
+                activity_counter=get_provider_activity_count,
             ):
                 if isinstance(item, dict) and "error" in item:
                     stream_had_error = True
@@ -3498,6 +3852,9 @@ class QwenLMDriver(BaseDriver):
                     break
 
                 yield item
+
+            if self.abort_requested or (abort_event and abort_event.is_set()):
+                await self._abort_generation_ui()
 
             if should_record_multi_slot and (not stream_had_error) and (not self.abort_requested):
                 conversation_info = await self._wait_for_current_conversation_info(timeout_ms=6000)
@@ -3528,13 +3885,48 @@ class QwenLMDriver(BaseDriver):
             ):
                 await self._auto_delete_current_chat()
         finally:
+            if completion_started.is_set() and not intercepted_request_finished.is_set():
+                try:
+                    await asyncio.wait_for(intercepted_request_finished.wait(), timeout=5.0)
+                except asyncio.TimeoutError:
+                    Logger.debug("QwenLM: timed out waiting for intercepted request cleanup.")
             self.current_abort_event = None
             self.abort_requested = False
             self.current_model = None
             self.current_send_deepthink = None
             self.current_tools_enabled = None
             self._tools_disabled_for_request = False
-            try:
-                await self.page.unroute(self.COMPLETIONS_ROUTE_GLOB)
-            except Exception:
-                pass
+            if route_handlers_registered:
+                try:
+                    await self.page.unroute(self.COMPLETIONS_ROUTE_GLOB, handle_route)
+                except Exception:
+                    try:
+                        await self.page.unroute(self.COMPLETIONS_ROUTE_GLOB)
+                    except Exception:
+                        pass
+            if cdp_session and cdp_listeners_registered:
+                for event_name, listener in (
+                    ("Network.requestWillBeSent", on_cdp_request_will_be_sent),
+                    ("Network.responseReceived", on_cdp_response_received),
+                    ("Network.dataReceived", on_cdp_data_received),
+                    ("Network.loadingFinished", on_cdp_loading_finished),
+                    ("Network.loadingFailed", on_cdp_loading_failed),
+                ):
+                    try:
+                        cdp_session.remove_listener(event_name, listener)
+                    except Exception:
+                        pass
+            for task in list(cdp_tasks):
+                if not task.done():
+                    task.cancel()
+            tasks_to_wait = set(cdp_tasks)
+            if tasks_to_wait:
+                try:
+                    await asyncio.wait(tasks_to_wait, timeout=1.0)
+                except Exception:
+                    pass
+            if cdp_session:
+                try:
+                    await cdp_session.detach()
+                except Exception as exc:
+                    Logger.debug(f"QwenLM: CDP detach failed: {exc}")

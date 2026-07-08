@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import random
+import threading
 import time
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
@@ -60,6 +61,7 @@ class EceManager:
 
     CREDENTIALS_VERSION = 1
     USAGE_VERSION = 1
+    _usage_write_lock = threading.RLock()
 
     def __init__(self, config_dir: str | Path):
         self.config_dir = Path(config_dir).resolve()
@@ -339,20 +341,21 @@ class EceManager:
         if not email_norm:
             return False
 
-        payload = self._read_usage_payload()
-        providers = payload.get("providers") if isinstance(payload.get("providers"), dict) else {}
-        providers = dict(providers)
+        with EceManager._usage_write_lock:
+            payload = self._read_usage_payload()
+            providers = payload.get("providers") if isinstance(payload.get("providers"), dict) else {}
+            providers = dict(providers)
 
-        usage = providers.get(provider_id, {})
-        if not isinstance(usage, dict):
-            usage = {}
+            usage = providers.get(provider_id, {})
+            if not isinstance(usage, dict):
+                usage = {}
 
-        usage = dict(usage)
-        usage[email_norm] = float(time.time())
-        providers[provider_id] = usage
+            usage = dict(usage)
+            usage[email_norm] = float(time.time())
+            providers[provider_id] = usage
 
-        ok = self._write_usage_payload(providers)
-        return ok
+            ok = self._write_usage_payload(providers)
+            return ok
 
     def set_pair_disabled(
         self,

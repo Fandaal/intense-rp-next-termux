@@ -19,6 +19,35 @@ _BUG_REPORTS_ROOT = "bug_reports"
 _CREDENTIALS_ROOTS = {"accounts", "ece"}
 _PROFILES_ROOT = "playwright_profiles"
 _SETTINGS_KEY_FILENAME = "settings.key"
+_VOLATILE_PROFILE_DIR_NAMES = {
+    name.casefold()
+    for name in (
+        "BrowserMetrics",
+        "Cache",
+        "CacheStorage",
+        "Code Cache",
+        "component_crx_cache",
+        "Crashpad",
+        "DawnGraphiteCache",
+        "DawnWebGPUCache",
+        "GPUCache",
+        "GrShaderCache",
+        "OnDeviceHeadSuggestModel",
+        "OptimizationHints",
+        "OptimizationGuidePredictionModels",
+        "ShaderCache",
+        "blob_storage",
+    )
+}
+_VOLATILE_PROFILE_FILE_NAMES = {
+    name.casefold()
+    for name in (
+        "DevToolsActivePort",
+        "SingletonCookie",
+        "SingletonLock",
+        "SingletonSocket",
+    )
+}
 
 
 @dataclass(frozen=True)
@@ -134,6 +163,26 @@ def _zip_path_parts(arcname: str | Path) -> tuple[str, ...]:
         return tuple()
 
 
+def _profile_member_parts(arcname: str | Path) -> tuple[str, ...]:
+    parts = _zip_path_parts(arcname)
+    for index, part in enumerate(parts):
+        if part.casefold() == _PROFILES_ROOT.casefold():
+            return parts[index + 1 :]
+    return tuple()
+
+
+def _should_skip_volatile_profile_member(arcname: str | Path) -> bool:
+    profile_parts = _profile_member_parts(arcname)
+    if not profile_parts:
+        return False
+
+    lowered_parts = tuple(part.casefold() for part in profile_parts)
+    if any(part in _VOLATILE_PROFILE_DIR_NAMES for part in lowered_parts):
+        return True
+
+    return lowered_parts[-1] in _VOLATILE_PROFILE_FILE_NAMES
+
+
 def _should_include_backup_member(arcname: str | Path, options: ConfigBackupOptions) -> bool:
     parts = _zip_path_parts(arcname)
     if not parts:
@@ -149,7 +198,7 @@ def _should_include_backup_member(arcname: str | Path, options: ConfigBackupOpti
         return bool(options.settings_state or options.credentials)
 
     if root == _PROFILES_ROOT:
-        return bool(options.profiles)
+        return bool(options.profiles) and not _should_skip_volatile_profile_member(arcname)
 
     if root in _CREDENTIALS_ROOTS:
         return bool(options.credentials)
@@ -373,15 +422,19 @@ def _is_unsafe_zip_member(name: str) -> bool:
 
 
 def _safe_extract_zip(zip_path: Path, dest_dir: Path) -> tuple[bool, str]:
+    skipped_volatile_members = 0
     try:
         with zipfile.ZipFile(zip_path, "r") as zf:
             for info in zf.infolist():
                 name = info.filename
+                if _is_unsafe_zip_member(name):
+                    return False, f"Zip contains an unsafe path: {name}"
+                if _should_skip_volatile_profile_member(name):
+                    skipped_volatile_members += 1
+                    continue
                 if name.endswith("/"):
                     # directory entry
                     continue
-                if _is_unsafe_zip_member(name):
-                    return False, f"Zip contains an unsafe path: {name}"
 
                 rel = PurePosixPath(name)
                 out_path = dest_dir.joinpath(*rel.parts)
@@ -391,6 +444,12 @@ def _safe_extract_zip(zip_path: Path, dest_dir: Path) -> tuple[bool, str]:
                     shutil.copyfileobj(src, dst)
     except Exception as e:
         return False, f"Failed to read/extract zip: {e}"
+
+    if skipped_volatile_members:
+        Logger.info(
+            "Skipped "
+            f"{skipped_volatile_members} volatile browser profile cache item(s) while extracting backup."
+        )
 
     return True, ""
 
@@ -444,11 +503,12 @@ def _replace_entire_config_dir(root: Path, target_dir: Path) -> tuple[bool, str]
     parent.mkdir(parents=True, exist_ok=True)
 
     ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+    # apparently our long paths are close to MAX_PATH on Windows
     staging_dir, old_dir = _make_unique_import_dirs(
         parent,
         ts,
-        "__irpnext_config_import_staging",
-        "__irpnext_config_import_old",
+        "__i",
+        "__o",
     )
 
     try:
@@ -511,6 +571,21 @@ def _iter_settings_state_entries(root: Path) -> list[Path]:
     return result
 
 
+def _missing_selected_backup_categories(root: Path, options: ConfigBackupOptions) -> list[str]:
+    missing: list[str] = []
+
+    if options.settings_state and not _iter_settings_state_entries(root):
+        missing.append("Settings & State")
+
+    if options.profiles and not (root / _PROFILES_ROOT).exists():
+        missing.append("Profiles")
+
+    if options.credentials and not any((root / name).exists() for name in _CREDENTIALS_ROOTS):
+        missing.append("Credentials")
+
+    return missing
+
+
 def _restore_moved_paths(moved_paths: list[tuple[Path, Path]]) -> None:
     for target_path, rollback_path in reversed(moved_paths):
         try:
@@ -533,10 +608,11 @@ def _import_selected_config_data(
     target_dir.mkdir(parents=True, exist_ok=True)
 
     ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+    # even shorter names (wtf was I thinking)
     (rollback_dir,) = _make_unique_import_dirs(
         parent,
         ts,
-        "__irpnext_config_import_selected_old",
+        "__is",
     )
     rollback_dir.mkdir(parents=True, exist_ok=True)
 
@@ -686,6 +762,13 @@ def import_config_backup_zip(
             ok, reason = _validate_decryptable_settings(root)
             if not ok:
                 return False, reason
-            return _replace_entire_config_dir(root, target_dir)
+            missing_categories = _missing_selected_backup_categories(root, options)
+            if not missing_categories:
+                return _replace_entire_config_dir(root, target_dir)
+
+            Logger.info(
+                "Full config import requested, but the backup is missing selected "
+                f"data ({', '.join(missing_categories)}). Using selective import."
+            )
 
         return _import_selected_config_data(root, target_dir, options)

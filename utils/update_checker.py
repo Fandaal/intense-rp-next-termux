@@ -40,6 +40,7 @@ class UpdateCheckResult:
     error: Optional[str] = None
     remote_auto_updateable: Optional[bool] = None
     remote_severity: Optional[int] = None
+    remote_summary: Optional[str] = None
 
 
 def _parse_semver(version: str) -> Tuple[Tuple[int, int, int], Optional[Tuple[str, ...]]]:
@@ -203,6 +204,7 @@ def check_for_updates(
             error=str(exc),
             remote_auto_updateable=remote_info.auto_updateable,
             remote_severity=remote_info.severity,
+            remote_summary=remote_info.summary,
         )
 
     return UpdateCheckResult(
@@ -212,4 +214,5 @@ def check_for_updates(
         error=None,
         remote_auto_updateable=remote_info.auto_updateable,
         remote_severity=remote_info.severity,
+        remote_summary=remote_info.summary,
     )

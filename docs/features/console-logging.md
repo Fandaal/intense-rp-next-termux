@@ -106,6 +106,24 @@ Setting a target to "Warning" means it only receives Warning and Error messages.
 
 ---
 
+## :material-bug-check-outline: Extra Debug Logs
+
+**Extra Debug Logs** reveals additional developer-focused debug messages that are normally hidden even when your log level is set to Debug.
+
+:material-arrow-right: **Settings** -> **Advanced** -> **Diagnostics** -> **Extra Debug Logs**
+
+Most users should leave this off. It's mainly useful when you're investigating awkward desktop behavior, provider UI weirdness, notifications, or other issues where the normal logs don't show enough detail.
+
+!!! note "Still uses your log targets"
+    This does not change where logs go. If you want to see these messages, make sure at least one output target is set to **Debug** in **Logs and Troubleshooting** -> **Logging Levels**.
+
+!!! warning "Review before sharing"
+    Extra debug logs can include more internal state than the normal logs. They still go through the usual log paths, but you should review any logs or bug-report bundles before posting them publicly.
+
+The old `--extraDebugLogs` launch flag still works too, but only for that run. The Settings toggle is the persistent version.
+
+---
+
 ## :material-file-document: File Logging
 
 But what if you want to keep logs for later? Enter Logfiles - IntenseRP can save logs to timestamped files for you to review or share.
@@ -309,6 +327,12 @@ If you need to share logs with the developer or community:
 |---------|---------|-------------|
 | Ask Before Clearing the Console | On | Ask before clearing |
 | Export Folder | (blank) | Default dump location |
+
+### Advanced Diagnostics
+
+| Setting | Default | What It Does |
+|---------|---------|-------------|
+| Extra Debug Logs | Off | Reveals additional developer-focused debug messages |
 
 ---
 

@@ -1,8 +1,8 @@
 {
-  "version": "2.8.7-patch",
+  "version": "2.9.0-update",
   "aua": true,
   "severity": 4,
   "pu": "discord",
   "pufref": "none",
-  "summary": "Moonshot and Perplexity fixes, AI Studio lock"
+  "summary": "Anniversary update with Xiaomi MiMo, Dry Run Mode, CDP Teeing, and runtime polish"
 }

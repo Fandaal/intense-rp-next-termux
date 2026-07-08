@@ -26,7 +26,13 @@ from PySide6.QtWidgets import (
 from ui.core.brand import BrandColors
 from ui.core.icons import IconType, IconUtils
 from ui.widgets.rounded_progress_bar import RoundedProgressBar
-from utils.auto_update import AutoUpdateError, PreparedUpdate, prepare_update_from_github, DownloadProgress
+from utils.auto_update import (
+    AutoUpdateError,
+    PreparedUpdate,
+    prepare_update_from_github,
+    prepare_update_from_local_archive,
+    DownloadProgress,
+)
 
 
 class MissingUpdaterError(RuntimeError):
@@ -58,7 +64,19 @@ class _UpdaterLauncher(QObject):
                 )
             else:
                 kwargs["start_new_session"] = True
-            subprocess.Popen(self._cmd, **kwargs)
+            process = subprocess.Popen(self._cmd, **kwargs)
+            try:
+                return_code = process.wait(timeout=1.0)
+            except subprocess.TimeoutExpired:
+                return_code = None
+
+            if return_code is not None:
+                self.failed.emit(
+                    "The updater exited immediately "
+                    f"(code {return_code}). The staged updater may be from an older build."
+                )
+                return
+
             self.succeeded.emit()
         except Exception as exc:
             self.failed.emit(str(exc))
@@ -108,10 +126,17 @@ class _AutoUpdateWorker(QObject):
     finished = Signal(object)  # PreparedUpdate
     failed = Signal(str)
 
-    def __init__(self, remote_version: str, expected_exe_name: str, parent=None):
+    def __init__(
+        self,
+        remote_version: str,
+        expected_exe_name: str,
+        local_archive_path: Optional[Path] = None,
+        parent=None,
+    ):
         super().__init__(parent)
         self._remote_version = remote_version
         self._expected_exe_name = expected_exe_name
+        self._local_archive_path = local_archive_path
         self._cancelled = False
 
         self._staging_dir = Path(tempfile.mkdtemp(prefix="intenserp-update-extract-"))
@@ -124,8 +149,6 @@ class _AutoUpdateWorker(QObject):
     def run(self) -> None:
         succeeded = False
         try:
-            self.status.emit("Contacting GitHub…")
-
             def should_cancel() -> bool:
                 return bool(self._cancelled)
 
@@ -133,17 +156,31 @@ class _AutoUpdateWorker(QObject):
                 total = p.total_bytes if p.total_bytes is not None else -1
                 self.progress.emit(p.bytes_downloaded, total, float(p.speed_bytes_per_s))
 
-            self.status.emit("Downloading update…")
-            prepared = prepare_update_from_github(
-                remote_version=self._remote_version,
-                expected_exe_name=self._expected_exe_name,
-                download_dir=self._download_dir,
-                extract_dir=self._extract_dir,
-                progress_cb=on_progress,
-                should_cancel=should_cancel,
-            )
+            if self._local_archive_path is not None:
+                self.status.emit("Staging local update archive...")
+                prepared = prepare_update_from_local_archive(
+                    archive_path=self._local_archive_path,
+                    expected_exe_name=self._expected_exe_name,
+                    download_dir=self._download_dir,
+                    extract_dir=self._extract_dir,
+                    progress_cb=on_progress,
+                    should_cancel=should_cancel,
+                )
+            else:
+                self.status.emit("Contacting GitHub…")
+                self.status.emit("Downloading update…")
+                prepared = prepare_update_from_github(
+                    remote_version=self._remote_version,
+                    expected_exe_name=self._expected_exe_name,
+                    download_dir=self._download_dir,
+                    extract_dir=self._extract_dir,
+                    progress_cb=on_progress,
+                    should_cancel=should_cancel,
+                )
 
-            self.status.emit("Download complete.")
+            self.status.emit(
+                "Local archive staged." if self._local_archive_path is not None else "Download complete."
+            )
             succeeded = True
             self.finished.emit(prepared)
         except AutoUpdateError as exc:
@@ -165,15 +202,26 @@ class UpdateDownloadDialog(QDialog):
     On success, sets self.prepared_update and enables the install action (implemented in follow-up).
     """
 
-    def __init__(self, remote_version: str, parent=None):
+    def __init__(
+        self,
+        remote_version: str,
+        local_archive_path: Optional[Path | str] = None,
+        parent=None,
+    ):
         super().__init__(parent)
         self._remote_version = remote_version
+        self._local_archive_path = (
+            Path(local_archive_path).expanduser().resolve() if local_archive_path else None
+        )
         self.prepared_update: Optional[PreparedUpdate] = None
         self._cancel_requested = False
         self._install_started = False
         self._install_task: asyncio.Task | None = None
+        self._legacy_restore_config_logs = self._read_legacy_restore_config_logs_setting()
 
-        self.setWindowTitle("Downloading Update")
+        self.setWindowTitle(
+            "Preparing Debug Update" if self._local_archive_path is not None else "Downloading Update"
+        )
         self.setModal(True)
         self.setFixedWidth(520)
 
@@ -196,7 +244,9 @@ class UpdateDownloadDialog(QDialog):
         layout.setContentsMargins(22, 22, 22, 18)
         layout.setSpacing(12)
 
-        title = QLabel("Downloading update…")
+        title = QLabel(
+            "Preparing debug update..." if self._local_archive_path is not None else "Downloading update…"
+        )
         title.setAlignment(Qt.AlignCenter)
         title.setStyleSheet(
             f"""
@@ -346,7 +396,9 @@ class UpdateDownloadDialog(QDialog):
         expected_exe_name = Path(sys.executable).name
         self._thread = QThread(self)
         self._worker = _AutoUpdateWorker(
-            remote_version=self._remote_version, expected_exe_name=expected_exe_name
+            remote_version=self._remote_version,
+            expected_exe_name=expected_exe_name,
+            local_archive_path=self._local_archive_path,
         )
         self._worker.moveToThread(self._thread)
         self._thread.started.connect(self._worker.run)
@@ -433,10 +485,15 @@ class UpdateDownloadDialog(QDialog):
         if self._cancel_requested:
             self.reject()
             return
+        failure_message = (
+            "Failed to prepare the local update archive."
+            if self._local_archive_path is not None
+            else "Failed to download the update."
+        )
         QMessageBox.warning(
             self,
             "Auto-Update",
-            "Failed to download the update.\n\n"
+            f"{failure_message}\n\n"
             f"{message}",
         )
         self.reject()
@@ -460,6 +517,27 @@ class UpdateDownloadDialog(QDialog):
             except Exception:
                 return None
         return None
+
+    def _read_legacy_restore_config_logs_setting(self) -> bool:
+        current = self.parent()
+        while current is not None:
+            config_manager = getattr(current, "config_manager", None)
+            get_setting = getattr(config_manager, "get_setting", None)
+            if callable(get_setting):
+                try:
+                    return bool(
+                        get_setting(
+                            "application_settings",
+                            "legacy_update_restore_config_logs",
+                        )
+                    )
+                except Exception:
+                    return False
+            try:
+                current = current.parent()
+            except Exception:
+                return False
+        return False
 
     async def _stop_services_before_update(self) -> None:
         owner = self._find_stop_services_owner()
@@ -526,6 +604,11 @@ class UpdateDownloadDialog(QDialog):
             "--payload-dir",
             str(prepared.extracted_app_root),
         ]
+        release_url = str(prepared.release_html_url or "").strip()
+        if release_url:
+            cmd += ["--release-url", release_url]
+        if self._legacy_restore_config_logs:
+            cmd.append("--legacy-restore-config-logs")
 
         self._launcher_thread = QThread(self)
         self._launcher_worker = _UpdaterLauncher(cmd, tempfile.gettempdir())

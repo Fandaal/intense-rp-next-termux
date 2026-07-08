@@ -7,7 +7,7 @@ icon: material/star-four-points
 Use this page as a map of the app-wide docs. If you are looking for provider-specific toggles, model pickers, search controls, or provider quirks, go to :material-cloud: [Providers](providers.md) instead.
 
 !!! info "Provider settings moved"
-    DeepSeek, GLM, Moonshot, QwenLM, Perplexity, HuggingChat, and Google AI Studio Behavior settings now live in the dedicated [:material-cloud: Providers](providers.md) section.
+    DeepSeek, GLM, Moonshot, QwenLM, Perplexity, HuggingChat, Google AI Studio, and Xiaomi MiMo Behavior settings now live in the dedicated [:material-cloud: Providers](providers.md) section.
 
 ---
 
@@ -114,7 +114,7 @@ Use this page as a map of the app-wide docs. If you are looking for provider-spe
 
 -   :material-cloud: **Providers**
 
-    Tune DeepSeek, GLM, Moonshot, QwenLM, Perplexity, HuggingChat, or Google AI Studio.
+    Tune DeepSeek, GLM, Moonshot, QwenLM, Perplexity, HuggingChat, Google AI Studio, or Xiaomi MiMo.
 
     [:arrow_right: Browse Providers](providers.md)
 

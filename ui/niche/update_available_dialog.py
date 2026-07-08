@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Optional
 
 from PySide6.QtCore import Qt, QSize, QUrl
 from PySide6.QtGui import QDesktopServices
-from PySide6.QtWidgets import QDialog, QFrame, QHBoxLayout, QLabel, QPushButton, QVBoxLayout
+from PySide6.QtWidgets import QDialog, QFrame, QHBoxLayout, QLabel, QMessageBox, QPushButton, QVBoxLayout
 
 from ui.core.brand import BrandColors
 from ui.core.icons import IconType, IconUtils
@@ -31,9 +32,17 @@ class UpdateAvailableInfo:
     remote_version: str
     remote_auto_updateable: Optional[bool] = None
     remote_severity: Optional[int] = None
+    remote_summary: Optional[str] = None
+    local_update_archive: Optional[str] = None
+
+    @property
+    def is_local_update_debug(self) -> bool:
+        return bool(str(self.local_update_archive or "").strip())
 
     @property
     def release_notes_url(self) -> str:
+        if self.is_local_update_debug:
+            return ""
         remote = (self.remote_version or "").strip()
         if remote.lower().startswith("v"):
             remote = remote[1:].strip()
@@ -48,7 +57,7 @@ class UpdateAvailableDialog(QDialog):
         self._info = info
         self._install_button: QPushButton | None = None
 
-        self.setWindowTitle("Update Available")
+        self.setWindowTitle("Debug Update Available" if info.is_local_update_debug else "Update Available")
         self.setModal(True)
         self.setFixedWidth(440)
 
@@ -87,12 +96,22 @@ class UpdateAvailableDialog(QDialog):
         versions = self._build_version_row()
         layout.addWidget(versions, 0, Qt.AlignHCenter)
 
-        desc_text = "An update is available. You can install it or skip for now."
-        if info.remote_auto_updateable is False:
+        if info.is_local_update_debug:
+            archive_name = Path(str(info.local_update_archive or "")).name or "the selected ZIP"
             desc_text = (
-                "An update is available, but Auto-Update is disabled for this release. "
-                "Use Git (source runs) or download manually from the release page."
+                f"Debug update mode will stage {archive_name} and run the Auto-Update "
+                "installer flow."
             )
+        else:
+            desc_text = "An update is available. You can install it or skip for now."
+            if info.remote_auto_updateable is False:
+                desc_text = (
+                    "An update is available, but Auto-Update is disabled for this release. "
+                    "Use Git (source runs) or download manually from the release page."
+                )
+            summary = str(info.remote_summary or "").strip()
+            if summary:
+                desc_text = f"{desc_text}\n\nThis update brings: {summary}"
 
         desc = QLabel(desc_text)
         desc.setWordWrap(True)
@@ -110,31 +129,32 @@ class UpdateAvailableDialog(QDialog):
         buttons = self._build_button_row()
         layout.addWidget(buttons)
 
-        view_release_notes = QPushButton("View Release Notes")
-        view_release_notes.setCursor(Qt.PointingHandCursor)
-        view_release_notes.setStyleSheet(
-            f"""
-            QPushButton {{
-                background-color: transparent;
-                color: {BrandColors.TEXT_PRIMARY};
-                border: 1px solid {BrandColors.INPUT_BORDER};
-                padding: 10px 14px;
-                border-radius: 8px;
-                font-size: {BrandColors.FONT_SIZE_REGULAR};
-                font-weight: 700;
-            }}
-            QPushButton:hover {{
-                background-color: {BrandColors.ITEM_HOVER};
-                border: 1px solid {BrandColors.ACCENT};
-            }}
-            QPushButton:pressed {{
-                background-color: {BrandColors.SIDEBAR_BG};
-                border: 1px solid {BrandColors.INPUT_BORDER};
-            }}
-            """
-        )
-        view_release_notes.clicked.connect(self._open_release_notes)
-        layout.addWidget(view_release_notes)
+        if not info.is_local_update_debug:
+            view_release_notes = QPushButton("View Release Notes")
+            view_release_notes.setCursor(Qt.PointingHandCursor)
+            view_release_notes.setStyleSheet(
+                f"""
+                QPushButton {{
+                    background-color: transparent;
+                    color: {BrandColors.TEXT_PRIMARY};
+                    border: 1px solid {BrandColors.INPUT_BORDER};
+                    padding: 10px 14px;
+                    border-radius: 8px;
+                    font-size: {BrandColors.FONT_SIZE_REGULAR};
+                    font-weight: 700;
+                }}
+                QPushButton:hover {{
+                    background-color: {BrandColors.ITEM_HOVER};
+                    border: 1px solid {BrandColors.ACCENT};
+                }}
+                QPushButton:pressed {{
+                    background-color: {BrandColors.SIDEBAR_BG};
+                    border: 1px solid {BrandColors.INPUT_BORDER};
+                }}
+                """
+            )
+            view_release_notes.clicked.connect(self._open_release_notes)
+            layout.addWidget(view_release_notes)
 
     def _build_version_row(self) -> QFrame:
         row = QFrame()
@@ -167,7 +187,8 @@ class UpdateAvailableDialog(QDialog):
             arrow.setPixmap(arrow_pixmap)
         layout.addWidget(arrow, 0, Qt.AlignVCenter)
 
-        remote_label = QLabel(_format_version(self._info.remote_version))
+        remote_text = "Local ZIP" if self._info.is_local_update_debug else _format_version(self._info.remote_version)
+        remote_label = QLabel(remote_text)
         remote_label.setStyleSheet(
             f"""
             font-size: {BrandColors.FONT_SIZE_LARGE};
@@ -181,6 +202,9 @@ class UpdateAvailableDialog(QDialog):
         return row
 
     def _build_title_html(self) -> str:
+        if self._info.is_local_update_debug:
+            return f'<span style="color: {BrandColors.TEXT_PRIMARY};">Debug Update Available</span>'
+
         label, label_color = self._severity_label_and_color()
         if label and label_color:
             return (
@@ -265,6 +289,18 @@ class UpdateAvailableDialog(QDialog):
         return mapping.get(sev_int, (None, None))
 
     def _on_install_clicked(self) -> None:
+        if self._info.is_local_update_debug:
+            archive_path = str(self._info.local_update_archive or "").strip()
+            if not archive_path:
+                QMessageBox.warning(self, "Auto-Update", "No local update archive was provided.")
+                return
+            UpdateDownloadDialog(
+                remote_version=self._info.remote_version,
+                local_archive_path=archive_path,
+                parent=self,
+            ).exec()
+            return
+
         availability = default_update_method_availability()
         if self._info.remote_auto_updateable is False:
             availability = UpdateMethodAvailability(

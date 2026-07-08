@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
+import os
 import re
 import subprocess
 import sys
@@ -61,7 +62,26 @@ def _decode_process_output(stdout: bytes | None, stderr: bytes | None) -> str:
     return stderr_text or stdout_text or "Unknown error"
 
 
-async def _run_patchright_cli(*args: str, timeout_s: float = 300.0) -> PatchrightCommandResult:
+def _normalize_download_host(download_host: str | None) -> str:
+    return str(download_host or "").strip().rstrip("/")
+
+
+def _patchright_cli_env(download_host: str | None = None) -> dict[str, str] | None:
+    normalized_host = _normalize_download_host(download_host)
+    if not normalized_host:
+        return None
+
+    env = os.environ.copy()
+    env["PLAYWRIGHT_CHROMIUM_DOWNLOAD_HOST"] = normalized_host
+    return env
+
+
+async def _run_patchright_cli(
+    *args: str,
+    timeout_s: float = 300.0,
+    download_host: str | None = None,
+) -> PatchrightCommandResult:
+    env = _patchright_cli_env(download_host)
     process = await asyncio.create_subprocess_exec(
         sys.executable,
         "-m",
@@ -69,6 +89,7 @@ async def _run_patchright_cli(*args: str, timeout_s: float = 300.0) -> Patchrigh
         *args,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
+        env=env,
         creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
     )
 
@@ -126,15 +147,33 @@ async def is_browser_installed() -> bool:
     return bool(await probe_browser_executable_path())
 
 
-async def install_chromium_browser(status_callback: StatusCallback | None = None) -> PatchrightCommandResult:
+async def install_chromium_browser(
+    status_callback: StatusCallback | None = None,
+    download_host: str | None = None,
+) -> PatchrightCommandResult:
     Logger.info("Verifying/Installing Chromium browser...")
     if status_callback:
         status_callback("Verifying Browser...")
 
+    normalized_host = _normalize_download_host(download_host)
+    if normalized_host:
+        Logger.info(f"Using configured Chromium download mirror: {normalized_host}")
+        if status_callback:
+            status_callback("Using Browser Download Mirror...")
+
     try:
-        result = await _run_patchright_cli("install", "chromium")
+        result = await _run_patchright_cli(
+            "install",
+            "chromium",
+            download_host=normalized_host,
+        )
     except Exception as e:
         Logger.error(f"Browser installation failed: {e}")
+        if normalized_host:
+            raise RuntimeError(
+                "Browser installation failed while using the configured Chromium "
+                f"download mirror ({normalized_host}): {e}"
+            )
         raise RuntimeError(f"Browser installation failed: {e}")
 
     if result.stdout:

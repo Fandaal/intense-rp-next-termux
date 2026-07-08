@@ -13,6 +13,21 @@ This page covers the toggles and options that control how IntenseRP interacts wi
 
 ---
 
+## :material-call-split: Request Capture Mode
+
+Controls how IntenseRP captures Moonshot's streaming response.
+
+:material-arrow-right: **Settings** -> **Provider Behavior** -> **Moonshot** -> **Request Capture Mode**
+
+**Replay** is the default. IntenseRP intercepts the Kimi request, replays it internally, streams that replay to the API client, and then gives the captured response back to the page. It's the older, known-good path.
+
+**CDP Teeing** is the newer alternative. IntenseRP leaves Kimi's real browser request alone, tees the real response through Chrome DevTools Protocol, and feeds those bytes through the same Moonshot stream parser. This lets the page JavaScript receive and process its own response normally while IntenseRP observes the stream.
+
+!!! note "Default stays Replay"
+    CDP Teeing is off by default for Moonshot. It's available if you want the browser-native request path, but Replay remains the safer default while this newer path gets more real-world mileage.
+
+---
+
 ## :material-login: Authentication
 
 Kimi uses a Google sign-in popup rather than a normal in-page email/password form.
@@ -24,13 +39,13 @@ That said, Google is still Google. It may decide to ask for extra confirmation, 
 **Persistent Sessions are still strongly recommended.** If your Google session stays alive, Kimi becomes much less annoying to use.
 
 !!! info "Multiple profiles"
-    There's rate limiting as well, so you can still set up multiple Kimi accounts/profiles.
+    If you legitimately use more than one Kimi account, you can keep separate account/profile rows.
 
     Open **Settings -> Provider and Login -> Sign-In and Accounts -> Saved Accounts** and add multiple accounts under Moonshot.
 
     IntenseRP uses those values for Moonshot's Google popup Auto Login when **Auto Login** is enabled, and each row also gets its own browser profile/session.
 
-    You may wish to log in with different Google accounts in each profile to further reduce the risk of rate limits.
+    Keep each row tied to an account you are authorized to use, and expect each provider account to keep its own limits and checks.
 
 ## :material-head-cog: Thinking
 
@@ -50,8 +65,8 @@ When disabled, only final answer text is forwarded.
 
 :material-arrow-right: **Settings** -> **Provider Behavior** -> **Moonshot** -> **Send Thinking**
 
-!!! warning "Model downgrading"
-    As part of a paywall strategy, Kimi will downgrade to K2.6 Instant (if you're on their Free plan) when you enable Thinking mode. This is a provider-side change and not something IntenseRP can control. They say it's because of high demand, but really it probably just means they're trying to force you to pay `¯\_(ツ)_/¯`.
+!!! warning "Model availability"
+    Kimi may downgrade to K2.6 Instant when Thinking mode is unavailable for the active account or current provider conditions. This is a provider-side change and not something IntenseRP can control.
 
 ---
 
@@ -104,14 +119,14 @@ This setting only appears when **Send As Text File** is enabled.
 
 ---
 
-## :material-shield-off: Anti-Censorship
+## :material-shield-off: Blocked-response handling
 
-When enabled, IntenseRP suppresses refusal-like stream events (when detected) and closes the response cleanly.
+When **Blocked-Response Handling** is enabled, IntenseRP suppresses detected refusal-like stream events and closes the response cleanly.
 
-:material-arrow-right: **Settings** -> **Provider Behavior** -> **Moonshot** -> **Anti-Censorship**
+:material-arrow-right: **Settings** -> **Provider Behavior** -> **Moonshot** -> **Blocked-Response Handling**
 
 !!! warning "What It Doesn't Do"
-    This does not bypass provider filtering. It only suppresses refusal-style output from being forwarded to the client.
+    This does not override provider policy or unlock blocked content. It only changes how detected refusal-style output is forwarded to the client.
 
 ---
 
@@ -169,13 +184,14 @@ All macros are stripped before sending.
 
 | Setting | What It Does | Default |
 |---------|--------------|---------|
+| **Request Capture Mode** | Captures responses with Replay or CDP Teeing | Replay |
 | **Enable Thinking** | Switches Kimi mode between Instant and Thinking | Off |
 | **Send Thinking** | Includes reasoning in response | Off |
 | **Enable Search** | Toggles Kimi search | Off |
 | **Send As Text File** | Uploads prompt as .txt | Off |
 | **File Upload Timeout** | Seconds to wait for upload | 15 |
 | **Text File Filler** | Text pasted alongside the uploaded file | `.` |
-| **Anti-Censorship** | Suppresses refusal-like outputs | Off |
+| **Blocked-Response Handling** | Handles detected refusal-like outputs | Off |
 | **Reuse Matching Chat** | Regenerates on duplicate prompts | Off |
 | **Delete Chat After Reply** | Deletes the completed Kimi chat after a successful reply | Off |
 

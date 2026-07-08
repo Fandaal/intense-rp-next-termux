@@ -7,7 +7,7 @@ icon: material/cloud
 Each provider has its own Behavior page because the web UIs don't all expose the same controls, and some of them have unique quirks that need extra explanation. If you are looking for a specific toggle, model picker, or provider quirk, this is the place to find it.
 
 !!! tip "App-wide settings live elsewhere"
-    Accounts, sessions, formatting, ports, API keys, and logging are covered under :material-star-four-points: [Features](features.md). This section is for provider-specific controls like Thinking, Search, model pickers, uploads, anti-censorship workarounds, and provider quirks.
+    Accounts, sessions, formatting, ports, API keys, and logging are covered under :material-star-four-points: [Features](features.md). This section is for provider-specific controls like Thinking, Search, model pickers, uploads, blocked-response handling, and provider quirks.
 
 ---
 
@@ -15,7 +15,7 @@ Each provider has its own Behavior page because the web UIs don't all expose the
 
 -   :providers-deepseek: **DeepSeek Behavior**
 
-    DeepThink, Search, file uploads, anti-censorship, and chat reuse.
+    DeepThink, Search, file uploads, blocked-response handling, and chat reuse.
 
     [:arrow_right: Open DeepSeek](providers/deepseek-behavior.md)
 
@@ -27,7 +27,7 @@ Each provider has its own Behavior page because the web UIs don't all expose the
 
 -   :providers-moonshot: **Kimi Behavior**
 
-    Thinking, Search, file uploads, anti-censorship, and Kimi login/paywall notes.
+    Thinking, Search, file uploads, blocked-response handling, and Kimi account-tier notes.
 
     [:arrow_right: Open Kimi](providers/moonshot-behavior.md)
 
@@ -51,9 +51,15 @@ Each provider has its own Behavior page because the web UIs don't all expose the
 
 -   :providers-aistudio: **Google AI Studio Behavior**
 
-    Gemini model selection, Thinking Level, Search grounding, URL Context, uploads, sampling, and safety controls. Temporarily locked by default.
+    Gemini model selection, Thinking Level, Search grounding, URL Context, uploads, sampling, and humanized mouse movement.
 
     [:arrow_right: Open AI Studio](providers/aistudio-behavior.md)
+
+-   :providers-xiaomi: **Xiaomi MiMo Behavior**
+
+    MiMo model selection, thinking output filtering, uploads, regional availability notes, token usage, and chat reuse.
+
+    [:arrow_right: Open MiMo](providers/mimo-behavior.md)
 
 </div>
 
@@ -65,11 +71,12 @@ Each provider has its own Behavior page because the web UIs don't all expose the
 |---|---|
 | **DeepSeek** | You need DeepThink/Search controls, duplicate-prompt reuse, or the DeepSeek refusal-message workaround. |
 | **GLM Chat** | You need Tools, token counting, model picker behavior, Repetition Buster, or timing/instability notes. |
-| **Kimi / Moonshot** | You use Kimi's Thinking/Search modes, Google login, uploads, or want to understand its free/paid mode caveats. |
+| **Kimi / Moonshot** | You use Kimi's Thinking/Search modes, Google login, uploads, or want to understand its account-tier caveats. |
 | **QwenLM** | You need Qwen Thinking, Web Search, model selection, token counting, file uploads, or guardrail behavior. |
 | **Perplexity** | You use Perplexity's model picker, Thinking/Search behavior, uploads, or email-code login. |
 | **HuggingChat** | You need model/provider selection, Thinking Effort, Exa search, uploads, or help with monthly credit limits. |
-| **Google AI Studio** | You need to configure AI Studio behavior while it is temporarily locked, or you are intentionally using **Ignore Provider Locks**. |
+| **Google AI Studio** | You use Gemini through AI Studio, need model/Thinking/Search controls, etc. |
+| **Xiaomi MiMo** | You need MiMo model selection, thinking output filtering, proxy setup, or regional availability notes. |
 
 Provider docs are intentionally a little more detailed than the overview pages, though they're still focused on practical user-facing info, as I wanted to avoid dumping too much technicalities into the main flow. If you want to understand more about how a provider integration works under the hood, you're going to have to dig through the code or ask in the community.
 

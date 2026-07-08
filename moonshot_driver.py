@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import json
 import re
 import time
@@ -33,8 +34,14 @@ load_dotenv()
 
 
 class MoonshotDriver(BaseDriver):
+    REQUEST_CAPTURE_MODE_REPLAY = "replay"
+    REQUEST_CAPTURE_MODE_CDP_TEEING = "cdp_teeing"
     CHAT_ROUTE_GLOB = "**/apiv2/kimi.gateway.chat.v1.ChatService/Chat*"
     REGEN_ROUTE_GLOB = "**/apiv2/kimi.gateway.chat.v1.ChatService/RegenerateMessage*"
+    COMPLETION_URL_PATH_PREFIXES = (
+        "/apiv2/kimi.gateway.chat.v1.ChatService/Chat",
+        "/apiv2/kimi.gateway.chat.v1.ChatService/RegenerateMessage",
+    )
     USER_SETTINGS_ROUTE_GLOB = "**/apiv2/kimi.usersetting.v1.UserSettingService/GetUserSetting*"
     USER_SETTINGS_UPDATE_URL = "https://www.kimi.com/apiv2/kimi.usersetting.v1.UserSettingService/UpdateUserSetting"
     NEW_CHAT_URL = "https://www.kimi.com/?chat_enter_method=new_chat"
@@ -62,6 +69,7 @@ class MoonshotDriver(BaseDriver):
     MODEL_REASONER_API = "moonshot-reasoner"
     INTERCEPT_FIRST_CHUNK_TIMEOUT_S = 45.0
     INTERCEPT_IDLE_TIMEOUT_S = 75.0
+    COMPLETION_REQUEST_TIMEOUT_S = 20.0
     AUTH_STATE_SETTLE_TIMEOUT_MS = 12000
     AUTH_STATE_STABLE_SIGNED_OUT_MS = 1800
     GOOGLE_AUTO_LOGIN_TIMEOUT_MS = 20000
@@ -432,6 +440,7 @@ class MoonshotDriver(BaseDriver):
             return ""
 
         selectors = [
+            "div.user-info span.user-name",
             "div.user-info-container span.user-name",
             "span.user-name",
         ]
@@ -439,13 +448,30 @@ class MoonshotDriver(BaseDriver):
         for selector in selectors:
             try:
                 locator = self.page.locator(selector)
-                if await locator.count() == 0:
+                count = await locator.count()
+                if count == 0:
                     continue
-                text = (await locator.first.inner_text() or "").strip()
-                if text:
-                    return text
             except Exception:
                 continue
+
+            fallback_text = ""
+            for idx in range(min(count, 10)):
+                item = locator.nth(idx)
+                try:
+                    text = (await item.inner_text() or "").strip()
+                except Exception:
+                    continue
+                if not text:
+                    continue
+                if not fallback_text:
+                    fallback_text = text
+                try:
+                    if await item.is_visible():
+                        return text
+                except Exception:
+                    continue
+            if fallback_text:
+                return fallback_text
 
         return ""
 
@@ -479,16 +505,9 @@ class MoonshotDriver(BaseDriver):
         if user_state != "unknown":
             return user_state
 
-        editor = await self._find_first_visible(
-            [
-                "div.chat-input-editor[contenteditable='true']",
-                "div.chat-input-editor[contenteditable]",
-            ],
-            timeout_ms=0,
-        )
-        if editor is not None:
-            return "signed_in"
-
+        # Kimi can render the chat shell/editor before the account footer settles.
+        # Treat span.user-name as the auth source of truth so "Log In" can't be
+        # hidden by a premature editor-visible check.
         return "unknown"
 
     async def _is_logged_in(self) -> bool:
@@ -547,6 +566,178 @@ class MoonshotDriver(BaseDriver):
 
     async def _human_delay(self, delay_s: float = 0.8) -> None:
         await asyncio.sleep(max(0.0, float(delay_s)))
+
+    async def _click_with_fallbacks(
+        self,
+        locator,
+        *,
+        timeout_ms: int = 3000,
+        evaluate_fallback: bool = True,
+    ) -> bool:
+        try:
+            await locator.scroll_into_view_if_needed(timeout=int(timeout_ms))
+        except Exception:
+            pass
+
+        try:
+            await locator.click(timeout=int(timeout_ms))
+            return True
+        except Exception as e:
+            Logger.debug(f"Moonshot: normal click failed; trying fallbacks: {e}")
+
+        try:
+            await locator.click(timeout=int(timeout_ms), force=True)
+            return True
+        except Exception as e:
+            Logger.debug(f"Moonshot: forced click failed: {e}")
+
+        if not evaluate_fallback:
+            return False
+
+        try:
+            await locator.evaluate("(el) => el.click()")
+            return True
+        except Exception as e:
+            Logger.debug(f"Moonshot: DOM click fallback failed: {e}")
+            return False
+
+    async def _kimi_sidebar_mask_visible(self) -> bool:
+        if not self.page:
+            return False
+
+        try:
+            visible = await self.page.evaluate(
+                """() => {
+                    const isVisible = (el) => {
+                        if (!el) return false;
+                        const rect = el.getBoundingClientRect();
+                        if (!rect || rect.width <= 0 || rect.height <= 0) return false;
+                        const style = window.getComputedStyle(el);
+                        if (!style) return false;
+                        return (
+                            style.display !== 'none'
+                            && style.visibility !== 'hidden'
+                            && style.pointerEvents !== 'none'
+                            && Number(style.opacity || '1') !== 0
+                        );
+                    };
+                    return Array.from(document.querySelectorAll(
+                        'div.sidebar-slot.is-mobile-expanded div.mask, ' +
+                        'div.sidebar-slot.sidebar-slot--interactive.is-mobile-expanded div.mask'
+                    )).some(isVisible);
+                }"""
+            )
+            return bool(visible)
+        except Exception:
+            return False
+
+    async def _wait_for_kimi_sidebar_mask_hidden(self, timeout_ms: int = 1500) -> bool:
+        deadline = time.time() + max(0.0, float(timeout_ms) / 1000.0)
+        while True:
+            if not await self._kimi_sidebar_mask_visible():
+                return True
+            if time.time() >= deadline:
+                return False
+            await asyncio.sleep(0.08)
+
+    async def _disable_kimi_sidebar_mask_pointer_events(self) -> None:
+        if not self.page:
+            return
+
+        try:
+            await self.page.evaluate(
+                """() => {
+                    for (const mask of document.querySelectorAll(
+                        'div.sidebar-slot.is-mobile-expanded div.mask, ' +
+                        'div.sidebar-slot.sidebar-slot--interactive.is-mobile-expanded div.mask'
+                    )) {
+                        mask.style.pointerEvents = 'none';
+                    }
+                }"""
+            )
+        except Exception:
+            pass
+
+    async def _dismiss_kimi_sidebar_overlay(self) -> bool:
+        if not self.page:
+            return False
+
+        if not await self._kimi_sidebar_mask_visible():
+            return True
+
+        masks = self.page.locator(
+            "div.sidebar-slot.is-mobile-expanded div.mask, "
+            "div.sidebar-slot.sidebar-slot--interactive.is-mobile-expanded div.mask"
+        )
+        try:
+            count = await masks.count()
+        except Exception:
+            count = 0
+
+        for idx in range(min(count, 5)):
+            mask = masks.nth(idx)
+            try:
+                if not await mask.is_visible():
+                    continue
+            except Exception:
+                continue
+
+            if await self._click_with_fallbacks(mask, timeout_ms=1000):
+                if await self._wait_for_kimi_sidebar_mask_hidden(timeout_ms=1200):
+                    return True
+
+        try:
+            await self.page.keyboard.press("Escape")
+            if await self._wait_for_kimi_sidebar_mask_hidden(timeout_ms=800):
+                return True
+        except Exception:
+            pass
+
+        close_button = await self._find_first_visible(
+            [
+                "aside.sidebar div.sidebar-header div.expand-btn:not(.icon-button)",
+                "aside.sidebar div.sidebar-header .expand-btn",
+                "div.sidebar-header div.expand-btn:not(.icon-button)",
+            ],
+            timeout_ms=600,
+            poll_interval_s=0.08,
+        )
+        if close_button is not None:
+            if await self._click_with_fallbacks(close_button, timeout_ms=1000):
+                if await self._wait_for_kimi_sidebar_mask_hidden(timeout_ms=1200):
+                    return True
+
+        Logger.debug("Moonshot: sidebar mask stayed visible; disabling its pointer events.")
+        await self._disable_kimi_sidebar_mask_pointer_events()
+        return not await self._kimi_sidebar_mask_visible()
+
+    async def _open_kimi_toolkit_menu(self, timeout_ms: int = 4000) -> bool:
+        if not self.page:
+            return False
+
+        if await self._find_first_visible(["div.toolkit-container"], timeout_ms=0) is not None:
+            return True
+
+        await self._dismiss_kimi_sidebar_overlay()
+        toolkit_button = await self._find_first_visible(["div.toolkit-trigger-btn"], timeout_ms=timeout_ms)
+        if toolkit_button is None:
+            Logger.warning("Moonshot: toolkit trigger button not found.")
+            return False
+
+        if not await self._click_with_fallbacks(toolkit_button, timeout_ms=3000):
+            Logger.warning("Moonshot: toolkit trigger button could not be clicked.")
+            return False
+
+        try:
+            await self.page.wait_for_selector(
+                "div.toolkit-container",
+                timeout=max(1000, int(timeout_ms)),
+                state="visible",
+            )
+            return True
+        except Exception as e:
+            Logger.warning(f"Moonshot: toolkit menu did not open: {e}")
+            return False
 
     async def _find_first_visible_on_page(
         self,
@@ -885,6 +1076,89 @@ class MoonshotDriver(BaseDriver):
 
         return False, popup
 
+    async def _open_kimi_login_modal(self) -> bool:
+        if not self.page:
+            return False
+
+        if await self._login_modal_visible():
+            return True
+
+        try:
+            clicked = await self.page.evaluate(
+                """() => {
+                    const normalize = (value) => String(value || '').replace(/\\s+/g, ' ').trim().toLowerCase();
+                    const isVisible = (el) => {
+                        if (!el) return false;
+                        const rect = el.getBoundingClientRect();
+                        if (!rect || rect.width <= 0 || rect.height <= 0) return false;
+                        const style = window.getComputedStyle(el);
+                        return style && style.display !== 'none' && style.visibility !== 'hidden';
+                    };
+
+                    const userNames = Array.from(document.querySelectorAll('span.user-name'));
+                    const loginName = userNames.find((span) => normalize(span.textContent) === 'log in');
+                    const candidates = [];
+
+                    if (loginName) {
+                        const userInfo = loginName.closest('div.user-info');
+                        if (userInfo) candidates.push(userInfo);
+                        const container = loginName.closest('div.user-info-container');
+                        if (container) candidates.push(container);
+                    }
+
+                    candidates.push(...Array.from(document.querySelectorAll('div.user-info')));
+                    candidates.push(...Array.from(document.querySelectorAll('div.user-info-container')));
+
+                    const seen = new Set();
+                    const ordered = candidates.filter((el) => {
+                        if (!el || seen.has(el)) return false;
+                        seen.add(el);
+                        return true;
+                    });
+
+                    const target = ordered.find(isVisible) || ordered[0] || null;
+                    if (!target || typeof target.click !== 'function') {
+                        return false;
+                    }
+                    target.click();
+                    return true;
+                }"""
+            )
+            if clicked:
+                try:
+                    await self.page.wait_for_selector(
+                        "div.login-modal-content, div.google-login-btn",
+                        timeout=5000,
+                    )
+                    return True
+                except Exception:
+                    if await self._login_modal_visible():
+                        return True
+                    if await self._is_logged_in():
+                        return True
+        except Exception as e:
+            Logger.debug(f"Moonshot: JS user-info login click failed: {e}")
+
+        await self.set_sidebar_status(open=True)
+        user_info = await self._find_first_visible(
+            [
+                "div.user-info",
+                "div.user-info-container",
+            ],
+            timeout_ms=3000,
+        )
+        if user_info is None:
+            return False
+
+        if not await self._click_with_fallbacks(user_info, timeout_ms=2000):
+            return False
+
+        try:
+            await self.page.wait_for_selector("div.login-modal-content, div.google-login-btn", timeout=5000)
+            return True
+        except Exception:
+            return await self._login_modal_visible() or await self._is_logged_in()
+
     async def _click_google_login_and_get_popup(self):
         if not self.page:
             return None
@@ -909,7 +1183,9 @@ class MoonshotDriver(BaseDriver):
                 popup_task = None
 
         try:
-            await google_button.click()
+            clicked = await self._click_with_fallbacks(google_button, timeout_ms=3000)
+            if not clicked:
+                raise RuntimeError("Google login button was not clickable")
         except Exception as e:
             Logger.warning(f"Moonshot: failed to click Google login button: {e}")
             if popup_task and (not popup_task.done()):
@@ -945,21 +1221,9 @@ class MoonshotDriver(BaseDriver):
         except Exception:
             auto_login = False
 
-        user_info_container = await self._find_first_visible(
-            [
-                "div.user-info-container",
-            ],
-            timeout_ms=15000,
-        )
-        if user_info_container is None:
-            Logger.warning("Moonshot: user-info container not found. Waiting for manual login...")
-            await self._wait_until_logged_in(timeout_ms=0)
-            return
-
-        try:
-            await user_info_container.click()
-        except Exception as e:
-            Logger.warning(f"Moonshot: failed to open login modal: {e}")
+        opened_login_modal = await self._open_kimi_login_modal()
+        if not opened_login_modal:
+            Logger.warning("Moonshot: user-info login control not found. Waiting for manual login...")
             await self._wait_until_logged_in(timeout_ms=0)
             return
 
@@ -1097,6 +1361,28 @@ class MoonshotDriver(BaseDriver):
             )
 
         return settings
+
+    def _get_request_capture_mode(self) -> str:
+        try:
+            mode = str(
+                self.config_manager.get_setting("moonshot_behavior", "request_capture_mode")
+                or self.REQUEST_CAPTURE_MODE_REPLAY
+            ).strip().lower()
+        except Exception:
+            mode = self.REQUEST_CAPTURE_MODE_REPLAY
+
+        if mode == self.REQUEST_CAPTURE_MODE_CDP_TEEING:
+            return self.REQUEST_CAPTURE_MODE_CDP_TEEING
+        return self.REQUEST_CAPTURE_MODE_REPLAY
+
+    @classmethod
+    def _is_completion_request_url(cls, url: Any) -> bool:
+        try:
+            parsed = urlsplit(str(url or ""))
+        except Exception:
+            return False
+        path = str(parsed.path or "")
+        return any(path.startswith(prefix) for prefix in cls.COMPLETION_URL_PATH_PREFIXES)
 
     def _extract_moonshot_macros_from_text(self, text: str) -> tuple[str, Dict[str, bool]]:
         return extract_macro_overrides(text, macro_actions=COMMON_REQUEST_MACRO_ACTIONS)
@@ -1292,6 +1578,8 @@ class MoonshotDriver(BaseDriver):
         *,
         formatted_message: str,
         multi_slot_state: Dict[str, Any],
+        completion_armed: asyncio.Event | None = None,
+        completion_started: asyncio.Event | None = None,
     ) -> bool:
         account_key = self._get_multi_slot_cache_account_key()
         payload = read_multi_slot_cache_payload(
@@ -1325,7 +1613,11 @@ class MoonshotDriver(BaseDriver):
             pass
 
         Logger.info("Multi-Slot Cache (Moonshot): cached prompt match found. Attempting to regenerate...")
+        if completion_armed is not None:
+            completion_armed.set()
         if not await self._click_regenerate():
+            if completion_armed is not None:
+                completion_armed.clear()
             Logger.warning(
                 "Multi-Slot Cache (Moonshot): regenerate button unavailable. Removing cached entry."
             )
@@ -1337,6 +1629,21 @@ class MoonshotDriver(BaseDriver):
                 log_label="Multi-Slot Cache (Moonshot)",
             )
             return False
+
+        if completion_started is not None:
+            try:
+                await asyncio.wait_for(
+                    completion_started.wait(),
+                    timeout=self.COMPLETION_REQUEST_TIMEOUT_S,
+                )
+            except asyncio.TimeoutError:
+                if completion_armed is not None:
+                    completion_armed.clear()
+                Logger.warning(
+                    "Multi-Slot Cache (Moonshot): completion request not observed after clicking "
+                    "Regenerate. Falling back to a new chat."
+                )
+                return False
 
         return True
 
@@ -1392,6 +1699,25 @@ class MoonshotDriver(BaseDriver):
     ):
         _ = (stream, temperature, top_p, max_tokens)
         response_queue = asyncio.Queue()
+        completion_armed = asyncio.Event()
+        completion_started = asyncio.Event()
+        completion_claim_lock = asyncio.Lock()
+        completion_claimed = False
+        intercepted_response: httpx.Response | None = None
+        intercepted_request_abort = asyncio.Event()
+        intercepted_request_finished = asyncio.Event()
+        request_capture_mode = self._get_request_capture_mode()
+        use_cdp_teeing = request_capture_mode == self.REQUEST_CAPTURE_MODE_CDP_TEEING
+        route_handlers_registered = False
+        cdp_session: Any = None
+        cdp_listeners_registered = False
+        cdp_tasks: set[asyncio.Task] = set()
+        request_methods: dict[str, str] = {}
+        cdp_pending_response_urls: dict[str, str] = {}
+        cdp_active_request_id: Optional[str] = None
+        cdp_stream_started = False
+        cdp_stream_finished = False
+        cdp_had_data = False
 
         await self.require_english_ui()
 
@@ -1400,6 +1726,23 @@ class MoonshotDriver(BaseDriver):
         self.abort_requested = False
         self.current_abort_event = abort_event
         self._degrade_notice_logged = False
+        provider_activity_count = 0
+
+        def get_provider_activity_count() -> int:
+            return provider_activity_count
+
+        async def abort_intercepted_request() -> None:
+            intercepted_request_abort.set()
+            response = intercepted_response
+            if response is not None:
+                try:
+                    await response.aclose()
+                except Exception as e:
+                    Logger.debug(f"Moonshot: failed to close intercepted response: {e}")
+            try:
+                await self._click_stop_button()
+            except Exception as e:
+                Logger.debug(f"Moonshot: failed to click Stop during timeout handling: {e}")
 
         resolved_model = (model or "").strip() or "moonshot-auto"
         self.current_model = resolved_model
@@ -1422,9 +1765,34 @@ class MoonshotDriver(BaseDriver):
         self.current_send_deepthink = effective_send_deepthink
 
         async def handle_route(route):
+            nonlocal completion_claimed, provider_activity_count, intercepted_response
             request = route.request
+            try:
+                method = str(request.method or "").upper()
+            except Exception:
+                method = ""
+            try:
+                request_url = str(request.url or "")
+            except Exception:
+                request_url = ""
+
+            if (
+                method != "POST"
+                or not self._is_completion_request_url(request_url)
+                or not completion_armed.is_set()
+            ):
+                await route.continue_()
+                return
+
+            async with completion_claim_lock:
+                if completion_claimed:
+                    await route.continue_()
+                    return
+                completion_claimed = True
+                completion_started.set()
+
             Logger.info("Intercepting Moonshot API request...")
-            Logger.debug(f"Intercepted request to: {request.url}")
+            Logger.debug(f"Intercepted request to: {request_url}")
 
             headers = await request.all_headers()
             forwarded_followup_headers = self._build_settings_request_headers(headers)
@@ -1452,13 +1820,20 @@ class MoonshotDriver(BaseDriver):
                 if request_body is not None:
                     request_kwargs["content"] = request_body
 
-                async with client.stream(request.method, request.url, **request_kwargs) as response:
+                async with client.stream(method, request_url, **request_kwargs) as response:
+                    intercepted_response = response
                     response_status = int(response.status_code)
                     for k, v in response.headers.items():
                         response_headers[k] = v
 
                     async for chunk in response.aiter_bytes():
-                        if self.abort_requested or (abort_event and abort_event.is_set()):
+                        if chunk:
+                            provider_activity_count += 1
+                        if (
+                            intercepted_request_abort.is_set()
+                            or self.abort_requested
+                            or (abort_event and abort_event.is_set())
+                        ):
                             Logger.debug("Abort detected during Moonshot streaming, stopping...")
                             aborted = True
                             break
@@ -1473,15 +1848,25 @@ class MoonshotDriver(BaseDriver):
                             send_deepthink=bool(effective_send_deepthink),
                         )
             except httpx.ReadError as e:
-                if not aborted and not self.abort_requested:
+                if (
+                    not aborted
+                    and (not intercepted_request_abort.is_set())
+                    and not self.abort_requested
+                ):
                     Logger.error(f"Read error during Moonshot intercepted request: {e}")
                     await response_queue.put({"error": str(e)})
             except Exception as e:
-                if not aborted and not self.abort_requested:
+                if (
+                    not aborted
+                    and (not intercepted_request_abort.is_set())
+                    and not self.abort_requested
+                ):
                     Logger.error(f"Error during Moonshot intercepted request: {e}")
                     await response_queue.put({"error": str(e)})
+            finally:
+                intercepted_response = None
 
-            if aborted or self.abort_requested:
+            if aborted or intercepted_request_abort.is_set() or self.abort_requested:
                 Logger.warning("Moonshot generation aborted by user.")
                 await self._click_stop_button()
 
@@ -1491,13 +1876,260 @@ class MoonshotDriver(BaseDriver):
                 Logger.error(f"Moonshot: error fulfilling route: {e}")
 
             await response_queue.put(None)
-            if not aborted and not self.abort_requested:
+            intercepted_request_finished.set()
+            if (
+                not aborted
+                and (not intercepted_request_abort.is_set())
+                and not self.abort_requested
+            ):
                 Logger.success("Moonshot response streaming completed.")
 
-        await self.page.route(self.CHAT_ROUTE_GLOB, handle_route)
-        await self.page.route(self.REGEN_ROUTE_GLOB, handle_route)
+        def _schedule_cdp_task(coro: Any, label: str) -> None:
+            try:
+                task = asyncio.create_task(coro)
+            except Exception as exc:
+                Logger.debug(f"Moonshot: failed to schedule CDP handler for {label}: {exc}")
+                return
+
+            cdp_tasks.add(task)
+
+            def _on_done(done_task: asyncio.Task) -> None:
+                cdp_tasks.discard(done_task)
+                try:
+                    done_task.exception()
+                except asyncio.CancelledError:
+                    pass
+                except Exception as exc:
+                    Logger.debug(f"Moonshot: CDP handler for {label} failed: {exc}")
+
+            task.add_done_callback(_on_done)
+
+        def request_aborted() -> bool:
+            return bool(
+                intercepted_request_abort.is_set()
+                or self.abort_requested
+                or (abort_event and abort_event.is_set())
+            )
+
+        async def finish_cdp_stream(
+            request_id: str,
+            *,
+            aborted: bool = False,
+            encountered_error: bool = False,
+        ) -> None:
+            nonlocal cdp_stream_finished
+            if request_id != cdp_active_request_id or cdp_stream_finished:
+                return
+
+            cdp_stream_finished = True
+            await response_queue.put(None)
+            intercepted_request_finished.set()
+            request_methods.pop(request_id, None)
+            cdp_pending_response_urls.pop(request_id, None)
+
+            if not aborted and not encountered_error and not request_aborted():
+                Logger.success("Moonshot CDP stream completed.")
+
+        async def feed_cdp_stream_chunk(request_id: str, data: bytes) -> None:
+            nonlocal provider_activity_count, cdp_had_data
+            if request_id != cdp_active_request_id or not data or cdp_stream_finished:
+                return
+
+            cdp_had_data = True
+            provider_activity_count += 1
+            if request_aborted():
+                await finish_cdp_stream(request_id, aborted=True)
+                return
+
+            await self._process_connect_chunk(
+                data,
+                response_queue,
+                anti_censorship=bool(
+                    self.config_manager.get_setting("moonshot_behavior", "anti_censorship")
+                ),
+                send_deepthink=bool(effective_send_deepthink),
+            )
+            if request_aborted():
+                await finish_cdp_stream(request_id, aborted=True)
+
+        async def feed_base64_cdp_stream_chunk(request_id: str, encoded_data: Any) -> None:
+            if not encoded_data:
+                return
+            encoded_text = str(encoded_data)
+            try:
+                data = base64.b64decode(encoded_text, validate=True)
+            except Exception:
+                data = encoded_text.encode("utf-8", errors="ignore")
+            await feed_cdp_stream_chunk(request_id, data)
+
+        async def start_cdp_stream(request_id: str, url: str) -> None:
+            nonlocal cdp_stream_started
+            if (
+                request_id != cdp_active_request_id
+                or not cdp_session
+                or cdp_stream_started
+                or cdp_stream_finished
+            ):
+                return
+
+            cdp_stream_started = True
+            Logger.info("Teeing Moonshot API response via CDP...")
+            Logger.debug(f"Teeing request to: {url}")
+            try:
+                result = await cdp_session.send(
+                    "Network.streamResourceContent",
+                    {"requestId": request_id},
+                )
+            except Exception as exc:
+                message_text = f"Moonshot CDP response streaming failed: {exc}"
+                Logger.error(message_text)
+                await response_queue.put({"error": message_text})
+                await finish_cdp_stream(request_id, encountered_error=True)
+                return
+
+            if isinstance(result, dict):
+                await feed_base64_cdp_stream_chunk(request_id, result.get("bufferedData"))
+
+        async def handle_cdp_request_will_be_sent(params: Any) -> None:
+            nonlocal completion_claimed, cdp_active_request_id
+            if not isinstance(params, dict):
+                return
+            request_id = str(params.get("requestId") or "").strip()
+            request = params.get("request")
+            if not request_id or not isinstance(request, dict):
+                return
+
+            method = str(request.get("method") or "").upper()
+            request_methods[request_id] = method
+            url = str(request.get("url") or "")
+            if method != "POST" or not self._is_completion_request_url(url):
+                return
+            if not completion_armed.is_set():
+                return
+
+            async with completion_claim_lock:
+                if completion_claimed:
+                    return
+                completion_claimed = True
+                cdp_active_request_id = request_id
+                completion_started.set()
+
+            forwarded_followup_headers = self._build_settings_request_headers(
+                request.get("headers")
+            )
+            if forwarded_followup_headers:
+                self._last_followup_request_headers = dict(forwarded_followup_headers)
+            Logger.info("Observing Moonshot API request via CDP...")
+            Logger.debug(f"Observed request to: {url}")
+            pending_url = cdp_pending_response_urls.get(request_id)
+            if pending_url:
+                await start_cdp_stream(request_id, pending_url)
+
+        async def handle_cdp_response_received(params: Any) -> None:
+            if not isinstance(params, dict):
+                return
+            request_id = str(params.get("requestId") or "").strip()
+            response = params.get("response")
+            if not request_id or not isinstance(response, dict):
+                return
+            url = str(response.get("url") or "")
+            if not self._is_completion_request_url(url):
+                return
+            method = request_methods.get(request_id, "").upper()
+            if method and method != "POST":
+                return
+            cdp_pending_response_urls[request_id] = url
+            if request_id != cdp_active_request_id:
+                return
+            await start_cdp_stream(request_id, url)
+
+        async def handle_cdp_data_received(params: Any) -> None:
+            if not isinstance(params, dict):
+                return
+            request_id = str(params.get("requestId") or "").strip()
+            if request_id == cdp_active_request_id:
+                await feed_base64_cdp_stream_chunk(request_id, params.get("data"))
+
+        async def handle_cdp_loading_finished(params: Any) -> None:
+            if not isinstance(params, dict):
+                return
+            request_id = str(params.get("requestId") or "").strip()
+            if request_id == cdp_active_request_id:
+                await finish_cdp_stream(request_id)
+            else:
+                request_methods.pop(request_id, None)
+                cdp_pending_response_urls.pop(request_id, None)
+
+        async def handle_cdp_loading_failed(params: Any) -> None:
+            if not isinstance(params, dict):
+                return
+            request_id = str(params.get("requestId") or "").strip()
+            if request_id != cdp_active_request_id:
+                request_methods.pop(request_id, None)
+                cdp_pending_response_urls.pop(request_id, None)
+                return
+
+            if request_aborted():
+                await finish_cdp_stream(request_id, aborted=True)
+                return
+
+            error_text = str(params.get("errorText") or "network loading failed").strip()
+            if "ERR_ABORTED" in error_text.upper() and cdp_had_data:
+                Logger.debug(
+                    "Moonshot CDP stream ended with net::ERR_ABORTED after data arrived; "
+                    "treating it as complete."
+                )
+                await finish_cdp_stream(request_id)
+                return
+
+            message_text = f"Moonshot CDP stream failed: {error_text}"
+            Logger.error(message_text)
+            await response_queue.put({"error": message_text})
+            await finish_cdp_stream(request_id, encountered_error=True)
+
+        def on_cdp_request_will_be_sent(params: Any) -> None:
+            _schedule_cdp_task(handle_cdp_request_will_be_sent(params), "requestWillBeSent")
+
+        def on_cdp_response_received(params: Any) -> None:
+            _schedule_cdp_task(handle_cdp_response_received(params), "responseReceived")
+
+        def on_cdp_data_received(params: Any) -> None:
+            _schedule_cdp_task(handle_cdp_data_received(params), "dataReceived")
+
+        def on_cdp_loading_finished(params: Any) -> None:
+            _schedule_cdp_task(handle_cdp_loading_finished(params), "loadingFinished")
+
+        def on_cdp_loading_failed(params: Any) -> None:
+            _schedule_cdp_task(handle_cdp_loading_failed(params), "loadingFailed")
 
         try:
+            if use_cdp_teeing:
+                if not self.context or not self.page:
+                    message_text = "Moonshot CDP setup failed: browser context is not available."
+                    Logger.error(message_text)
+                    yield f"data: {json.dumps({'error': message_text})}\n\n"
+                    return
+                try:
+                    cdp_session = await self.context.new_cdp_session(self.page)
+                    await cdp_session.send("Network.enable", {})
+                    cdp_session.on("Network.requestWillBeSent", on_cdp_request_will_be_sent)
+                    cdp_session.on("Network.responseReceived", on_cdp_response_received)
+                    cdp_session.on("Network.dataReceived", on_cdp_data_received)
+                    cdp_session.on("Network.loadingFinished", on_cdp_loading_finished)
+                    cdp_session.on("Network.loadingFailed", on_cdp_loading_failed)
+                    cdp_listeners_registered = True
+                    Logger.info("Moonshot Request Capture Mode: CDP Teeing.")
+                except Exception as exc:
+                    message_text = f"Moonshot CDP setup failed: {exc}"
+                    Logger.error(message_text)
+                    yield f"data: {json.dumps({'error': message_text})}\n\n"
+                    return
+            else:
+                await self.page.route(self.CHAT_ROUTE_GLOB, handle_route)
+                await self.page.route(self.REGEN_ROUTE_GLOB, handle_route)
+                route_handlers_registered = True
+                Logger.info("Moonshot Request Capture Mode: Replay.")
+
             formatted_message = self._format_messages(message_for_formatting)
             moonshot_extra_prompt_texts: Dict[str, str] = {}
             if send_as_text_file:
@@ -1564,12 +2196,26 @@ class MoonshotDriver(BaseDriver):
                 if message_matches and state_matches:
                     current_cache_matched = True
                     Logger.info("Clean Regeneration (Moonshot): Message and settings match cache. Attempting to regenerate...")
+                    completion_armed.set()
                     if await self._click_regenerate():
                         Logger.info("Clean Regeneration (Moonshot): Button clicked. Regenerating...")
-                        regenerated = True
-                        self.cache_manager.write_cache(self.clean_regen_message_cache_key, formatted_message)
-                        self._write_clean_regeneration_state(clean_regen_state)
+                        try:
+                            await asyncio.wait_for(
+                                completion_started.wait(),
+                                timeout=self.COMPLETION_REQUEST_TIMEOUT_S,
+                            )
+                        except asyncio.TimeoutError:
+                            completion_armed.clear()
+                            Logger.warning(
+                                "Clean Regeneration (Moonshot): completion request not observed after "
+                                "clicking Regenerate. Falling back to new chat."
+                            )
+                        else:
+                            regenerated = True
+                            self.cache_manager.write_cache(self.clean_regen_message_cache_key, formatted_message)
+                            self._write_clean_regeneration_state(clean_regen_state)
                     else:
+                        completion_armed.clear()
                         Logger.warning("Clean Regeneration (Moonshot): Button not found. Falling back to new chat.")
 
             if (
@@ -1581,6 +2227,8 @@ class MoonshotDriver(BaseDriver):
                 regenerated = await self._try_multi_slot_regeneration(
                     formatted_message=formatted_message,
                     multi_slot_state=multi_slot_state,
+                    completion_armed=completion_armed,
+                    completion_started=completion_started,
                 )
                 if regenerated and clean_regen_state:
                     self.cache_manager.write_cache(self.clean_regen_message_cache_key, formatted_message)
@@ -1598,15 +2246,25 @@ class MoonshotDriver(BaseDriver):
                 if send_as_text_file:
                     Logger.info("Moonshot: sending message as text file...")
                     file_payload = build_prompt_text_file_payload(formatted_message)
-                    await self._upload_file(file_payload)
-                    filler = self.config_manager.get_setting("moonshot_behavior", "text_file_filler") or "."
-                    await self._enter_message(str(filler))
-                    upload_timeout = int(self.config_manager.get_setting("moonshot_behavior", "file_upload_timeout") or 15)
+                    uploaded = await self._upload_file(file_payload)
+                    if uploaded:
+                        filler = self.config_manager.get_setting("moonshot_behavior", "text_file_filler") or "."
+                        await self._enter_message(str(filler))
+                    else:
+                        Logger.warning(
+                            "Moonshot: text-file upload failed; falling back to normal text entry."
+                        )
+                        await self._enter_message(formatted_message)
+                    upload_timeout = int(
+                        self.config_manager.get_setting("moonshot_behavior", "file_upload_timeout") or 15
+                    )
                     Logger.info("Moonshot: sending request...")
+                    completion_armed.set()
                     await self._send_message(timeout=upload_timeout)
                 else:
                     await self._enter_message(formatted_message)
                     Logger.info("Moonshot: sending request...")
+                    completion_armed.set()
                     await self._send_message()
 
                 if clean_regeneration:
@@ -1614,13 +2272,28 @@ class MoonshotDriver(BaseDriver):
                     self._write_clean_regeneration_state(clean_regen_state)
                     should_record_multi_slot = bool(multi_slot_cache_enabled and multi_slot_state)
 
+            if not completion_started.is_set():
+                try:
+                    await asyncio.wait_for(
+                        completion_started.wait(),
+                        timeout=self.COMPLETION_REQUEST_TIMEOUT_S,
+                    )
+                except asyncio.TimeoutError:
+                    Logger.error(
+                        "Moonshot: completion request was not observed. "
+                        "The UI may have swallowed the click or the endpoint changed."
+                    )
+                    yield f"data: {json.dumps({'error': 'Moonshot: completion request not observed'})}\n\n"
+                    return
+
             stream_had_error = False
             async for item in self._iterate_response_queue(
                 response_queue,
                 abort_event=abort_event,
                 first_chunk_timeout_s=self.INTERCEPT_FIRST_CHUNK_TIMEOUT_S,
                 idle_timeout_s=self.INTERCEPT_IDLE_TIMEOUT_S,
-                on_timeout=self._click_stop_button,
+                on_timeout=abort_intercepted_request,
+                activity_counter=get_provider_activity_count,
             ):
                 if isinstance(item, dict) and "error" in item:
                     stream_had_error = True
@@ -1628,6 +2301,9 @@ class MoonshotDriver(BaseDriver):
                     break
 
                 yield item
+
+            if self.abort_requested or (abort_event and abort_event.is_set()):
+                await abort_intercepted_request()
 
             if should_record_multi_slot and (not stream_had_error) and (not self.abort_requested):
                 conversation_info = await self._wait_for_current_conversation_info(timeout_ms=6000)
@@ -1659,20 +2335,58 @@ class MoonshotDriver(BaseDriver):
                 await self._auto_delete_current_chat()
 
         finally:
+            if completion_started.is_set() and not intercepted_request_finished.is_set():
+                try:
+                    await asyncio.wait_for(intercepted_request_finished.wait(), timeout=5.0)
+                except asyncio.TimeoutError:
+                    Logger.debug("Moonshot: timed out waiting for intercepted request cleanup.")
             self.current_abort_event = None
             self.abort_requested = False
             self.current_model = None
             self.current_send_deepthink = None
             self.thinking_active = False
             self._connect_buffer = bytearray()
-            try:
-                await self.page.unroute(self.CHAT_ROUTE_GLOB)
-            except Exception:
-                pass
-            try:
-                await self.page.unroute(self.REGEN_ROUTE_GLOB)
-            except Exception:
-                pass
+            if route_handlers_registered:
+                try:
+                    await self.page.unroute(self.CHAT_ROUTE_GLOB, handle_route)
+                except Exception:
+                    try:
+                        await self.page.unroute(self.CHAT_ROUTE_GLOB)
+                    except Exception:
+                        pass
+                try:
+                    await self.page.unroute(self.REGEN_ROUTE_GLOB, handle_route)
+                except Exception:
+                    try:
+                        await self.page.unroute(self.REGEN_ROUTE_GLOB)
+                    except Exception:
+                        pass
+            if cdp_session and cdp_listeners_registered:
+                for event_name, listener in (
+                    ("Network.requestWillBeSent", on_cdp_request_will_be_sent),
+                    ("Network.responseReceived", on_cdp_response_received),
+                    ("Network.dataReceived", on_cdp_data_received),
+                    ("Network.loadingFinished", on_cdp_loading_finished),
+                    ("Network.loadingFailed", on_cdp_loading_failed),
+                ):
+                    try:
+                        cdp_session.remove_listener(event_name, listener)
+                    except Exception:
+                        pass
+            for task in list(cdp_tasks):
+                if not task.done():
+                    task.cancel()
+            tasks_to_wait = set(cdp_tasks)
+            if tasks_to_wait:
+                try:
+                    await asyncio.wait(tasks_to_wait, timeout=1.0)
+                except Exception:
+                    pass
+            if cdp_session:
+                try:
+                    await cdp_session.detach()
+                except Exception as exc:
+                    Logger.debug(f"Moonshot: CDP detach failed: {exc}")
 
     async def abort_generation(self):
         Logger.info("Moonshot: abort generation requested...")
@@ -1877,8 +2591,10 @@ class MoonshotDriver(BaseDriver):
 
     async def _read_current_model_name(self) -> str:
         selectors = [
-            "div.current-model span.name",
+            "div.current-model div.model-name > span:first-child",
+            "div.current-model div.model-name span:first-child",
             "div.current-model div.model-name span.name",
+            "div.current-model span.name",
             "div.current-model .name",
         ]
 
@@ -1895,14 +2611,52 @@ class MoonshotDriver(BaseDriver):
 
         return ""
 
+    async def _read_kimi_model_item_name(self, item) -> str:
+        selectors = [
+            "div.model-item-content div.header div.model-name > span:first-child",
+            "div.model-item-content div.header div.model-name span:first-child",
+            "div.model-name > span:first-child",
+            "div.model-name span:first-child",
+            "span.name",
+        ]
+
+        for selector in selectors:
+            try:
+                locator = item.locator(selector)
+                if await locator.count() == 0:
+                    continue
+                text = (await locator.first.inner_text() or "").strip()
+                if text:
+                    return text
+            except Exception:
+                continue
+
+        try:
+            raw = (await item.inner_text() or "").strip()
+        except Exception:
+            raw = ""
+        if not raw:
+            return ""
+
+        for line in raw.splitlines():
+            text = line.strip()
+            if text:
+                return text
+        return raw
+
     async def _select_kimi_model(self, target_model: str) -> bool:
+        await self._dismiss_kimi_sidebar_overlay()
         trigger = await self._find_first_visible(["div.current-model"], timeout_ms=8000)
         if trigger is None:
             Logger.warning("Moonshot: model selector trigger not found.")
             return False
 
         try:
-            await trigger.click()
+            if await self._find_first_visible(["div.models-container"], timeout_ms=0) is None:
+                clicked = await self._click_with_fallbacks(trigger, timeout_ms=3000)
+                if not clicked:
+                    Logger.warning("Moonshot: model selector trigger could not be clicked.")
+                    return False
             await self.page.wait_for_selector("div.models-container", timeout=5000, state="visible")
             await self.page.wait_for_selector("div.models-container div.model-item", timeout=5000, state="attached")
         except Exception as e:
@@ -1918,18 +2672,14 @@ class MoonshotDriver(BaseDriver):
 
         for idx in range(min(count, 30)):
             item = items.nth(idx)
-            name_locator = item.locator("div.model-item-content div.header div.model-name span.name")
-            if await name_locator.count() == 0:
-                name_locator = item.locator("span.name")
-            if await name_locator.count() == 0:
-                continue
-
-            name_text = (await name_locator.first.inner_text() or "").strip()
+            name_text = await self._read_kimi_model_item_name(item)
             if self._normalize_text(name_text) != target_norm:
                 continue
 
             try:
-                await item.click()
+                clicked = await self._click_with_fallbacks(item, timeout_ms=3000)
+                if not clicked:
+                    raise RuntimeError("model item was not clickable")
             except Exception as e:
                 Logger.warning(f"Moonshot: failed to click model '{target_model}': {e}")
                 return False
@@ -1949,6 +2699,10 @@ class MoonshotDriver(BaseDriver):
             return False
 
         Logger.warning(f"Moonshot: target model '{target_model}' not found in picker.")
+        try:
+            await self.page.keyboard.press("Escape")
+        except Exception:
+            pass
         return False
 
     async def set_deepthink_state(self, state: bool):
@@ -2042,6 +2796,16 @@ class MoonshotDriver(BaseDriver):
         except Exception:
             pass
 
+    async def _toolkit_item_hover_target(self, tool_item):
+        try:
+            content = tool_item.locator(":scope .toolkit-item-content").first
+            if await content.count() > 0 and await content.is_visible():
+                return content
+        except Exception:
+            pass
+
+        return tool_item
+
     async def _open_search_connect_menu(self, tool_item) -> bool:
         if not self.page:
             return False
@@ -2049,20 +2813,25 @@ class MoonshotDriver(BaseDriver):
         if await self._wait_for_connect_menu_open(timeout_ms=400):
             return True
 
+        hover_target = await self._toolkit_item_hover_target(tool_item)
+
         try:
-            await tool_item.scroll_into_view_if_needed()
+            await hover_target.scroll_into_view_if_needed()
         except Exception:
             pass
 
         try:
-            await tool_item.hover()
+            await hover_target.hover(timeout=1500)
         except Exception:
-            pass
+            try:
+                await hover_target.hover(timeout=1500, force=True)
+            except Exception:
+                pass
         if await self._wait_for_connect_menu_open(timeout_ms=1200):
             return True
 
         try:
-            box = await tool_item.bounding_box()
+            box = await hover_target.bounding_box()
             if box:
                 cx = box["x"] + (box["width"] / 2.0)
                 cy = box["y"] + (box["height"] / 2.0)
@@ -2074,49 +2843,63 @@ class MoonshotDriver(BaseDriver):
         if await self._wait_for_connect_menu_open(timeout_ms=1000):
             return True
 
-        await self._dispatch_connect_trigger_events(tool_item)
+        await self._dispatch_connect_trigger_events(hover_target)
         if await self._wait_for_connect_menu_open(timeout_ms=1000):
             return True
 
-        # Sometimes this submenu opens on click rather than hover
-        try:
-            await tool_item.click(timeout=1500)
-        except Exception:
-            pass
+        if hover_target is not tool_item:
+            await self._dispatch_connect_trigger_events(tool_item)
         if await self._wait_for_connect_menu_open(timeout_ms=1000):
             return True
 
-        try:
-            await tool_item.click(timeout=1500, force=True)
-        except Exception:
-            pass
         return await self._wait_for_connect_menu_open(timeout_ms=1000)
 
+    async def _find_search_toolkit_item(self):
+        if not self.page:
+            return None
+
+        selectors = [
+            "div.toolkit-container > label.toolkit-item",
+            "div.toolkit-container label.toolkit-item",
+            "div.toolkit-container > .toolkit-item",
+            "div.toolkit-container .toolkit-item",
+            "div.toolkit-container .toolkit-item-content",
+            "div.toolkit-container > *",
+        ]
+
+        candidates = []
+        for selector in selectors:
+            locator = self.page.locator(selector)
+            try:
+                count = await locator.count()
+            except Exception:
+                count = 0
+
+            for idx in range(min(count, 40)):
+                item = locator.nth(idx)
+                try:
+                    if not await item.is_visible():
+                        continue
+                except Exception:
+                    continue
+
+                candidates.append(item)
+
+        for item in candidates:
+            label = self._normalize_text(await self._read_locator_text(item))
+            if any(token in label for token in ("search", "internet", "web", "connect")):
+                return item
+
+        if candidates:
+            return candidates[-1]
+
+        return None
+
     async def _set_search_state_via_toolkit(self, state: bool) -> bool:
-        toolkit_button = await self._find_first_visible(["div.toolkit-trigger-btn"], timeout_ms=8000)
-        if toolkit_button is None:
-            Logger.warning("Moonshot: toolkit trigger button not found.")
+        if not await self._open_kimi_toolkit_menu(timeout_ms=8000):
             return False
 
-        try:
-            await toolkit_button.click()
-            await self.page.wait_for_selector("div.toolkit-container", timeout=3000, state="visible")
-        except Exception as e:
-            Logger.warning(f"Moonshot: toolkit menu did not open: {e}")
-            return False
-
-        parent_tool = await self._find_nth_visible(
-            [
-                # Preferred selector: toolkit entries (first can be <label>, next are usually <div>)
-                "div.toolkit-container > .toolkit-item",
-                "div.toolkit-container .toolkit-item",
-                # Fallback in case class names change
-                "div.toolkit-container > *",
-            ],
-            # Kimi's Search submenu is currently the fifth visible item in the + menu
-            visible_index=4,
-            timeout_ms=3000,
-        )
+        parent_tool = await self._find_search_toolkit_item()
         if parent_tool is None:
             Logger.warning("Moonshot: search toolkit entry not found.")
             return False
@@ -2134,13 +2917,17 @@ class MoonshotDriver(BaseDriver):
 
         target_index = 0 if state else 1
         try:
-            await connect_items.nth(target_index).click()
+            clicked = await self._click_with_fallbacks(connect_items.nth(target_index), timeout_ms=3000)
+            if not clicked:
+                raise RuntimeError("search state option was not clickable")
+            await asyncio.sleep(0.35)
             return True
         except Exception as e:
             Logger.warning(f"Moonshot: failed to click search state option: {e}")
             return False
 
     async def set_search_state(self, state: bool):
+        await self._dismiss_kimi_sidebar_overlay()
         current = await self._is_search_enabled()
         if current == state:
             return
@@ -2152,7 +2939,7 @@ class MoonshotDriver(BaseDriver):
             )
             if await quick_enable.count() > 0:
                 try:
-                    await quick_enable.first.click()
+                    await self._click_with_fallbacks(quick_enable.first, timeout_ms=2000)
                     await asyncio.sleep(0.15)
                     if await self._is_search_enabled():
                         return
@@ -2164,7 +2951,7 @@ class MoonshotDriver(BaseDriver):
             Logger.warning(f"Moonshot: could not set Search to {state}.")
             return
 
-        await asyncio.sleep(0.2)
+        await asyncio.sleep(0.4)
         after = await self._is_search_enabled()
         if after != state:
             Logger.warning(f"Moonshot: Search state mismatch after toggle (wanted={state}, actual={after}).")
@@ -2281,8 +3068,63 @@ class MoonshotDriver(BaseDriver):
 
             await asyncio.sleep(max(0.05, float(poll_interval_s)))
 
+    async def _find_last_visible(
+        self,
+        selectors: List[str],
+        timeout_ms: int = 0,
+        poll_interval_s: float = 0.15,
+    ):
+        if not self.page:
+            return None
+
+        deadline = time.time() + max(0.0, float(timeout_ms) / 1000.0)
+
+        while True:
+            for selector in selectors:
+                locator = self.page.locator(selector)
+                try:
+                    count = await locator.count()
+                except Exception:
+                    count = 0
+
+                for idx in range(min(count, 40) - 1, -1, -1):
+                    item = locator.nth(idx)
+                    try:
+                        if await item.is_visible():
+                            return item
+                    except Exception:
+                        continue
+
+            if timeout_ms <= 0 or time.time() >= deadline:
+                return None
+
+            await asyncio.sleep(max(0.05, float(poll_interval_s)))
+
     async def set_sidebar_status(self, open: bool):
-        _ = open
+        if not self.page:
+            return
+
+        if not open:
+            await self._dismiss_kimi_sidebar_overlay()
+            return
+
+        if await self._kimi_sidebar_mask_visible():
+            return
+
+        opener = await self._find_first_visible(
+            [
+                "div.icon-button.expand-btn",
+                "div.expand-btn.icon-button",
+                "aside.sidebar div.sidebar-header div.expand-btn.icon-button",
+            ],
+            timeout_ms=1000,
+            poll_interval_s=0.08,
+        )
+        if opener is None:
+            Logger.debug("Moonshot: open-sidebar button not found.")
+            return
+
+        await self._click_with_fallbacks(opener, timeout_ms=1500)
 
     async def click_new_chat(self, source: str = "auto"):
         _ = source
@@ -2299,6 +3141,8 @@ class MoonshotDriver(BaseDriver):
         if auth_state == "signed_out":
             Logger.warning("Moonshot: New Chat URL is not available for the active session.")
             return
+
+        await self.set_sidebar_status(open=False)
 
         editor = await self._find_first_visible(
             [
@@ -2317,6 +3161,7 @@ class MoonshotDriver(BaseDriver):
         await self._send_message(timeout=timeout)
 
     async def _enter_message(self, message: str):
+        await self._dismiss_kimi_sidebar_overlay()
         editor = await self._find_first_visible(
             [
                 "div.chat-input-editor[contenteditable='true']",
@@ -2329,7 +3174,14 @@ class MoonshotDriver(BaseDriver):
             return
 
         try:
-            await editor.click()
+            clicked = await self._click_with_fallbacks(editor, timeout_ms=3000)
+            if not clicked:
+                await editor.evaluate("(el) => el.focus()")
+            else:
+                try:
+                    await editor.evaluate("(el) => el.focus()")
+                except Exception:
+                    pass
             await self.page.keyboard.press("Control+A")
             await self.page.keyboard.press("Backspace")
             if message:
@@ -2348,11 +3200,36 @@ class MoonshotDriver(BaseDriver):
                         pasted = False
 
                 if not pasted:
-                    await editor.type(message, delay=0)
+                    try:
+                        await editor.type(message, delay=0)
+                        pasted = True
+                    except Exception:
+                        pasted = False
+
+                if not pasted:
+                    await editor.evaluate(
+                        """(el, value) => {
+                            el.focus();
+                            try {
+                                document.execCommand('selectAll', false, null);
+                                document.execCommand('insertText', false, String(value || ''));
+                            } catch (e) {
+                                el.textContent = String(value || '');
+                            }
+                            el.dispatchEvent(new InputEvent('input', {
+                                bubbles: true,
+                                cancelable: true,
+                                inputType: 'insertText',
+                                data: String(value || '')
+                            }));
+                        }""",
+                        message,
+                    )
         except Exception as e:
             Logger.warning(f"Moonshot: failed to enter message: {e}")
 
     async def _send_message(self, timeout: int = None):
+        await self._dismiss_kimi_sidebar_overlay()
         send_button = await self._find_first_visible(["div.send-button-container"], timeout_ms=10000)
         if send_button is None:
             Logger.warning("Moonshot: send button not found.")
@@ -2373,7 +3250,9 @@ class MoonshotDriver(BaseDriver):
             return
 
         try:
-            await send_button.click()
+            clicked = await self._click_with_fallbacks(send_button, timeout_ms=3000)
+            if not clicked:
+                raise RuntimeError("send button was not clickable")
         except Exception as e:
             Logger.warning(f"Moonshot: failed to click send button: {e}")
 
@@ -2381,6 +3260,7 @@ class MoonshotDriver(BaseDriver):
         await self.click_new_chat(source="auto")
 
     async def _click_regenerate(self) -> bool:
+        await self._dismiss_kimi_sidebar_overlay()
         actions = self.page.locator("div.segment-assistant-actions-content")
         has_actions = await self._wait_for_locator_count(actions, minimum_count=1, timeout_ms=8000)
         if not has_actions:
@@ -2408,8 +3288,7 @@ class MoonshotDriver(BaseDriver):
                 return False
 
             try:
-                await candidate.click()
-                return True
+                return await self._click_with_fallbacks(candidate, timeout_ms=2000)
             except Exception:
                 return False
 
@@ -2456,13 +3335,11 @@ class MoonshotDriver(BaseDriver):
     async def upload_file(self, file_spec: Any) -> None:
         await self._upload_file(file_spec)
 
-    async def _upload_file(self, file_spec: Any):
-        toolkit_button = await self._find_first_visible(["div.toolkit-trigger-btn"], timeout_ms=5000)
-        if toolkit_button is not None:
-            try:
-                await toolkit_button.click()
-            except Exception:
-                pass
+    async def _upload_file_direct_input(self, file_spec: Any) -> bool:
+        if not self.page:
+            return False
+
+        await self._open_kimi_toolkit_menu(timeout_ms=4000)
 
         file_input = await self._wait_for_first_attached(
             [
@@ -2474,10 +3351,20 @@ class MoonshotDriver(BaseDriver):
         )
         if file_input is None:
             Logger.warning("Moonshot: file input not found.")
-            return
+            return False
 
         try:
             await file_input.set_input_files(file_spec)
             await asyncio.sleep(0.8)
+            return True
         except Exception as e:
             Logger.warning(f"Moonshot: file upload failed: {e}")
+            return False
+
+    async def _upload_file(self, file_spec: Any) -> bool:
+        await self._dismiss_kimi_sidebar_overlay()
+        if await self._upload_file_direct_input(file_spec):
+            return True
+
+        Logger.warning("Moonshot: file upload could not be completed through the hidden input.")
+        return False

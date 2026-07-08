@@ -42,10 +42,9 @@ Adds a small icon button to the **left of the Help button**. The button shows yo
 | Moonshot | :material-moon-waning-crescent: Eclipse |
 | QwenLM | (whatever the Qwen logo is meant to represent) |
 | Perplexity | Perplexity logo |
+| HuggingChat | Hugging Face logo |
 | Google AI Studio | Sparkle tile |
-
-!!! note "Locked providers are hidden"
-    Hotswap only shows unlocked providers. Google AI Studio is temporarily locked by default, so it appears here only when **Settings** -> **Advanced** -> **Provider Stability** -> **Ignore Provider Locks** is enabled.
+| Xiaomi MiMo | Xiaomi logo |
 
 The button is only visible while services are running. Click it to open the same provider-selection dialog.
 

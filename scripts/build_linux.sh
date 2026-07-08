@@ -116,6 +116,6 @@ cp "$UPDATER_EXE" "$OPTIONAL_STAGE/updater"
 # Create tar.gz archive
 ARCHIVE_PATH="$DIST_DIR/$PACKAGE_NAME.tar.gz"
 rm -f "$ARCHIVE_PATH"
-tar -czvf "$ARCHIVE_PATH" -C "$STAGING_DIR" .
+tar -czvf "$ARCHIVE_PATH" -C "$STAGING_DIR" "$PACKAGE_APP_DIR_NAME" "$PACKAGE_OPTIONAL_DIR_NAME"
 
 echo "Created release asset: $ARCHIVE_PATH"

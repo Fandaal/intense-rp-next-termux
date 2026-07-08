@@ -43,11 +43,15 @@ Appears when no browser installation is currently detected.
 
 Browser Manager installs the Chromium bundle IntenseRP needs, then refreshes the status/path right away.
 
+If the official download CDN is blocked for you, set **Settings -> Browser & Runtime -> Browser Installation -> Chromium Download Mirror** first, then come back here and click **Install**.
+
 ### Reinstall
 
 Removes the current browser installation, downloads a fresh one, then refreshes the path.
 
 This is handy when the browser install got corrupted, half-updated, or outdated.
+
+Reinstall uses the same **Chromium Download Mirror** setting when one is configured.
 
 ### Delete
 

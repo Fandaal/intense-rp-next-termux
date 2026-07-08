@@ -14,6 +14,7 @@ from typing import List, Optional, Dict, Any, Callable, Literal, Union
 from drivers.base_driver import BaseDriver
 from drivers.parallel_manager import ParallelDriversManager
 from drivers.providers import DriverProvider, is_provider_locked, provider_lock_reason
+from drivers.shared_utils import format_request_messages
 from remote_control import RemoteControlActions, RemoteControlWeb
 from utils.ip_utils import is_ip_address_allowed
 from utils.logger import Logger
@@ -36,7 +37,12 @@ _RATE_LIMIT_LIKE_RE = re.compile(
 )
 _NON_RETRYABLE_PROVIDER_ERROR_RE = re.compile(
     r"(peak\s*hours|at\s*capacity|model\s*concurrency\s*limit|concurrency\s*limit|"
-    r"regeneration[_\s-]*limit)",
+    r"regeneration[_\s-]*limit|sensitive[_\s-]*query|provider-side\s+sensitive|"
+    r"data_inspection_failed|qwen\s+censored)",
+    flags=re.IGNORECASE,
+)
+_TERMINAL_PARTIAL_ERROR_RE = re.compile(
+    r"(data_inspection_failed|qwen\s+censored)",
     flags=re.IGNORECASE,
 )
 
@@ -82,6 +88,8 @@ AISTUDIO_THINKING_SUFFIX_RE = re.compile(
     flags=re.IGNORECASE,
 )
 QueueStateListener = Callable[[], None]
+RequestType = Literal["chat", "text"]
+DryRunCaptureCallback = Callable[["DryRunCapture"], None]
 
 
 @dataclass(frozen=True)
@@ -90,6 +98,42 @@ class RuntimeExecutionSlot:
     provider: DriverProvider
     driver: BaseDriver
     label: str
+
+
+@dataclass(frozen=True)
+class DryRunCapture:
+    request_type: RequestType
+    raw_json: str
+    formatted_text: str
+    model: str
+    stream: bool
+    captured_at: float
+    api_key_name: str | None = None
+
+
+class DryRunDriver:
+    """Tiny API runtime stand-in used when Dry Run Mode skips provider launch."""
+
+    def __init__(self, config_manager: Any):
+        self.config_manager = config_manager
+        self.provider = self._resolve_provider()
+        self.provider_label = "Dry Run"
+        self.is_running = True
+
+    def _resolve_provider(self) -> DriverProvider:
+        try:
+            raw_provider = self.config_manager.get_setting("providers_credentials", "provider")
+        except Exception:
+            raw_provider = None
+
+        provider = DriverProvider.from_setting(raw_provider)
+        return provider if provider is not None else DriverProvider.DEEPSEEK
+
+    async def close(self) -> None:
+        self.is_running = False
+
+    def request_abort(self) -> None:
+        return None
 
 
 def _parse_sse_json(chunk: Any) -> dict | None:
@@ -157,6 +201,10 @@ def _is_non_retryable_provider_error(message: str) -> bool:
     return bool(_NON_RETRYABLE_PROVIDER_ERROR_RE.search(str(message or "")))
 
 
+def _is_terminal_partial_error(message: str) -> bool:
+    return bool(_TERMINAL_PARTIAL_ERROR_RE.search(str(message or "")))
+
+
 def _make_openai_error_sse_chunk(message: str) -> str:
     error_chunk = {
         "error": {
@@ -209,9 +257,6 @@ class ChatCompletionRequest(BaseModel):
 
 
 CompletionPromptInput = Union[str, List[str]]
-RequestType = Literal["chat", "text"]
-
-
 class TextCompletionRequest(BaseModel):
     prompt: CompletionPromptInput
     model: str = "deepseek-auto"
@@ -519,13 +564,17 @@ class RequestQueue:
 class API:
     def __init__(
         self,
-        driver: BaseDriver | ParallelDriversManager,
+        driver: BaseDriver | ParallelDriversManager | DryRunDriver,
         *,
         remote_actions: RemoteControlActions | None = None,
+        dry_run: bool = False,
+        dry_run_capture_callback: DryRunCaptureCallback | None = None,
     ):
         self.app = FastAPI()
         self._install_api_cors_middleware()
         self.driver = driver
+        self._dry_run_enabled = bool(dry_run)
+        self._dry_run_capture_callback = dry_run_capture_callback
         self._queue_state_listeners: list[QueueStateListener] = []
         self._request_queue_listener = self._notify_queue_state_changed
         self._drivers_by_provider: dict[DriverProvider, BaseDriver] = self._build_runtime_drivers_map()
@@ -545,7 +594,8 @@ class API:
 
         self._global_processing_lock = asyncio.Lock()
         self._parallel_request_queue_enabled = (
-            is_parallel_request_queue_feature_enabled(getattr(self.driver, "config_manager", None))
+            (not self._dry_run_enabled)
+            and is_parallel_request_queue_feature_enabled(getattr(self.driver, "config_manager", None))
             and len(self._execution_slots) >= 2
         )
 
@@ -566,7 +616,10 @@ class API:
         self.setup_routes()
         if self.remote_control is not None:
             self.remote_control.register_routes(self.app)
-        self.start_worker()
+        if self._dry_run_enabled:
+            self.worker_tasks = {}
+        else:
+            self.start_worker()
 
     def _install_api_cors_middleware(self) -> None:
         @self.app.middleware("http")
@@ -1063,6 +1116,14 @@ class API:
             return "high"
         return effort
 
+    @staticmethod
+    def _glm_deepthink_effort_for_reasoning_effort(effort: str) -> str:
+        if effort in REASONING_EFFORT_DISABLED_VALUES:
+            return ""
+        if effort in {"max", "maximum", "xhigh", "x-high", "extra-high", "extra-highest"}:
+            return "max"
+        return "high"
+
     @classmethod
     def _huggingchat_reasoning_effort_enables_reasoning(cls, effort: str) -> bool:
         return cls._huggingchat_effort_for_reasoning_effort(effort) not in {"", "default"}
@@ -1102,10 +1163,18 @@ class API:
         request: QueuedRequest,
         provider: DriverProvider,
     ) -> dict[str, Any]:
-        if provider != DriverProvider.HUGGINGCHAT:
-            return {}
-
         overrides: dict[str, Any] = {}
+        if provider == DriverProvider.GLM_CHAT:
+            if self._provider_accepts_api_reasoning_effort(provider):
+                effort = _normalize_reasoning_effort(_extract_reasoning_effort_value(request))
+                deepthink_effort = self._glm_deepthink_effort_for_reasoning_effort(effort)
+                if deepthink_effort:
+                    overrides["deepthink_effort"] = deepthink_effort
+            return overrides
+
+        if provider != DriverProvider.HUGGINGCHAT:
+            return overrides
+
         for attr_name in (
             "inference_provider",
             "huggingchat_inference_provider",
@@ -1415,6 +1484,95 @@ class API:
         self._enforce_ip_whitelist(raw_request)
         return self._authenticate_request(raw_request)
 
+    @staticmethod
+    def _request_model_payload(request: BaseModel) -> Any:
+        dumper = getattr(request, "model_dump", None)
+        if callable(dumper):
+            try:
+                return dumper(mode="json")
+            except TypeError:
+                return dumper()
+
+        legacy_dumper = getattr(request, "dict", None)
+        if callable(legacy_dumper):
+            return legacy_dumper()
+        return {}
+
+    async def _read_raw_request_payload(self, raw_request: Request, request: BaseModel) -> Any:
+        try:
+            body = await raw_request.body()
+        except Exception:
+            body = b""
+
+        if body:
+            try:
+                return json.loads(body.decode("utf-8"))
+            except Exception:
+                try:
+                    return json.loads(body)
+                except Exception:
+                    pass
+
+        return self._request_model_payload(request)
+
+    def _format_dry_run_request(self, request: QueuedRequest, request_type: RequestType) -> str:
+        cfg = getattr(self.driver, "config_manager", None)
+        if cfg is None:
+            return ""
+
+        try:
+            if request_type == "text":
+                prompt = _normalize_text_completion_prompt(getattr(request, "prompt", ""))
+                return format_request_messages(cfg, prompt)
+            return format_request_messages(cfg, getattr(request, "messages", []))
+        except Exception as exc:
+            Logger.warning(f"Dry Run Mode: failed to format captured request: {exc}")
+            return f"Failed to format request: {exc}"
+
+    async def _capture_dry_run_request(
+        self,
+        request: QueuedRequest,
+        raw_request: Request,
+        *,
+        request_type: RequestType,
+        api_key_name: str | None,
+    ) -> None:
+        raw_payload = await self._read_raw_request_payload(raw_request, request)
+        try:
+            raw_json = json.dumps(raw_payload, indent=2, ensure_ascii=False)
+        except Exception:
+            raw_json = json.dumps(self._request_model_payload(request), indent=2, ensure_ascii=False)
+
+        formatted_text = self._format_dry_run_request(request, request_type)
+        capture = DryRunCapture(
+            request_type=request_type,
+            raw_json=raw_json,
+            formatted_text=formatted_text,
+            model=str(getattr(request, "model", "") or ""),
+            stream=bool(getattr(request, "stream", False)),
+            captured_at=time.time(),
+            api_key_name=api_key_name,
+        )
+
+        callback = self._dry_run_capture_callback
+        if callable(callback):
+            try:
+                callback(capture)
+            except Exception as exc:
+                Logger.warning(f"Dry Run Mode: failed to update display window: {exc}")
+
+        Logger.info(
+            "Dry Run Mode captured "
+            f"{request_type} request for model `{capture.model or '<empty>'}`."
+        )
+        raise HTTPException(
+            status_code=418,
+            detail=(
+                "I'm a teapot: Dry Run Mode captured the request. "
+                "It is now inspectable in the Dry Run Display window."
+            ),
+        )
+
     def setup_routes(self):
         @self.app.get("/v1/models")
         async def list_models(raw_request: Request):
@@ -1422,11 +1580,14 @@ class API:
 
             cfg = getattr(self.driver, "config_manager", None)
             all_runtime_providers = list(self._drivers_by_provider.keys()) or [DriverProvider.DEEPSEEK]
-            runtime_providers = [
-                provider
-                for provider in all_runtime_providers
-                if not is_provider_locked(provider, cfg)
-            ]
+            if self._dry_run_enabled:
+                runtime_providers = all_runtime_providers
+            else:
+                runtime_providers = [
+                    provider
+                    for provider in all_runtime_providers
+                    if not is_provider_locked(provider, cfg)
+                ]
             if not runtime_providers:
                 return {
                     "object": "list",
@@ -1473,6 +1634,14 @@ class API:
         async def chat_completions(request: ChatCompletionRequest, raw_request: Request):
             # Optional API key authentication (Bearer token)
             api_key_name = self._authorize_request(raw_request)
+
+            if self._dry_run_enabled:
+                await self._capture_dry_run_request(
+                    request,
+                    raw_request,
+                    request_type="chat",
+                    api_key_name=api_key_name,
+                )
 
             if not self.driver.is_running:
                 raise HTTPException(status_code=503, detail="Driver is not running")
@@ -1582,6 +1751,8 @@ class API:
                     # Prefer returning partial content for non-streaming clients if we already have
                     # meaningful output (i.e., avoid losing all progress)
                     if content_parts:
+                        if _is_terminal_partial_error(error_message):
+                            raise HTTPException(status_code=500, detail=error_message)
                         Logger.warning(
                             "Non-streaming request returned partial content due to error: "
                             + str(error_message)
@@ -1610,6 +1781,16 @@ class API:
         @self.app.post("/v1/completions")
         async def text_completions(request: TextCompletionRequest, raw_request: Request):
             api_key_name = self._authorize_request(raw_request)
+
+            if self._dry_run_enabled:
+                normalized_prompt = _normalize_text_completion_prompt(request.prompt)
+                normalized_request = request.model_copy(update={"prompt": normalized_prompt})
+                await self._capture_dry_run_request(
+                    normalized_request,
+                    raw_request,
+                    request_type="text",
+                    api_key_name=api_key_name,
+                )
 
             if not self.driver.is_running:
                 raise HTTPException(status_code=503, detail="Driver is not running")
@@ -1722,6 +1903,8 @@ class API:
                 self._request_abort_for_abort_event(abort_event)
 
                 if content_parts:
+                    if _is_terminal_partial_error(error_message):
+                        raise HTTPException(status_code=500, detail=error_message)
                     Logger.warning(
                         "Non-streaming text completion returned partial content due to error: "
                         + str(error_message)

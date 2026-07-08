@@ -20,12 +20,13 @@ import qasync
 
 from drivers.factory import create_driver
 from drivers.providers import DriverProvider, is_provider_locked, provider_lock_reason, provider_options
-from api import API
+from api import API, DryRunCapture, DryRunDriver
 from config.manager import ConfigManager
 from config.loadouts import get_behavior_category_for_provider, get_loadout_field_defs
 from remote_control import RemoteControlActions
 from ui.windows.settings_window import SettingsWindow
 from ui.windows.console_window import ConsoleWindow
+from ui.windows.dry_run_window import DryRunWindow
 from ui.windows.help_window import HelpWindow
 from ui.windows.welcome_window import WelcomeWindow
 from ui.widgets.mini_console import MiniConsole
@@ -46,6 +47,7 @@ from utils.news_state import NEWS_DOCS_URL, has_unviewed_news, mark_latest_news_
 from utils.providers_in_parallel import (
     get_current_provider,
     get_parallel_selected_providers,
+    is_parallel_feature_enabled,
     is_parallel_runtime_active,
 )
 from utils.update_checker import check_for_updates
@@ -62,7 +64,9 @@ import time
 import traceback
 
 
-def _parse_update_cleanup_args(argv: list[str]) -> tuple[list[str], bool, str | None, bool, bool, str | None, bool, bool]:
+def _parse_update_cleanup_args(
+    argv: list[str],
+) -> tuple[list[str], bool, str | None, bool, bool, str | None, str | None, bool, bool]:
     """
     Parse and remove internal startup args from argv.
 
@@ -72,6 +76,8 @@ def _parse_update_cleanup_args(argv: list[str]) -> tuple[list[str], bool, str | 
       --updaterpath=<path>
       --clearFlags
       --fakeUpdate
+      --localUpdateDebug <zipfile>
+      --localUpdateDebug=<zipfile>
       --debugWidgetShows
       --extraDebugLogs
     """
@@ -81,6 +87,7 @@ def _parse_update_cleanup_args(argv: list[str]) -> tuple[list[str], bool, str | 
     clear_flags = False
     fake_update = False
     fake_pufref: str | None = None
+    local_update_debug: str | None = None
     debug_widget_shows = False
     extra_debug_logs = False
 
@@ -130,6 +137,20 @@ def _parse_update_cleanup_args(argv: list[str]) -> tuple[list[str], bool, str | 
             i += 1
             continue
 
+        if arg.lower() == "--localupdatedebug":
+            if i + 1 < len(argv) and not argv[i + 1].startswith("--"):
+                local_update_debug = argv[i + 1]
+                i += 2
+                continue
+            local_update_debug = ""
+            i += 1
+            continue
+
+        if arg.lower().startswith("--localupdatedebug="):
+            local_update_debug = arg.split("=", 1)[1]
+            i += 1
+            continue
+
         if arg.lower() == "--debugwidgetshows":
             debug_widget_shows = True
             i += 1
@@ -150,9 +171,34 @@ def _parse_update_cleanup_args(argv: list[str]) -> tuple[list[str], bool, str | 
         clear_flags,
         fake_update,
         fake_pufref,
+        local_update_debug,
         debug_widget_shows,
         extra_debug_logs,
     )
+
+
+def _resolve_local_update_debug_archive(raw_path: str | None) -> Path | None:
+    if raw_path is None:
+        return None
+
+    value = str(raw_path or "").strip()
+    if not value:
+        raise ValueError("--localUpdateDebug must point to a .zip file.")
+
+    try:
+        archive_path = Path(value).expanduser()
+        try:
+            archive_path = archive_path.resolve()
+        except Exception:
+            archive_path = archive_path.absolute()
+    except Exception as exc:
+        raise ValueError(f"Invalid --localUpdateDebug path: {value}") from exc
+
+    if archive_path.suffix.lower() != ".zip":
+        raise ValueError(f"--localUpdateDebug must point to a .zip file: {archive_path}")
+    if not archive_path.is_file():
+        raise ValueError(f"Local update debug ZIP not found: {archive_path}")
+    return archive_path
 
 
 def _delete_updater_best_effort(cleanup_path: Path) -> None:
@@ -332,6 +378,16 @@ def get_version():
 
 
 POSTUPDATE_FLAG_FILENAME = "postupdate_notes_url.txt"
+POSTUPDATE_CLEANUP_FILENAME = "postupdate_cleanup.json"
+
+
+def _get_update_app_root() -> Path | None:
+    try:
+        if getattr(sys, "frozen", False):
+            return Path(sys.executable).resolve().parent
+        return Path(__file__).resolve().parent
+    except Exception:
+        return None
 
 
 def _release_notes_url_for_version(version: str) -> str:
@@ -343,13 +399,96 @@ def _release_notes_url_for_version(version: str) -> str:
     return f"https://github.com/LyubomirT/intense-rp-next/releases/tag/v{value}"
 
 
-def _consume_postupdate_installed_info() -> UpdateInstalledInfo | None:
+def _read_postupdate_cleanup_backup_dir(app_root: Path) -> tuple[Path, Path] | None:
+    marker_path = app_root / POSTUPDATE_CLEANUP_FILENAME
     try:
-        if getattr(sys, "frozen", False):
-            app_root = Path(sys.executable).resolve().parent
-        else:
-            app_root = Path(__file__).resolve().parent
+        if not marker_path.is_file():
+            return None
     except Exception:
+        return None
+
+    try:
+        payload = json.loads(marker_path.read_text(encoding="utf-8", errors="replace"))
+    except Exception:
+        try:
+            marker_path.unlink()
+        except Exception:
+            pass
+        return None
+
+    raw_backup_dir = ""
+    if isinstance(payload, dict):
+        raw_backup_dir = str(payload.get("backup_dir") or "").strip()
+    if not raw_backup_dir:
+        try:
+            marker_path.unlink()
+        except Exception:
+            pass
+        return None
+
+    try:
+        backup_dir = Path(raw_backup_dir).expanduser().resolve()
+        app_root_resolved = app_root.resolve()
+    except Exception:
+        return None
+
+    # The updater only creates backup folders next to the app root
+    try:
+        expected_prefix = f"{app_root_resolved.name}-backup"
+        if backup_dir.parent != app_root_resolved.parent:
+            return None
+        if not backup_dir.name.startswith(expected_prefix):
+            return None
+        if backup_dir == app_root_resolved:
+            return None
+    except Exception:
+        return None
+
+    return backup_dir, marker_path
+
+
+def _cleanup_postupdate_backup_best_effort() -> None:
+    app_root = _get_update_app_root()
+    if app_root is None:
+        return
+
+    cleanup_info = _read_postupdate_cleanup_backup_dir(app_root)
+    if cleanup_info is None:
+        return
+
+    backup_dir, marker_path = cleanup_info
+    if not backup_dir.exists():
+        try:
+            marker_path.unlink()
+        except Exception:
+            pass
+        return
+
+    def worker() -> None:
+        # Let startup finish first. This backup is our rollback until relaunch.
+        time.sleep(2.0)
+        for attempt in range(60):
+            try:
+                if backup_dir.exists():
+                    shutil.rmtree(backup_dir)
+                try:
+                    marker_path.unlink()
+                except Exception:
+                    pass
+                Logger.info(f"Post-update backup cleaned up: {backup_dir}")
+                return
+            except Exception as exc:
+                if attempt == 0:
+                    Logger.warning(f"Post-update backup cleanup is waiting: {exc}")
+                time.sleep(0.5)
+        Logger.warning(f"Post-update backup cleanup failed: {backup_dir}")
+
+    threading.Thread(target=worker, daemon=True).start()
+
+
+def _consume_postupdate_installed_info() -> UpdateInstalledInfo | None:
+    app_root = _get_update_app_root()
+    if app_root is None:
         return None
 
     flag_path = app_root / POSTUPDATE_FLAG_FILENAME
@@ -392,16 +531,26 @@ def _consume_postupdate_installed_info() -> UpdateInstalledInfo | None:
 
 class MainWindow(QMainWindow):
     update_available_found = Signal(object)
+    dry_run_capture_received = Signal(object)
     DEFAULT_WINDOW_WIDTH = 450
     DEFAULT_WINDOW_HEIGHT = 520
 
-    def __init__(self, *, fake_update: bool = False, fake_pufref: str | None = None):
+    def __init__(
+        self,
+        *,
+        fake_update: bool = False,
+        fake_pufref: str | None = None,
+        local_update_debug_archive: str | None = None,
+        extra_debug_logs_cli: bool = False,
+    ):
         super().__init__()
         self.setWindowTitle("IntenseRP Next")
         self.resize(self.DEFAULT_WINDOW_WIDTH, self.DEFAULT_WINDOW_HEIGHT)
         self.setStyleSheet(f"background-color: {BrandColors.WINDOW_BG}; color: {BrandColors.TEXT_PRIMARY};")
 
         self.config_manager = ConfigManager()
+        self._extra_debug_logs_cli_enabled = bool(extra_debug_logs_cli)
+        self._sync_extra_debug_logs_setting()
         sync_animations_disabled_from_config(self.config_manager)
         self._queue_preview_min_width = 300
         self._queue_preview_handle_width = 12
@@ -601,6 +750,7 @@ class MainWindow(QMainWindow):
         self.settings_window = None
         self._settings_button_loading = False
         self.console_window = None
+        self.dry_run_window = None
         self.help_window = None
         self._welcome_window = None
         self._main_logging_enabled = True
@@ -619,6 +769,7 @@ class MainWindow(QMainWindow):
         # Always set the log callback for the mini-console
         Logger.set_console_callback(self._on_log_message)
         self.update_available_found.connect(self._show_update_available_dialog)
+        self.dry_run_capture_received.connect(self._on_dry_run_capture_received)
 
         self._tray_icon = None
         self._tray_menu = None
@@ -631,6 +782,7 @@ class MainWindow(QMainWindow):
         self._tray_action_exit = None
         self._desktop_notifier = None
         self._desktop_notifier_unavailable = False
+        self._open_notification_dialogs = []
         self._exit_requested = False
         self._setup_tray_icon()
 
@@ -661,8 +813,12 @@ class MainWindow(QMainWindow):
                 summary=version_info.summary,
             )
         self._maybe_show_update_installed_dialog()
+        QTimer.singleShot(3000, _cleanup_postupdate_backup_best_effort)
 
-        self._maybe_check_for_updates_on_startup()
+        if local_update_debug_archive:
+            self._maybe_show_local_update_debug_dialog(local_update_debug_archive)
+        else:
+            self._maybe_check_for_updates_on_startup()
         self._apply_queue_preview_setting(force=True)
         self._refresh_news_state()
         self._sync_news_button()
@@ -767,7 +923,7 @@ class MainWindow(QMainWindow):
 
     def _iter_tray_windows(self):
         windows = [self]
-        for attr in ("settings_window", "help_window", "console_window"):
+        for attr in ("settings_window", "help_window", "console_window", "dry_run_window"):
             win = getattr(self, attr, None)
             if win is not None:
                 windows.append(win)
@@ -1399,24 +1555,71 @@ class MainWindow(QMainWindow):
         except Exception as exc:
             Logger.extra_debug(f"Windows FlashWindowEx failed: {exc}")
 
-    def _notify_user(self, title: str, message: str, level: str = "info") -> None:
+    def _open_notification_dialog(
+        self,
+        title: str,
+        message: str,
+        level: str,
+        *,
+        request_attention: bool = False,
+    ) -> None:
+        dialog = QMessageBox(self)
+        level_norm = str(level or "info").strip().lower()
+        if level_norm in {"warn", "warning"}:
+            dialog.setIcon(QMessageBox.Warning)
+        elif level_norm in {"err", "error", "critical"}:
+            dialog.setIcon(QMessageBox.Critical)
+        else:
+            dialog.setIcon(QMessageBox.Information)
+        dialog.setWindowTitle(str(title or "Notification"))
+        dialog.setText(str(message or ""))
+        dialog.setStandardButtons(QMessageBox.Ok)
+        dialog.setAttribute(Qt.WA_DeleteOnClose, True)
+
+        self._open_notification_dialogs.append(dialog)
+
+        def _forget_dialog(_result=None, current_dialog=dialog) -> None:
+            try:
+                self._open_notification_dialogs.remove(current_dialog)
+            except ValueError:
+                pass
+
+        dialog.finished.connect(_forget_dialog)
+        dialog.open()
+        if request_attention:
+            try:
+                QApplication.beep()
+            except Exception:
+                pass
+            self._flash_attention_window(dialog)
+
+    def _notify_user(
+        self,
+        title: str,
+        message: str,
+        level: str = "info",
+        dialog_message: str | None = None,
+    ) -> None:
         title = str(title or "Notification")
         message = str(message or "")
         level_norm = str(level or "info").strip().lower()
+        dialog_message = str(dialog_message or "").strip()
 
         is_focused = bool(self.isVisible() and self.isActiveWindow())
+        if dialog_message:
+            if not is_focused:
+                if not self._schedule_desktop_notification(title, message, level_norm):
+                    self._show_tray_message(title, message, level_norm)
+            self._open_notification_dialog(
+                title,
+                dialog_message,
+                level_norm,
+                request_attention=not is_focused,
+            )
+            return
+
         if is_focused:
-            dialog = QMessageBox(self)
-            if level_norm in {"warn", "warning"}:
-                dialog.setIcon(QMessageBox.Warning)
-            elif level_norm in {"err", "error", "critical"}:
-                dialog.setIcon(QMessageBox.Critical)
-            else:
-                dialog.setIcon(QMessageBox.Information)
-            dialog.setWindowTitle(title)
-            dialog.setText(message)
-            dialog.setStandardButtons(QMessageBox.Ok)
-            dialog.open()
+            self._open_notification_dialog(title, message, level_norm)
             return
 
         if self._schedule_desktop_notification(title, message, level_norm):
@@ -1653,6 +1856,7 @@ class MainWindow(QMainWindow):
                             remote_version=str(result.remote_version or "unknown"),
                             remote_auto_updateable=result.remote_auto_updateable,
                             remote_severity=result.remote_severity,
+                            remote_summary=result.remote_summary,
                         )
                     )
                 return
@@ -1661,18 +1865,47 @@ class MainWindow(QMainWindow):
 
         threading.Thread(target=worker, daemon=True).start()
 
+    def _maybe_show_local_update_debug_dialog(self, archive_path: str) -> None:
+        archive_path = str(archive_path or "").strip()
+        if not archive_path:
+            return
+
+        try:
+            local_version = get_version()
+        except Exception:
+            local_version = "unknown"
+
+        Logger.warning(f"Local update debug enabled: {archive_path}")
+        self.update_available_found.emit(
+            UpdateAvailableInfo(
+                local_version=str(local_version or "unknown"),
+                remote_version="Debug",
+                remote_auto_updateable=True,
+                remote_severity=None,
+                remote_summary=None,
+                local_update_archive=archive_path,
+            )
+        )
+
     def _maybe_show_welcome_window(self) -> None:
         try:
-            is_first_run = bool(getattr(self.config_manager, "is_first_run", False))
+            should_show_welcome = bool(self.config_manager.should_show_welcome())
         except Exception:
-            is_first_run = False
+            should_show_welcome = bool(getattr(self.config_manager, "is_first_run", False))
 
-        if not is_first_run:
+        if not should_show_welcome:
             return
 
         def show() -> None:
             existing = getattr(self, "_welcome_window", None)
             if existing is not None and existing.isVisible():
+                return
+
+            try:
+                should_show = bool(self.config_manager.should_show_welcome())
+            except Exception:
+                should_show = bool(getattr(self.config_manager, "is_first_run", False))
+            if not should_show:
                 return
 
             welcome = WelcomeWindow(self.config_manager, None)
@@ -1688,8 +1921,23 @@ class MainWindow(QMainWindow):
         # Defer until the UI loop is running
         QTimer.singleShot(0, show)
 
+    def _sync_extra_debug_logs_setting(self):
+        Logger.set_extra_debug_logs_enabled(
+            bool(self.config_manager.get_setting("diagnostics", "extra_debug_logs"))
+            or self._extra_debug_logs_cli_enabled
+        )
+
     def _setup_logging(self):
         """Setup logging (console and file) based on settings."""
+        def _coerce_int_setting(value, default: int, label: str) -> int:
+            try:
+                return int(value)
+            except Exception:
+                Logger.warning(
+                    f"Invalid {label} value after settings reload ({value!r}); using {default}."
+                )
+                return default
+
         # Console window (separate from mini-console)
         enable_console = self.config_manager.get_setting("console_settings", "enable_console")
 
@@ -1717,11 +1965,14 @@ class MainWindow(QMainWindow):
         if max_files is None: max_files = 5
         if max_size_val is None: max_size_val = 10
         if size_unit is None: size_unit = "MB"
-        
-        Logger.configure_file_logging(bool(enable_files), str(log_dir), int(max_files) if max_files is not None else 5, int(max_size_val) if max_size_val is not None else 10, str(size_unit))
+
+        max_files_int = _coerce_int_setting(max_files, 5, "logfiles.max_files")
+        max_size_int = _coerce_int_setting(max_size_val, 10, "logfiles.size_val")
+        Logger.configure_file_logging(bool(enable_files), str(log_dir), max_files_int, max_size_int, str(size_unit))
         configure_internal_diagnostics_logging(self.config_manager)
         if not bool(self.config_manager.get_setting("diagnostics", "save_last_prompt")):
             clear_prompt_snapshots(self.config_manager.config_dir)
+        self._sync_extra_debug_logs_setting()
 
         # Logging levels
         stdout_lvl = self.config_manager.get_setting("system_settings", "stdout_log_level") or "Debug"
@@ -2439,6 +2690,64 @@ class MainWindow(QMainWindow):
             port = 7777
         return f"Running (Port {port})"
 
+    def _dry_run_mode_enabled(self) -> bool:
+        try:
+            return bool(self.config_manager.get_setting("network_settings", "dry_run_mode"))
+        except Exception:
+            return False
+
+    def _dry_run_status_text(self, port: int | None = None) -> str:
+        if port is None:
+            port_setting = self.config_manager.get_setting("network_settings", "port")
+            try:
+                port = int(port_setting) if port_setting else 7777
+            except (TypeError, ValueError):
+                port = 7777
+        return f"Dry Run (Port {port})"
+
+    def _emit_dry_run_capture(self, capture: DryRunCapture) -> None:
+        self.dry_run_capture_received.emit(capture)
+
+    def _show_dry_run_window(self) -> None:
+        window = getattr(self, "dry_run_window", None)
+        if window is None:
+            window = DryRunWindow(None)
+            window.stop_requested.connect(self._on_dry_run_window_stop_requested)
+            self.dry_run_window = window
+
+        window.show_waiting()
+        window.present()
+
+    def _close_dry_run_window(self) -> None:
+        window = getattr(self, "dry_run_window", None)
+        if window is None:
+            return
+
+        try:
+            window.force_close()
+        except Exception:
+            try:
+                window.close()
+            except Exception:
+                pass
+        finally:
+            self.dry_run_window = None
+
+    def _on_dry_run_window_stop_requested(self) -> None:
+        if getattr(self, "_stop_task", None) is not None:
+            return
+        asyncio.create_task(self.stop_services())
+
+    def _on_dry_run_capture_received(self, capture: DryRunCapture) -> None:
+        window = getattr(self, "dry_run_window", None)
+        if window is None:
+            window = DryRunWindow(None)
+            window.stop_requested.connect(self._on_dry_run_window_stop_requested)
+            self.dry_run_window = window
+
+        window.set_capture(capture)
+        window.present()
+
     def _reset_start_controls_to_idle(self) -> None:
         self.start_button.setText("Start")
         self.start_button.apply_icon(IconType.START, BrandColors.TEXT_PRIMARY)
@@ -2797,7 +3106,10 @@ class MainWindow(QMainWindow):
         """Show or hide the discrete hotswap button based on setting + running state."""
         mode = self.config_manager.get_setting("application_settings", "hotswap_experience")
         running = self.start_button.text() == "Stop"
-        show = (mode == "Persistent Discrete") or ((mode == "Discrete") and running)
+        dry_run_active = isinstance(getattr(self, "driver", None), DryRunDriver)
+        show = (not dry_run_active) and (
+            (mode == "Persistent Discrete") or ((mode == "Discrete") and running)
+        )
 
         self.hotswap_button.setVisible(show)
         if show:
@@ -3049,6 +3361,24 @@ class MainWindow(QMainWindow):
                     )
             return
 
+        if provider == DriverProvider.MIMO:
+            apply_model = getattr(runtime_driver, "apply_configured_model", None)
+            if not callable(apply_model):
+                raise RuntimeError("Xiaomi MiMo does not expose model switching right now.")
+
+            await apply_model()
+
+            read_label = getattr(runtime_driver, "_read_current_mimo_model_label", None)
+            canonicalize_label = getattr(runtime_driver, "_canonicalize_model_label", None)
+            if callable(read_label) and callable(canonicalize_label):
+                current_label = str(await read_label() or "").strip()
+                if canonicalize_label(current_label) != canonicalize_label(desired):
+                    shown = current_label or "Unknown"
+                    raise RuntimeError(
+                        f"Xiaomi MiMo did not confirm the requested model switch (still showing '{shown}')."
+                    )
+            return
+
         raise RuntimeError(f"{provider.value} does not support remote model switching.")
 
     async def _remote_switch_model(self, selected_models: dict[str, str] | str) -> None:
@@ -3137,17 +3467,20 @@ class MainWindow(QMainWindow):
 
     def on_settings_reloaded(self):
         Logger.info("Settings reloaded.")
-        sync_animations_disabled_from_config(self.config_manager)
-        self._setup_logging()
-        self._refresh_news_state()
-        self._sync_news_button()
+        try:
+            sync_animations_disabled_from_config(self.config_manager)
+            self._setup_logging()
+            self._refresh_news_state()
+            self._sync_news_button()
 
-        if self.console_window:
-            self.console_window.apply_settings()
+            if self.console_window:
+                self.console_window.apply_settings()
 
-        if self.settings_window and self.settings_window.isVisible():
-            # Importing settings is effectively an external change; force refresh
-            self.settings_window.refresh_from_config(force=True)
+            if self.settings_window and self.settings_window.isVisible():
+                # importing settings is effectively an external change -=> force refresh
+                self.settings_window.refresh_from_config(force=True)
+        except Exception as exc:
+            Logger.error(f"Failed to apply reloaded settings: {exc}")
 
     def on_restart_requested(self):
         asyncio.create_task(self._restart_application())
@@ -3520,6 +3853,63 @@ class MainWindow(QMainWindow):
                 self._update_tray_menu_state()
                 return
 
+            if self._dry_run_mode_enabled():
+                Logger.info("Dry Run Mode active: starting API server without launching a provider browser.")
+                self.driver = DryRunDriver(self.config_manager)
+
+                for logger_name in ("uvicorn", "uvicorn.error", "uvicorn.access"):
+                    logger = logging.getLogger(logger_name)
+                    logger.handlers = [logging.NullHandler()]
+                    logger.setLevel(logging.CRITICAL)
+                    logger.propagate = False
+                    logger.disabled = True
+
+                self.api = API(
+                    self.driver,
+                    dry_run=True,
+                    dry_run_capture_callback=self._emit_dry_run_capture,
+                )
+                self._set_queue_preview_api(self.api)
+
+                config = uvicorn.Config(
+                    app=self.api.app,
+                    host=host,
+                    port=port,
+                    log_level="critical",
+                    log_config=None,
+                    access_log=False,
+                )
+
+                self.server = uvicorn.Server(config)
+
+                self._update_status("Starting Dry Run API Server...", "info")
+                self.server_task = asyncio.create_task(self.server.serve())
+
+                self._show_dry_run_window()
+                self._update_status(self._dry_run_status_text(port), "running")
+
+                if self.config_manager.get_setting("network_settings", "show_ip"):
+                    addrs = [f"http://127.0.0.1:{port}"]
+                    if available_on_lan:
+                        try:
+                            hostname = socket.gethostname()
+                            for info in socket.getaddrinfo(hostname, None, socket.AF_INET):
+                                ip = info[4][0]
+                                if not ip.startswith("127."):
+                                    addrs.append(f"http://{ip}:{port}")
+                        except Exception:
+                            pass
+                    for addr in set(addrs):
+                        Logger.success(f"Dry run server running at {addr}")
+
+                self.start_button.setText("Stop")
+                self.start_button.apply_icon(IconType.STOP, BrandColors.TEXT_PRIMARY)
+                self.start_button.setEnabled(True)
+                self.start_button.set_chevron_visible(False)
+                self._sync_hotswap_button()
+                self._update_tray_menu_state()
+                return
+
             current_provider = get_current_provider(self.config_manager)
             if is_provider_locked(current_provider, self.config_manager):
                 self._show_provider_locked_notice(current_provider)
@@ -3528,7 +3918,7 @@ class MainWindow(QMainWindow):
 
             required_providers = (
                 get_parallel_selected_providers(self.config_manager)
-                if bool(self.config_manager.get_setting("experimental", "providers_in_parallel"))
+                if is_parallel_feature_enabled(self.config_manager)
                 else [current_provider]
             )
             locked_required_providers = [
@@ -3819,6 +4209,8 @@ class MainWindow(QMainWindow):
                 finally:
                     self.driver = None
 
+            self._close_dry_run_window()
+
             if update_ui:
                 self._update_status("Stopped", "ready")
                 self.start_button.setText("Start")
@@ -4044,6 +4436,7 @@ def main():
         clear_flags,
         fake_update,
         fake_pufref,
+        local_update_debug,
         debug_widget_shows,
         extra_debug_logs,
     ) = _parse_update_cleanup_args(sys.argv[1:])
@@ -4054,6 +4447,12 @@ def main():
         sys.exit(0 if _clear_app_flags() else 1)
 
     app = QApplication(sys.argv)
+    try:
+        local_update_debug_archive = _resolve_local_update_debug_archive(local_update_debug)
+    except ValueError as exc:
+        QMessageBox.warning(None, "Local Update Debug", str(exc))
+        sys.exit(2)
+
     if debug_widget_shows:
         _install_widget_debug_logging(app)
 
@@ -4099,7 +4498,14 @@ def main():
     loop = qasync.QEventLoop(app)
     asyncio.set_event_loop(loop)
 
-    window = MainWindow(fake_update=fake_update, fake_pufref=fake_pufref)
+    window = MainWindow(
+        fake_update=fake_update,
+        fake_pufref=fake_pufref,
+        local_update_debug_archive=(
+            str(local_update_debug_archive) if local_update_debug_archive is not None else None
+        ),
+        extra_debug_logs_cli=extra_debug_logs,
+    )
     window.show()
 
     def _request_quit() -> None:

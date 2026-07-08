@@ -8,7 +8,7 @@ IntenseRP manages provider logins using an account-based saved-accounts system.
 
 There's nothing to enable - this is the standard way IntenseRP manages credentials now.
 
-You can store **multiple accounts per provider**, let IntenseRP pick one on start, **pin a specific one when you want a predictable startup profile**, and (optionally) **retry a failed request by restarting the browser and rotating to a different identity**.
+You can store **multiple accounts per provider**, let IntenseRP pick one on start, **pin a specific one when you want a predictable startup profile**, and (optionally) **retry an early failed request with another saved account/profile**.
 
 ---
 
@@ -18,8 +18,8 @@ You can store **multiple accounts per provider**, let IntenseRP pick one on star
 2. If you want auto-login for your provider, enable **Sign In Automatically** and add at least one account in **Saved Accounts**.
 3. Keep a backup of your `[config_dir]` (see [Backup & Restore](system.md#backup--restore)).
 4. (Optional) Enable:
-    - **Prefer the Least Used Account**: spreads usage across accounts
-    - **Retry With Another Account**: retries early failures with a rotated identity
+    - **Prefer the Least Used Account**: rotates between saved accounts you are authorized to use
+    - **Retry With Another Account**: retries early failures with another saved account/profile
     - **Pin** in **Saved Accounts**: forces a specific row to be used on normal startup
     - **Disable** in **Saved Accounts**: keeps a row saved but removes it from selection/rotation
 
@@ -31,7 +31,7 @@ You can store **multiple accounts per provider**, let IntenseRP pick one on star
 flowchart TD
     A[Add accounts in Saved Accounts] --> B[Enable Sign In Automatically]
     B --> C[Start provider driver]
-    C --> D["An identity is selected<br/>(account + profile)"]
+    C --> D["An account/profile is selected"]
     D --> E[Driver logs in]
     E --> F[API request arrives]
     F --> G[Generate response via provider UI]
@@ -39,11 +39,11 @@ flowchart TD
     H -->|Yes| I[Forward response to client]
     H -->|No, early failure| J{Retry With Another Account enabled?}
     J -->|No| K[Return error / empty output]
-    J -->|Yes| L[Restart driver + rotate identity]
+    J -->|Yes| L[Restart driver + choose another account/profile]
     L --> G
 ```
 
-Under the hood, accounts are used by the drivers at login time, and by the request retry logic when it decides whether to rotate and try again.
+Under the hood, accounts are used by the drivers at login time, and by the request retry logic when it decides whether to try another saved account/profile.
 
 ---
 
@@ -68,13 +68,13 @@ Under the hood, accounts are used by the drivers at login time, and by the reque
 | **Saved Accounts** | Settings -> Provider and Login -> Sign-In and Accounts | Add and manage accounts per provider, including pinning and disabling rows |
 | **Sign In Automatically** | Settings -> Provider and Login -> Sign-In and Accounts | Uses a saved account for login |
 | **Prefer the Least Used Account** | Settings -> Provider and Login -> Sign-In and Accounts | Chooses the least recently used account when starting the driver, unless a row is pinned |
-| **Retry With Another Account** | Settings -> Provider and Login -> Sign-In and Accounts | On early failures, restarts the driver and retries once with a rotated identity |
+| **Retry With Another Account** | Settings -> Provider and Login -> Sign-In and Accounts | On early failures, restarts the driver and retries once with another saved account/profile |
 
 ---
 
 ## :material-account-switch: How account selection works
 
-Accounts are stored per provider (DeepSeek / GLM Chat / Moonshot / QwenLM / Perplexity / HuggingChat / Google AI Studio).
+Accounts are stored per provider (DeepSeek / GLM Chat / Moonshot / QwenLM / Perplexity / HuggingChat / Google AI Studio / Xiaomi MiMo).
 
 When **Sign In Automatically** is enabled, IntenseRP selects an account on driver start and logs in automatically. If it is disabled, you can still log in manually and use **Keep Provider Sessions Signed In** to stay signed in between restarts.
 
@@ -103,7 +103,7 @@ Open the little `...` button on any Saved Accounts row and click **Disable**.
 
 Disabled rows stay visible and dimmed, but IntenseRP will not use them for startup selection, least-used rotation, full parallel lanes, or retry-with-another-account recovery.
 
-This is especially useful for providers with monthly limits. For example, when a HuggingChat account hits its monthly credits, disable that row until the quota resets.
+This is especially useful for providers with account-specific limits. For example, when a HuggingChat account reaches its monthly credits, disable that row until the quota resets.
 
 !!! note "At least one enabled account"
     If a provider has saved rows, at least one row must stay enabled. Otherwise Auto Login would have credentials saved but no usable identity to pick.
@@ -124,6 +124,7 @@ IntenseRP stores one profile per identity (account or manual) under:
 [config_dir]/playwright_profiles/accounts/perplexity/<hash>/
 [config_dir]/playwright_profiles/accounts/huggingchat/<hash>/
 [config_dir]/playwright_profiles/accounts/aistudio/<hash>/
+[config_dir]/playwright_profiles/accounts/mimo/<hash>/
 ```
 
 The `<hash>` is derived from your email (SHA-256, truncated). It's only there so your email doesn't show up in folder names.
@@ -143,14 +144,14 @@ If no account is selected (for example Auto Login is off / manual login), the pr
 
 ## :material-refresh: Retry With Another Account
 
-This option is meant to handle cases where a provider fails early and returns no meaningful output (for example, a rate limit / quota style error).
+This option is meant to handle cases where a provider fails early and returns no meaningful output (for example, a quota or account-state error).
 
-When enabled, each request gets up to **two attempts**. If the first attempt produces no meaningful output, IntenseRP restarts the driver, rotates the identity, and retries once.
+When enabled, each request gets up to **two attempts**. If the first attempt produces no meaningful output, IntenseRP restarts the driver, chooses another saved account/profile, and retries once.
 
 !!! note "This restarts the browser"
     The retry is implemented by closing and restarting the provider driver, which means the provider browser window is relaunched.
 
-### What "rotate identity" means
+### What "choose another account/profile" means
 
 IntenseRP tries two strategies, in this order:
 
@@ -159,7 +160,7 @@ IntenseRP tries two strategies, in this order:
 
 The second option is most useful when **Persistent Sessions** are enabled, because it forces a clean session/profile for the same login.
 
-If a row is pinned, that only affects the normal startup pick. The retry path can still rotate away from it if recovery is needed.
+If a row is pinned, that only affects the normal startup pick. The retry path can still choose another saved account/profile if recovery is needed.
 
 ---
 
@@ -195,9 +196,11 @@ These files are encrypted using the same `settings.key` used for your main setti
 
 **Perplexity:** email-code login. Auto Login can fill the email and start the code flow, but you still need to enter the 6-digit code in the browser. Password can be left blank in Saved Accounts.
 
-**HuggingChat:** username/email + password login. HuggingChat monthly credits are small (`$0.1/month` for free accounts, `$2/month` for Pro), so add multiple accounts if you have them and disable rows that hit the monthly limit until they reset.
+**HuggingChat:** username/email + password login. HuggingChat accounts can have monthly credits, so disable rows that reach their limit until the quota resets.
 
 **Google AI Studio:** Google login with optional credential autofill. Persistent Sessions are strongly recommended because Google may still ask for manual confirmation/challenge steps.
+
+**Xiaomi MiMo:** Xiaomi account login with email/password and an agreement checkbox. MiMo is heavily region-dependent, so if the page itself refuses to connect, check regional availability or configure a permitted MiMo proxy before troubleshooting credentials.
 
 ---
 
@@ -210,10 +213,10 @@ These files are encrypted using the same `settings.key` used for your main setti
     Usually no. If you had legacy saved credentials, IntenseRP imports them automatically on startup.
 
 ??? question "How do I switch accounts?"
-    - Enable **Prefer the Least Used Account** to spread usage across accounts, or
+    - Enable **Prefer the Least Used Account** to rotate between saved accounts, or
     - Pin a specific Saved Accounts row if you want startup to always land on that one, or
     - Use **Switch Account** in the Stop menu, or
-    - Enable **Retry With Another Account** so early failures can trigger an automatic rotation.
+    - Enable **Retry With Another Account** so early failures can trigger one retry with another saved account/profile.
 
 ??? question "Can I see which account is active?"
     There is still no always-visible indicator in the main UI, but startup logs now show the selected profile/email when services launch.

@@ -1,5 +1,6 @@
 import re
 import sys
+from urllib.parse import urlsplit
 from utils.ip_utils import normalize_ip_list
 
 
@@ -132,6 +133,33 @@ def validate_directory_path(value: str | None) -> None:
         base = trimmed.split(".", 1)[0].upper()
         if base in _WINDOWS_RESERVED_NAMES:
             raise ValueError(f"Windows path component uses a reserved name: {base}.")
+
+
+def validate_http_base_url(value: str | None) -> None:
+    """
+    Validate a simple HTTP(S) base URL.
+
+    Empty values are allowed so optional settings can fall back to defaults.
+    """
+    if value is None:
+        return
+
+    text = str(value).strip()
+    if not text:
+        return
+
+    if any(ch.isspace() for ch in text):
+        raise ValueError("URL cannot contain spaces.")
+
+    parsed = urlsplit(text)
+    if parsed.scheme not in {"http", "https"}:
+        raise ValueError("URL must start with http:// or https://.")
+    if not parsed.netloc:
+        raise ValueError("URL must include a host.")
+    if parsed.username or parsed.password:
+        raise ValueError("URL cannot include a username or password.")
+    if parsed.query or parsed.fragment:
+        raise ValueError("URL cannot include query strings or fragments.")
 
 
 def validate_ip_address_list(value) -> None:

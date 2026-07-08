@@ -4,7 +4,7 @@ icon: material/rocket-launch
 
 # :material-rocket-launch: Getting Started
 
-Let's get IntenseRP installed, connected to a provider, and talking to SillyTavern. This page sticks to the setup path, while deeper provider weirdness gets linke out to the relevant Behavior pages in :material-cloud: [Providers](providers.md).
+Let's get IntenseRP installed, connected to a provider, and talking to SillyTavern. This page sticks to the setup path, while deeper provider weirdness gets linked out to the relevant Behavior pages in :material-cloud: [Providers](providers.md).
 
 ---
 
@@ -15,7 +15,7 @@ Before we dive in, make sure you have:
 | | |
 |---|---|
 | :material-microsoft-windows: **Windows 10/11** or :material-linux: **Linux** | 64-bit with a graphical desktop |
-| :material-account-plus: **Provider account** | [DeepSeek](https://chat.deepseek.com), [GLM Chat (Z.ai)](https://chat.z.ai/), [Kimi](https://www.kimi.com/), [QwenLM](https://chat.qwen.ai/), [Perplexity](https://www.perplexity.ai/), or [HuggingChat](https://huggingface.co/chat). [Google AI Studio](https://aistudio.google.com/) is temporarily locked by default. |
+| :material-account-plus: **Provider account** | [DeepSeek](https://chat.deepseek.com), [GLM Chat (Z.ai)](https://chat.z.ai/), [Kimi](https://www.kimi.com/), [QwenLM](https://chat.qwen.ai/), [Perplexity](https://www.perplexity.ai/), [HuggingChat](https://huggingface.co/chat), [Google AI Studio](https://aistudio.google.com/), or [Xiaomi MiMo](https://aistudio.xiaomimimo.com/#/c). |
 | :material-chat: **SillyTavern** (or similar) | Any OpenAI-compatible client works |
 
 ---
@@ -87,7 +87,7 @@ Before hitting **Start**, pick your provider and decide whether IntenseRP should
 
 1. Click the :material-cog: **Settings** button
 2. Go to **Provider and Login**
-3. In **Current Provider**, choose your provider (DeepSeek, GLM Chat, Moonshot, QwenLM, Perplexity, or HuggingChat)
+3. In **Current Provider**, choose your provider (DeepSeek, GLM Chat, Moonshot, QwenLM, Perplexity, HuggingChat, Google AI Studio, or Xiaomi MiMo)
 4. In **Sign-In and Accounts**, (optional) turn on :material-toggle-switch: **Sign In Automatically**
 5. Open **Saved Accounts** and add your account(s)
 6. (Optional) Enable **Prefer the Least Used Account** and/or **Retry With Another Account**
@@ -107,12 +107,10 @@ Before hitting **Start**, pick your provider and decide whether IntenseRP should
     | **GLM Chat** | Auto Login can fill credentials, but you still solve the CAPTCHA. Persistent sessions help a lot. |
     | **Moonshot / Google AI Studio** | Google sign-in may ask for confirmation, 2FA, or manual popup cleanup. |
     | **Perplexity** | Auto Login starts the email-code flow, but you enter the 6-digit code. |
-    | **HuggingChat** | Uses Hugging Face credentials; free monthly credits can run out quickly on heavier models. |
+    | **HuggingChat** | Uses Hugging Face credentials; account credits can run out quickly on heavier models. |
+    | **Xiaomi MiMo** | Uses Xiaomi account login and may be unavailable in some regions. If the page refuses the connection, use a permitted network setup or MiMo's proxy setting. |
 
     For the longer version, see [:material-key: Login & Sessions](features/login-sessions.md) and [:material-cloud: Providers](providers.md).
-
-!!! warning "Google AI Studio is temporarily locked"
-    AI Studio currently appears to detect Patchright/automated browser sessions and can block automated sends. You can still configure it under **Provider Behavior**, but it only appears as a selectable provider if you enable **Settings** -> **Advanced** -> **Provider Stability** -> **Ignore Provider Locks**.
 
 !!! note "Upgrading?"
     If you previously saved credentials in older versions, IntenseRP imports them into **Saved Accounts** on startup.
@@ -164,24 +162,12 @@ Click the :material-power-plug: **API** button in SillyTavern's top bar.
 |-------|-------|
 | :material-web: **Custom Endpoint** | `http://127.0.0.1:7777/v1` |
 | :material-key: **API Key** | Leave blank |
-| :material-robot: **Model** | `deepseek-*` / `glm-*` / `moonshot-*` / `qwen-*` / `perplexity-*` / `huggingchat-*` |
+| :material-robot: **Model** | `deepseek-*` / `glm-*` / `moonshot-*` / `qwen-*` / `perplexity-*` / `huggingchat-*` / `aistudio-*` / `mimo-*` |
 
-!!! note
-    Use the model ID that matches your active provider:
+!!! note "Model IDs"
+    Use `<provider>-auto` for your active provider. The current prefixes are `deepseek`, `glm`, `moonshot`, `qwen`, `perplexity`, `huggingchat`, `aistudio`, and `mimo`, so GLM uses `glm-auto`, AI Studio uses `aistudio-auto`, etc.
 
-    - DeepSeek -> `deepseek-auto`
-    - GLM Chat -> `glm-auto`
-    - Moonshot -> `moonshot-auto`
-    - QwenLM -> `qwen-auto`
-    - Perplexity -> `perplexity-auto`
-    - HuggingChat -> `huggingchat-auto`
-    - Google AI Studio -> `aistudio-auto` only when **Ignore Provider Locks** is enabled
-
-!!! info "Model IDs"
-    The `*-auto` model is the default and respects your IntenseRP settings for the active provider.
-
-    There are also `*-chat` and `*-reasoner` variants.
-    For the full list, see [:material-lan: Network & API](features/network-api.md).
+    `*-auto` respects your IntenseRP settings. There are also `*-chat` and `*-reasoner` variants; for the full behavior reference, see [:material-lan: Network & API](features/network-api.md).
 
 ![SillyTavern Endpoint Settings](pics/getting-started/preview_of_settings.png)
 

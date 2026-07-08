@@ -11,6 +11,21 @@ This page covers the toggles and options that control how IntenseRP interacts wi
 
 ---
 
+## :material-call-split: Request Capture Mode
+
+Controls how IntenseRP captures GLM's streaming response.
+
+:material-arrow-right: **Settings** -> **Provider Behavior** -> **GLM Chat** -> **Request Capture Mode**
+
+**Replay** is the default. IntenseRP intercepts the GLM request, replays it internally, streams that replay to the API client, and then gives the captured response back to the page. It's the older, known-good path.
+
+**CDP Teeing** is the newer alternative. IntenseRP leaves GLM's real browser request alone, tees the real response through Chrome DevTools Protocol, and feeds those bytes through the same GLM stream parser. This lets the page JavaScript receive and process its own response normally while IntenseRP observes the stream.
+
+!!! note "Default stays Replay"
+    CDP Teeing is off by default for GLM. It's available if you want the browser-native request path, but Replay remains the safer default while this newer path gets more real-world mileage.
+
+---
+
 ## :material-tune: Modes (model IDs)
 
 In IntenseRP Next v2, the `model` you select in SillyTavern is mostly a **mode selector**, not a true model picker.
@@ -28,15 +43,9 @@ For GLM, these model IDs map to simple behavior presets:
 
     :material-arrow-right: **Settings** -> **Provider Behavior** -> **GLM Chat** -> **Model**
 
-    Supported options:
+    The Settings dropdown shows the supported GLM web UI entries. Use it as the exact list, since GLM can change model availability through rollouts or maintenance.
 
-    - **GLM-5.1** (recommended for rp)
-    - **GLM-5-Turbo**
-    - **GLM-5V-Turbo**
-    - **GLM-5**
-    - **GLM-4.7**
-
-    Right now, **GLM-5V-Turbo** is also the only GLM model where IntenseRP exposes the separate **Enable Tools** toggle. On other GLM models, that setting is forced off.
+    Right now, **GLM-5.2** is the only model where IntenseRP exposes the separate **Deep Think Effort** setting, and **GLM-5V-Turbo** is the only model where IntenseRP exposes the separate **Enable Tools** toggle. On other GLM models, those settings are ignored or forced off as needed.
 
     !!! warning "Fallback behavior"
         If your selected model is not present in the dropdown (UI changes / rollout), IntenseRP logs a warning and selects the **first available** model instead.
@@ -52,6 +61,14 @@ Deep Think is GLM's reasoning mode. When enabled, GLM produces an internal reaso
 Toggles the Deep Think button in GLM's interface.
 
 :material-arrow-right: **Settings** -> **Provider Behavior** -> **GLM Chat** -> **Enable Deep Think**
+
+### Deep Think Effort
+
+GLM-5.2 uses a newer Deep Think control. Instead of one plain toggle, the menu has **High** and **Max** effort choices plus a separate on/off switch.
+
+:material-arrow-right: **Settings** -> **Provider Behavior** -> **GLM Chat** -> **Deep Think Effort**
+
+This setting is only shown for **GLM-5.2** while **Enable Deep Think** is on. Older GLM models keep using the simpler Deep Think toggle.
 
 ### Send Deep Think
 
@@ -265,8 +282,10 @@ GLM has a few quirks worth knowing about, that could look as broken (but really 
 
 | Setting | What It Does | Default |
 |---------|--------------|---------|
-| **Model** | Selects GLM's real model picker (UI) | GLM-5 |
+| **Request Capture Mode** | Captures responses with Replay or CDP Teeing | Replay |
+| **Model** | Selects GLM's real model picker (UI) | GLM-5.2 |
 | **Enable Deep Think** | Toggles GLM reasoning mode | Off |
+| **Deep Think Effort** | Picks GLM-5.2's Deep Think effort | Max |
 | **Send Deep Think** | Includes thinking in response | Off |
 | **Count Tokens** | Returns token usage in API responses | On |
 | **Enable Search** | Enables GLM search | Off |

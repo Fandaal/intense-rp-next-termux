@@ -1,8 +1,10 @@
 import asyncio
+import base64
 import json
 import re
 import time
 from typing import Any, Callable, Dict, List, Optional, Union
+from urllib.parse import urlsplit
 
 import httpx
 from dotenv import load_dotenv
@@ -51,17 +53,24 @@ GLM_REQUEST_MACRO_ACTIONS: Dict[str, tuple[str, Any]] = {
 
 
 class GLMDriver(BaseDriver):
+    REQUEST_CAPTURE_MODE_REPLAY = "replay"
+    REQUEST_CAPTURE_MODE_CDP_TEEING = "cdp_teeing"
     CHAT_URL = "https://chat.z.ai/"
     AUTH_URL = "https://chat.z.ai/auth"
     CONVERSATION_URL_RE = re.compile(r"^https://chat\.z\.ai/c/([^/?#]+)", re.IGNORECASE)
+    COMPLETION_ROUTE_GLOB = "**/api/v2/chat/completions**"
+    COMPLETION_URL_PATHS = {"/api/v2/chat/completions"}
     MODEL_CONCURRENCY_LIMIT_CODE = "MODEL_CONCURRENCY_LIMIT"
+    GLM_52_MODEL_FRIENDLY = "GLM-5.2"
     TOOLS_SUPPORTED_MODEL_FRIENDLY = "GLM-5V-Turbo"
+    DEFAULT_GLM_52_DEEPTHINK_EFFORT = "max"
     MODEL_CAPACITY_TEXT_MARKERS = (
         "model_concurrency_limit",
         "currently at capacity",
         "peak hours",
         "switch to another model",
     )
+    EMPTY_COMPLETION_STREAM_ERROR_CODE = "20001"
 
     REFRESH_AFTER_GENERATION_DELAY_S = 2.0
     COMPLETION_REQUEST_TIMEOUT_S = 150.0
@@ -70,6 +79,7 @@ class GLMDriver(BaseDriver):
     MODEL_SELECTOR_READY_TIMEOUT_MS = 20000
     CLEAN_REGEN_STATE_KEYS = (
         "deepthink_enabled",
+        "deepthink_effort",
         "search_enabled",
         "advanced_search_enabled",
         "tools_enabled",
@@ -84,16 +94,17 @@ class GLMDriver(BaseDriver):
     MODEL_SELECTOR_BUTTON_SELECTOR = "button.modelSelectorButton"
     MODEL_DROPDOWN_ID = "f8T9iEf1QC"
     MODEL_DROPDOWN_SELECTOR = f"div#{MODEL_DROPDOWN_ID}"
+    MODEL_OPTION_SELECTOR = "button[aria-label='model-item'][data-value], div[role='menu'] button[data-value]"
     MODEL_DATA_VALUE_BY_FRIENDLY: Dict[str, str] = {
+        "GLM-5.2": "glm-5.2",
         "GLM-5.1": "GLM-5.1",
-        "GLM-5": "glm-5",
         "GLM-5-Turbo": "GLM-5-Turbo",
         "GLM-5V-Turbo": "GLM-5v-Turbo",
         "GLM-4.7": "glm-4.7",
     }
 
-    # Models hidden behind a collapsible section in the dropdown
-    MODELS_IN_COLLAPSIBLE: set = {"GLM-5", "GLM-4.7"}
+    # Models hidden behind a collapsible section in older dropdown variants.
+    MODELS_IN_COLLAPSIBLE: set = set()
 
     def __init__(self, config_manager):
         super().__init__(config_manager=config_manager, provider=DriverProvider.GLM_CHAT)
@@ -102,6 +113,7 @@ class GLMDriver(BaseDriver):
         self.current_model: Optional[str] = None
         self.current_send_deepthink: Optional[bool] = None
         self.thinking_active = False
+        self._pending_request_overrides: dict[str, Any] = {}
 
         self.clean_regen_message_cache_key = "glm_last_message.txt"
         self.clean_regen_state_cache_key = "glm_last_message_state.json"
@@ -226,7 +238,7 @@ class GLMDriver(BaseDriver):
         except asyncio.CancelledError:
             return
         except Exception as e:
-            Logger.warning(f"GLM Chat: failed to reload after generation: {e}")
+            Logger.warning(f"GLM Chat: failed to reload page: {e}")
             return
 
         try:
@@ -299,6 +311,9 @@ class GLMDriver(BaseDriver):
         )
         self._refresh_after_generation_task = None
 
+    def set_request_overrides(self, overrides: dict[str, Any] | None = None) -> None:
+        self._pending_request_overrides = dict(overrides or {})
+
     def api_real_model_labels(self) -> list[str]:
         return list(self.MODEL_DATA_VALUE_BY_FRIENDLY.keys())
 
@@ -315,6 +330,8 @@ class GLMDriver(BaseDriver):
         model: Any = None,
         wait_until_ready: bool = False,
     ) -> None:
+        await self._dismiss_dialog_close_buttons()
+
         desired_friendly = self._get_glm_model_label_for_request(model)
         if not desired_friendly:
             return
@@ -337,9 +354,248 @@ class GLMDriver(BaseDriver):
             value = None
         return str(value or "").strip()
 
+    def _get_configured_glm_deepthink_effort(self) -> str:
+        try:
+            value = self.config_manager.get_setting("glm_behavior", "deepthink_effort")
+        except Exception:
+            value = None
+        return self._normalize_glm_deepthink_effort(value)
+
     @staticmethod
     def _normalize_model_label(value: str) -> str:
         return re.sub(r"\\s+", " ", str(value or "")).strip().lower()
+
+    @classmethod
+    def _glm_uses_deepthink_effort_controls(cls, model_friendly: str) -> bool:
+        return cls._normalize_model_label(model_friendly) == cls._normalize_model_label(
+            cls.GLM_52_MODEL_FRIENDLY
+        )
+
+    @classmethod
+    def _normalize_glm_deepthink_effort(cls, value: Any, default: str | None = None) -> str:
+        fallback = str(default or cls.DEFAULT_GLM_52_DEEPTHINK_EFFORT).strip().lower()
+        normalized = str(value or "").strip().lower()
+        normalized = re.sub(r"[\s_]+", "-", normalized)
+        normalized = re.sub(r"-{2,}", "-", normalized).strip("-")
+
+        if normalized in {"max", "maximum", "xhigh", "x-high", "extra-high", "extra-highest"}:
+            return "max"
+        if normalized in {"high", "medium", "med"}:
+            return "high"
+        return fallback if fallback in {"high", "max"} else cls.DEFAULT_GLM_52_DEEPTHINK_EFFORT
+
+    def _get_request_capture_mode(self) -> str:
+        try:
+            mode = str(
+                self.config_manager.get_setting("glm_behavior", "request_capture_mode")
+                or self.REQUEST_CAPTURE_MODE_REPLAY
+            ).strip().lower()
+        except Exception:
+            mode = self.REQUEST_CAPTURE_MODE_REPLAY
+
+        if mode == self.REQUEST_CAPTURE_MODE_CDP_TEEING:
+            return self.REQUEST_CAPTURE_MODE_CDP_TEEING
+        return self.REQUEST_CAPTURE_MODE_REPLAY
+
+    @classmethod
+    def _is_completion_request_url(cls, url: Any) -> bool:
+        try:
+            parsed = urlsplit(str(url or ""))
+        except Exception:
+            return False
+        return parsed.path in cls.COMPLETION_URL_PATHS
+
+    async def _dismiss_dialog_close_buttons(self, context: str = "GLM Chat") -> int:
+        if not self.page:
+            return 0
+
+        try:
+            clicked = await self.page.evaluate(
+                """() => {
+                    const isVisible = (element) => {
+                        if (!element) return false;
+                        const style = window.getComputedStyle(element);
+                        const rect = element.getBoundingClientRect();
+                        return (
+                            style.display !== 'none' &&
+                            style.visibility !== 'hidden' &&
+                            rect.width > 0 &&
+                            rect.height > 0
+                        );
+                    };
+
+                    let clicked = 0;
+                    for (const button of document.querySelectorAll('button[data-dialog-close]')) {
+                        if (button.disabled || !isVisible(button)) {
+                            continue;
+                        }
+                        try {
+                            button.click();
+                            clicked += 1;
+                        } catch (e) {
+                            // Ignore one bad close button; the next UI action will retry.
+                        }
+                    }
+                    return clicked;
+                }"""
+            )
+        except Exception as e:
+            Logger.debug(f"{context}: failed to dismiss data-dialog-close buttons: {e}")
+            return 0
+
+        try:
+            clicked_count = int(clicked or 0)
+        except Exception:
+            clicked_count = 0
+        if clicked_count:
+            Logger.debug(f"{context}: dismissed {clicked_count} startup dialog close button(s).")
+            await asyncio.sleep(0.1)
+        return clicked_count
+
+    async def _read_glm_pointer_events_state(self) -> dict[str, Any]:
+        """Return whether GLM's app shell is currently accepting pointer events."""
+        if not self.page:
+            return {"ready": True}
+
+        try:
+            state = await self.page.evaluate(
+                """() => {
+                    const normalize = (value) => String(value || '')
+                        .replace(/\\s+/g, ' ')
+                        .trim();
+
+                    const visibleOpenControls = Array.from(
+                        document.querySelectorAll('[data-state="open"], [aria-expanded="true"]')
+                    ).filter((element) => {
+                        const style = window.getComputedStyle(element);
+                        const rect = element.getBoundingClientRect();
+                        return (
+                            style.display !== 'none' &&
+                            style.visibility !== 'hidden' &&
+                            rect.width > 0 &&
+                            rect.height > 0
+                        );
+                    }).slice(0, 8).map((element) => ({
+                        tag: normalize(element.tagName).toLowerCase(),
+                        id: normalize(element.id),
+                        text: normalize(element.textContent).slice(0, 80),
+                        dataState: normalize(element.getAttribute('data-state')),
+                        ariaExpanded: normalize(element.getAttribute('aria-expanded')),
+                    }));
+
+                    const bodyStyle = document.body
+                        ? window.getComputedStyle(document.body)
+                        : null;
+                    const htmlStyle = document.documentElement
+                        ? window.getComputedStyle(document.documentElement)
+                        : null;
+                    const bodyPointerEvents = normalize(bodyStyle?.pointerEvents || '');
+                    const htmlPointerEvents = normalize(htmlStyle?.pointerEvents || '');
+                    return {
+                        bodyPointerEvents,
+                        htmlPointerEvents,
+                        openControls: visibleOpenControls,
+                        ready: bodyPointerEvents.toLowerCase() !== 'none',
+                    };
+                }"""
+            )
+        except Exception as e:
+            Logger.debug(f"GLM Chat: failed to read pointer-events state: {e}")
+            return {"ready": True}
+
+        return state if isinstance(state, dict) else {"ready": True}
+
+    async def _ensure_glm_pointer_events_ready(
+        self,
+        *,
+        context: str = "GLM Chat",
+        timeout_ms: int | None = None,
+        send_escape: bool = True,
+    ) -> bool:
+        """Close stale popovers until GLM restores normal click hit-testing."""
+        if not self.page:
+            return False
+
+        timeout = int(timeout_ms or self._ui_timeout)
+        deadline = time.time() + max(0.0, float(timeout) / 1000.0)
+        last_state: dict[str, Any] = {}
+        last_escape_at = 0.0
+
+        while True:
+            last_state = await self._read_glm_pointer_events_state()
+            if last_state.get("ready"):
+                return True
+
+            now = time.time()
+            if send_escape and (last_escape_at <= 0.0 or (now - last_escape_at) >= 0.35):
+                try:
+                    await self.page.keyboard.press("Escape")
+                except Exception as e:
+                    Logger.debug(f"{context}: failed to press Escape while unblocking UI: {e}")
+                last_escape_at = now
+
+            if now >= deadline:
+                Logger.debug(
+                    f"{context}: UI still has body pointer-events='{last_state.get('bodyPointerEvents', '')}' "
+                    f"after {timeout}ms; open controls={last_state.get('openControls', [])}"
+                )
+                return False
+
+            await asyncio.sleep(0.1)
+
+    async def _click_glm_control(
+        self,
+        target: Any,
+        *,
+        label: str,
+        timeout_ms: int | None = None,
+        ensure_unblocked: bool = True,
+        evaluate_fallback: bool = True,
+    ) -> bool:
+        """Click a GLM control with fallbacks for transient overlay hit-test failures."""
+        if not self.page or target is None:
+            return False
+
+        timeout = int(timeout_ms or self._ui_timeout)
+        if ensure_unblocked:
+            await self._ensure_glm_pointer_events_ready(
+                context=f"GLM Chat: before clicking {label}",
+                timeout_ms=min(timeout, 1000),
+            )
+
+        try:
+            await target.scroll_into_view_if_needed(timeout=timeout)
+        except Exception:
+            pass
+
+        try:
+            await target.click(timeout=timeout)
+            return True
+        except Exception as e:
+            Logger.debug(f"GLM Chat: {label} click failed, trying fallbacks: {e}")
+
+        try:
+            await target.click(timeout=timeout, force=True)
+            return True
+        except Exception as e:
+            Logger.debug(f"GLM Chat: {label} forced click failed: {e}")
+
+        if not evaluate_fallback:
+            return False
+
+        try:
+            return bool(
+                await target.evaluate(
+                    """(element) => {
+                        if (!element) return false;
+                        element.click();
+                        return true;
+                    }"""
+                )
+            )
+        except Exception as e:
+            Logger.debug(f"GLM Chat: {label} DOM click fallback failed: {e}")
+            return False
 
     async def _read_glm_model_selector_state(self) -> dict[str, Any]:
         if not self.page:
@@ -488,7 +744,19 @@ class GLMDriver(BaseDriver):
         if not await self._click_glm_model_selector_button():
             return False
 
-        # Wait for the dropdown content to appear.
+        # Wait for the dropdown content to appear. The old dropdown had a fixed
+        # id, but the current Bits UI generates dynamic wrapper ids.
+        try:
+            await self.page.wait_for_selector(
+                self.MODEL_OPTION_SELECTOR,
+                timeout=int(timeout_ms),
+                state="visible",
+            )
+            return True
+        except Exception:
+            pass
+
+        # Legacy fallback for older GLM sessions.
         try:
             await self.page.wait_for_selector(
                 f"{self.MODEL_DROPDOWN_SELECTOR} button[data-value]",
@@ -507,9 +775,88 @@ class GLMDriver(BaseDriver):
             Logger.warning("GLM Chat: model dropdown did not appear after clicking the selector (this is usually very bad).")
             return False
 
+    async def _is_glm_model_dropdown_open(self) -> bool:
+        if not self.page:
+            return False
+
+        try:
+            return bool(
+                await self.page.evaluate(
+                    """(optionSelector) => {
+                        const isVisible = (element) => {
+                            if (!element) return false;
+                            const style = window.getComputedStyle(element);
+                            const rect = element.getBoundingClientRect();
+                            return (
+                                style.display !== 'none' &&
+                                style.visibility !== 'hidden' &&
+                                rect.width > 0 &&
+                                rect.height > 0
+                            );
+                        };
+
+                        const selector = document.querySelector('button.modelSelectorButton');
+                        const expanded = String(selector?.getAttribute('aria-expanded') || '')
+                            .trim()
+                            .toLowerCase();
+                        if (expanded === 'true') {
+                            return true;
+                        }
+
+                        return Array.from(document.querySelectorAll(optionSelector)).some(isVisible);
+                    }""",
+                    self.MODEL_OPTION_SELECTOR,
+                )
+            )
+        except Exception:
+            pass
+
+        try:
+            options = self.page.locator(self.MODEL_OPTION_SELECTOR)
+            count = await options.count()
+            for idx in range(min(count, 10)):
+                try:
+                    if await options.nth(idx).is_visible():
+                        return True
+                except Exception:
+                    continue
+        except Exception:
+            pass
+
+        return False
+
+    async def _wait_for_glm_model_dropdown_closed(self, timeout_ms: int | None = None) -> bool:
+        timeout = int(timeout_ms or self._ui_timeout)
+        deadline = time.time() + max(0.0, float(timeout) / 1000.0)
+
+        while True:
+            if not await self._is_glm_model_dropdown_open():
+                return True
+            if time.time() >= deadline:
+                return False
+            await asyncio.sleep(0.1)
+
     async def _close_glm_model_dropdown(self) -> None:
         if not self.page:
             return
+
+        if not await self._is_glm_model_dropdown_open():
+            await self._ensure_glm_pointer_events_ready(
+                context="GLM Chat: after model dropdown check",
+                timeout_ms=min(self._ui_timeout, 1000),
+            )
+            return
+
+        try:
+            await self.page.keyboard.press("Escape")
+            if await self._wait_for_glm_model_dropdown_closed(timeout_ms=self._ui_timeout):
+                await self._ensure_glm_pointer_events_ready(
+                    context="GLM Chat: after closing model dropdown",
+                    timeout_ms=self._ui_timeout,
+                )
+                return
+        except Exception:
+            pass
 
         button = self.page.locator(self.MODEL_SELECTOR_BUTTON_SELECTOR)
         if await button.count() == 0:
@@ -530,9 +877,14 @@ class GLMDriver(BaseDriver):
                 return
 
         try:
-            await self.page.wait_for_selector(self.MODEL_DROPDOWN_SELECTOR, timeout=self._ui_timeout, state="hidden")
+            await self._wait_for_glm_model_dropdown_closed(timeout_ms=self._ui_timeout)
         except Exception:
             return
+
+        await self._ensure_glm_pointer_events_ready(
+            context="GLM Chat: after closing model dropdown",
+            timeout_ms=self._ui_timeout,
+        )
 
     async def _expand_collapsible_section(self) -> bool:
         """Expand the model dropdown's More Models section when it is collapsed."""
@@ -573,14 +925,16 @@ class GLMDriver(BaseDriver):
             await self._expand_collapsible_section()
 
         option = self.page.locator(
-            f"{self.MODEL_DROPDOWN_SELECTOR} button[data-value='{safe_value}']"
+            f"button[aria-label='model-item'][data-value='{safe_value}'], "
+            f"div[role='menu'] button[data-value='{safe_value}']"
         )
         if await option.count() == 0:
             option = self.page.locator(f"button[data-value='{safe_value}']")
         if await option.count() == 0 and friendly_name not in self.MODELS_IN_COLLAPSIBLE:
             await self._expand_collapsible_section()
             option = self.page.locator(
-                f"{self.MODEL_DROPDOWN_SELECTOR} button[data-value='{safe_value}']"
+                f"button[aria-label='model-item'][data-value='{safe_value}'], "
+                f"div[role='menu'] button[data-value='{safe_value}']"
             )
             if await option.count() == 0:
                 option = self.page.locator(f"button[data-value='{safe_value}']")
@@ -609,7 +963,7 @@ class GLMDriver(BaseDriver):
         if not self.page:
             return None
 
-        options = self.page.locator(f"{self.MODEL_DROPDOWN_SELECTOR} button[data-value]")
+        options = self.page.locator(self.MODEL_OPTION_SELECTOR)
         if await options.count() == 0:
             options = self.page.locator("button[data-value]")
 
@@ -723,6 +1077,7 @@ class GLMDriver(BaseDriver):
 
         timeout = 0 if timeout_ms is None else int(timeout_ms)
         await self.page.wait_for_selector("textarea#chat-input, #chat-input", timeout=timeout, state="visible")
+        await self._dismiss_dialog_close_buttons()
 
     async def _wait_for_chat_shell_ready(self, timeout_ms: int | None = None) -> None:
         """
@@ -736,13 +1091,37 @@ class GLMDriver(BaseDriver):
         if not self.page:
             return
 
-        timeout = 0 if timeout_ms is None else int(timeout_ms)
-        await self.page.wait_for_selector(
+        shell_selector = (
             "textarea#chat-input, #chat-input, "
-            "button:has-text('Sign in'), a:has-text('Sign in'), [role='button']:has-text('Sign in')",
-            timeout=timeout,
-            state="visible",
+            "button:has-text('Sign in'), a:has-text('Sign in'), [role='button']:has-text('Sign in')"
         )
+        combined_selector = f"{shell_selector}, button[data-dialog-close]"
+        deadline = None if timeout_ms is None else time.time() + max(0.0, int(timeout_ms) / 1000.0)
+
+        while True:
+            timeout = 0
+            if deadline is not None:
+                remaining_ms = int(max(1.0, (deadline - time.time()) * 1000.0))
+                timeout = remaining_ms
+
+            await self.page.wait_for_selector(
+                combined_selector,
+                timeout=timeout,
+                state="visible",
+            )
+            await self._dismiss_dialog_close_buttons()
+
+            shell_controls = self.page.locator(shell_selector)
+            count = await shell_controls.count()
+            for idx in range(min(count, 10)):
+                try:
+                    if await shell_controls.nth(idx).is_visible():
+                        return
+                except Exception:
+                    continue
+
+            if deadline is not None and time.time() >= deadline:
+                raise TimeoutError("GLM Chat shell did not become ready before timeout.")
 
     async def login(self) -> None:
         """
@@ -755,6 +1134,7 @@ class GLMDriver(BaseDriver):
             await self.page.wait_for_load_state("domcontentloaded")
         except Exception:
             pass
+        await self._dismiss_dialog_close_buttons()
 
         # GLM shows an initial loading screen; auth UI is unreliable to detect until the
         # app transitions into its stable shell. Wait for composer/sign-in UI before checking auth
@@ -763,6 +1143,7 @@ class GLMDriver(BaseDriver):
         except Exception as e:
             # If the composer never appears (UI change / slow load), fall back to best-effort auth detection
             Logger.debug(f"GLM Chat: chat composer not detected before auth check: {e}")
+        await self._dismiss_dialog_close_buttons()
 
         needs_auth = await self._chat_page_contains_sign_in()
         if not needs_auth:
@@ -872,10 +1253,29 @@ class GLMDriver(BaseDriver):
             self.TOOLS_SUPPORTED_MODEL_FRIENDLY
         )
 
-    def _resolve_glm_request_settings(self, model: str, overrides: Optional[Dict[str, bool]] = None) -> Dict[str, bool]:
+    def _resolve_glm_deepthink_effort(
+        self,
+        ui_model_label: str,
+        *,
+        deepthink_enabled: bool,
+        overrides: Optional[Dict[str, Any]] = None,
+    ) -> str:
+        if not (deepthink_enabled and self._glm_uses_deepthink_effort_controls(ui_model_label)):
+            return ""
+
+        override = (overrides or {}).get("deepthink_effort")
+        value = override if override is not None else self._get_configured_glm_deepthink_effort()
+        return self._normalize_glm_deepthink_effort(value)
+
+    def _resolve_glm_request_settings(self, model: str, overrides: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         resolved_model = (model or "").strip() or "glm-auto"
         ui_model_label = self._get_glm_model_label_for_request(resolved_model)
         deepthink_enabled, send_deepthink = self._resolve_deepthink_flags(resolved_model)
+        deepthink_effort = self._resolve_glm_deepthink_effort(
+            ui_model_label,
+            deepthink_enabled=deepthink_enabled,
+            overrides=overrides,
+        )
         enable_search = bool(self.config_manager.get_setting("glm_behavior", "enable_search"))
         enable_advanced_search = bool(
             self.config_manager.get_setting("glm_behavior", "enable_advanced_search")
@@ -887,6 +1287,7 @@ class GLMDriver(BaseDriver):
         settings = {
             "model_label": ui_model_label,
             "deepthink_enabled": bool(deepthink_enabled),
+            "deepthink_effort": deepthink_effort,
             "send_deepthink": bool(send_deepthink),
             "search_enabled": bool(enable_search),
             "advanced_search_enabled": bool(enable_advanced_search),
@@ -898,16 +1299,30 @@ class GLMDriver(BaseDriver):
             for key in (
                 "deepthink_enabled",
                 "send_deepthink",
+                "deepthink_effort",
                 "search_enabled",
                 "advanced_search_enabled",
                 "tools_enabled",
                 "send_as_text_file",
             ):
+                if key == "deepthink_effort":
+                    if key in overrides:
+                        settings[key] = self._resolve_glm_deepthink_effort(
+                            ui_model_label,
+                            deepthink_enabled=bool(settings["deepthink_enabled"]),
+                            overrides=overrides,
+                        )
+                    continue
                 if key in overrides:
                     settings[key] = bool(overrides[key])
 
         if not tools_supported:
             settings["tools_enabled"] = False
+        if settings["deepthink_enabled"] and self._glm_uses_deepthink_effort_controls(ui_model_label):
+            if not settings["deepthink_effort"]:
+                settings["deepthink_effort"] = self._get_configured_glm_deepthink_effort()
+        else:
+            settings["deepthink_effort"] = ""
 
         if settings["advanced_search_enabled"] and not (
             settings["deepthink_enabled"] and settings["search_enabled"]
@@ -952,54 +1367,78 @@ class GLMDriver(BaseDriver):
         if not isinstance(state, dict):
             return None
 
-        required_keys = [key for key in self.CLEAN_REGEN_STATE_KEYS if key != "advanced_search_enabled"]
+        optional_keys = {"advanced_search_enabled", "deepthink_effort"}
+        required_keys = [key for key in self.CLEAN_REGEN_STATE_KEYS if key not in optional_keys]
         if not all(key in state for key in required_keys):
             return None
 
+        ui_model = str(state.get("ui_model") or "").strip()
+        deepthink_enabled = bool(state.get("deepthink_enabled"))
+        deepthink_effort = ""
+        if deepthink_enabled and self._glm_uses_deepthink_effort_controls(ui_model):
+            deepthink_effort = self._normalize_glm_deepthink_effort(
+                state.get("deepthink_effort"),
+                default=self.DEFAULT_GLM_52_DEEPTHINK_EFFORT,
+            )
+
         return {
-            "deepthink_enabled": bool(state.get("deepthink_enabled")),
+            "deepthink_enabled": deepthink_enabled,
+            "deepthink_effort": deepthink_effort,
             "search_enabled": bool(state.get("search_enabled")),
             "advanced_search_enabled": bool(state.get("advanced_search_enabled", False)),
             "tools_enabled": bool(state.get("tools_enabled")),
             "send_as_text_file": bool(state.get("send_as_text_file")),
-            "ui_model": str(state.get("ui_model") or "").strip(),
+            "ui_model": ui_model,
         }
 
     def _build_multi_slot_cache_state(
         self,
         *,
         effective_deepthink: bool,
+        deepthink_effort: str = "",
         enable_search: bool,
         enable_advanced_search: bool,
         enable_tools: bool,
         send_as_text_file: bool,
         ui_model_label: str | None = None,
     ) -> Dict[str, Any]:
+        normalized_ui_model = str(ui_model_label or self._get_glm_model_label_for_request(self.current_model))
+        normalized_effort = ""
+        if effective_deepthink and self._glm_uses_deepthink_effort_controls(normalized_ui_model):
+            normalized_effort = self._normalize_glm_deepthink_effort(deepthink_effort)
         return {
             "deepthink_enabled": bool(effective_deepthink),
+            "deepthink_effort": normalized_effort,
             "search_enabled": bool(enable_search),
             "advanced_search_enabled": bool(enable_advanced_search),
             "tools_enabled": bool(enable_tools),
             "send_as_text_file": bool(send_as_text_file),
-            "ui_model": str(ui_model_label or self._get_glm_model_label_for_request(self.current_model)),
+            "ui_model": normalized_ui_model,
         }
 
     async def _prepare_new_chat_request_ui(
         self,
         *,
         effective_deepthink: bool,
+        deepthink_effort: str = "",
         enable_search: bool,
         enable_advanced_search: bool,
         enable_tools: bool,
+        ui_model_label: str | None = None,
         log_label: str = "GLM Chat: preparing new chat session...",
     ) -> None:
         Logger.info(log_label)
+        await self._dismiss_dialog_close_buttons()
         await self.click_new_chat(source="auto")
         await asyncio.sleep(self._post_delay_s)
 
         await self.apply_configured_model(model=self.current_model, wait_until_ready=True)
-        await self.set_tools_state(bool(enable_tools))
-        await self.set_deepthink_state(bool(effective_deepthink))
+        await self.set_tools_state(bool(enable_tools), model_label=ui_model_label)
+        await self.set_deepthink_state(
+            bool(effective_deepthink),
+            effort=deepthink_effort,
+            model_label=ui_model_label,
+        )
         await self.set_search_state(bool(enable_search))
         await self.set_advanced_search_state(bool(enable_advanced_search))
         await asyncio.sleep(self._post_delay_s)
@@ -1080,7 +1519,15 @@ class GLMDriver(BaseDriver):
 
         capacity_error_message = self._extract_model_capacity_error_from_text(response_text)
         if not capacity_error_message:
-            return None
+            if self._glm_frontend_would_see_sse_data_event(response_text):
+                return None
+
+            empty_stream_message = self._build_empty_completion_stream_error_message()
+            Logger.warning(empty_stream_message)
+            await self._reload_chat_page(
+                f"empty completion stream (GLM Error code: {self.EMPTY_COMPLETION_STREAM_ERROR_CODE})"
+            )
+            return empty_stream_message
 
         Logger.warning(capacity_error_message)
         await self._refresh_page_after_capacity_error()
@@ -1090,9 +1537,11 @@ class GLMDriver(BaseDriver):
         self,
         *,
         effective_deepthink: bool,
+        deepthink_effort: str = "",
         enable_search: bool,
         enable_advanced_search: bool,
         enable_tools: bool,
+        ui_model_label: str | None = None,
         auto_delete_after_send: bool = False,
     ) -> str | None:
         Logger.info(
@@ -1101,9 +1550,11 @@ class GLMDriver(BaseDriver):
         )
         await self._prepare_new_chat_request_ui(
             effective_deepthink=effective_deepthink,
+            deepthink_effort=deepthink_effort,
             enable_search=enable_search,
             enable_advanced_search=enable_advanced_search,
             enable_tools=enable_tools,
+            ui_model_label=ui_model_label,
             log_label="Repetition Buster (GLM): opening throwaway chat...",
         )
         capacity_error_message = await self._send_text_request_with_capacity_guard(
@@ -1272,8 +1723,15 @@ class GLMDriver(BaseDriver):
                 return False
 
         try:
-            await self.set_tools_state(bool(multi_slot_state.get("tools_enabled")))
-            await self.set_deepthink_state(bool(multi_slot_state.get("deepthink_enabled")))
+            await self.set_tools_state(
+                bool(multi_slot_state.get("tools_enabled")),
+                model_label=str(multi_slot_state.get("ui_model") or ""),
+            )
+            await self.set_deepthink_state(
+                bool(multi_slot_state.get("deepthink_enabled")),
+                effort=str(multi_slot_state.get("deepthink_effort") or ""),
+                model_label=str(multi_slot_state.get("ui_model") or ""),
+            )
             await self.set_search_state(bool(multi_slot_state.get("search_enabled")))
             await self.set_advanced_search_state(bool(multi_slot_state.get("advanced_search_enabled")))
             await asyncio.sleep(self._post_delay_s)
@@ -1367,6 +1825,8 @@ class GLMDriver(BaseDriver):
         if not self.page:
             return
 
+        await self._dismiss_dialog_close_buttons()
+
         sidebar = self.page.locator("#sidebar")
         is_open = False
         try:
@@ -1456,6 +1916,8 @@ class GLMDriver(BaseDriver):
         Non-5V models no longer expose a Web Search aria-label wrapper. In that
         layout, Search is the unlabeled globe button immediately before the Deep
         Think toggle, while GLM-5V still has a separate Tools button in between.
+        GLM-5.2 can replace the old Deep Think wrapper with an effort menu, so
+        keep a composer-local ``button[data-active]`` fallback for that layout.
         """
         if not self.page:
             return None
@@ -1522,6 +1984,80 @@ class GLMDriver(BaseDriver):
                 return button
         except Exception as e:
             Logger.debug(f"GLM Chat: compact Search button lookup failed: {e}")
+
+        try:
+            handle = await self.page.evaluate_handle(
+                """() => {
+                    const isVisible = (element) => {
+                        if (!element) return false;
+                        const style = window.getComputedStyle(element);
+                        const rect = element.getBoundingClientRect();
+                        return (
+                            style.display !== 'none' &&
+                            style.visibility !== 'hidden' &&
+                            rect.width > 0 &&
+                            rect.height > 0
+                        );
+                    };
+
+                    const isExcludedButton = (button) => (
+                        button.id === 'upload-file-button' ||
+                        button.id === 'send-message-button' ||
+                        button.hasAttribute('data-autothink') ||
+                        button.closest('div[aria-label^="Deep think"]') ||
+                        button.closest('[aria-label="Send Message"]') ||
+                        button.closest('[aria-label^="Up to "]')
+                    );
+
+                    const inputs = Array.from(
+                        document.querySelectorAll('textarea#chat-input, #chat-input, textarea')
+                    ).filter(isVisible);
+
+                    for (const input of inputs) {
+                        const roots = [];
+                        const addRoot = (node) => {
+                            if (node && !roots.includes(node)) {
+                                roots.push(node);
+                            }
+                        };
+
+                        addRoot(input.closest('form'));
+                        let parent = input.parentElement;
+                        for (let depth = 0; parent && depth < 5; depth += 1) {
+                            addRoot(parent);
+                            parent = parent.parentElement;
+                        }
+
+                        const inputRect = input.getBoundingClientRect();
+                        for (const root of roots) {
+                            const candidates = Array.from(root.querySelectorAll('button[data-active]'))
+                                .filter((button) => {
+                                    if (!isVisible(button) || isExcludedButton(button)) {
+                                        return false;
+                                    }
+                                    const rect = button.getBoundingClientRect();
+                                    return rect.top >= inputRect.bottom - 16;
+                                })
+                                .sort((left, right) => {
+                                    const leftRect = left.getBoundingClientRect();
+                                    const rightRect = right.getBoundingClientRect();
+                                    return leftRect.left - rightRect.left;
+                                });
+
+                            if (candidates.length > 0) {
+                                return candidates[0];
+                            }
+                        }
+                    }
+
+                    return null;
+                }"""
+            )
+            button = handle.as_element()
+            if button:
+                return button
+        except Exception as e:
+            Logger.debug(f"GLM Chat: composer Search data-active lookup failed: {e}")
 
         return None
 
@@ -1620,22 +2156,254 @@ class GLMDriver(BaseDriver):
         """Find the Deep Think button by its aria-label wrapper."""
         return await self._find_composer_toggle_button("Deep think", state_attr="data-autothink")
 
+    async def _find_glm_52_deepthink_trigger(self):
+        """Find GLM-5.2's combined Deep Think effort menu trigger."""
+        if not self.page:
+            return None
+
+        try:
+            candidates = self.page.locator(
+                "div[aria-expanded][data-state][type='button']"
+            ).filter(has_text="Deep Think")
+            count = await candidates.count()
+        except Exception:
+            return None
+
+        for idx in range(min(count, 10)):
+            cand = candidates.nth(idx)
+            try:
+                if await cand.is_visible():
+                    return cand
+            except Exception:
+                pass
+
+        return candidates.first if count > 0 else None
+
+    async def _read_glm_52_deepthink_trigger_state(self, trigger: Any | None = None) -> dict[str, Any]:
+        button = trigger or await self._find_glm_52_deepthink_trigger()
+        if not button:
+            return {"exists": False, "enabled": False, "effort": ""}
+
+        try:
+            text = await button.inner_text()
+        except Exception:
+            text = ""
+
+        normalized = self._normalize_model_label(text)
+        enabled = "off" not in normalized
+        effort = ""
+        if enabled:
+            if "high" in normalized:
+                effort = "high"
+            elif "max" in normalized:
+                effort = "max"
+
+        return {
+            "exists": True,
+            "enabled": enabled,
+            "effort": effort,
+            "text": str(text or "").strip(),
+        }
+
+    async def _open_glm_52_deepthink_menu(self) -> bool:
+        if not self.page:
+            return False
+
+        trigger = await self._find_glm_52_deepthink_trigger()
+        if not trigger:
+            Logger.warning("GLM Chat: GLM-5.2 Deep Think effort menu not found.")
+            return False
+
+        try:
+            expanded = str((await trigger.get_attribute("aria-expanded")) or "").strip().lower()
+        except Exception:
+            expanded = ""
+
+        if expanded != "true":
+            await self._ensure_glm_pointer_events_ready(
+                context="GLM Chat: before opening GLM-5.2 Deep Think menu",
+                timeout_ms=min(self._ui_timeout, 1000),
+            )
+            try:
+                await trigger.click(timeout=self._ui_timeout)
+            except Exception as e:
+                Logger.warning(f"GLM Chat: failed to open GLM-5.2 Deep Think menu: {e}")
+                return False
+
+        try:
+            await self.page.wait_for_selector(
+                "div[role='menu'][data-state='open'] button[role='switch'][aria-checked]",
+                timeout=self._ui_timeout,
+                state="visible",
+            )
+            return True
+        except Exception:
+            Logger.warning("GLM Chat: GLM-5.2 Deep Think menu did not appear.")
+            return False
+
+    async def _close_glm_52_deepthink_menu(self) -> None:
+        if not self.page:
+            return
+        try:
+            await self.page.keyboard.press("Escape")
+        except Exception:
+            pass
+
+        if await self._ensure_glm_pointer_events_ready(
+            context="GLM Chat: closing GLM-5.2 Deep Think menu",
+            timeout_ms=self._ui_timeout,
+        ):
+            return
+
+        trigger = await self._find_glm_52_deepthink_trigger()
+        if not trigger:
+            return
+
+        try:
+            await trigger.evaluate(
+                """(element) => {
+                    if (!element) return;
+                    if (String(element.getAttribute('aria-expanded') || '').toLowerCase() === 'true') {
+                        element.click();
+                    }
+                }"""
+            )
+        except Exception as e:
+            Logger.debug(f"GLM Chat: DOM close for GLM-5.2 Deep Think menu failed: {e}")
+
+        await self._ensure_glm_pointer_events_ready(
+            context="GLM Chat: after DOM-closing GLM-5.2 Deep Think menu",
+            timeout_ms=self._ui_timeout,
+        )
+
+    async def _read_glm_52_deepthink_switch_enabled(self) -> bool:
+        if not self.page:
+            return False
+        switch = self.page.locator(
+            "div[role='menu'][data-state='open'] button[role='switch'][aria-checked]"
+        )
+        if await switch.count() == 0:
+            return False
+        try:
+            checked = await switch.first.get_attribute("aria-checked")
+            return str(checked or "").strip().lower() == "true"
+        except Exception:
+            return False
+
+    async def _click_glm_52_deepthink_switch(self) -> bool:
+        if not self.page:
+            return False
+        switch = self.page.locator(
+            "div[role='menu'][data-state='open'] button[role='switch'][aria-checked]"
+        )
+        if await switch.count() == 0:
+            return False
+        try:
+            await switch.first.click(timeout=self._ui_timeout)
+            return True
+        except Exception as e:
+            Logger.warning(f"GLM Chat: failed to toggle GLM-5.2 Deep Think switch: {e}")
+            return False
+
+    async def _select_glm_52_deepthink_effort(self, effort: str) -> bool:
+        if not self.page:
+            return False
+
+        desired = self._normalize_glm_deepthink_effort(effort)
+        label = "Max" if desired == "max" else "High"
+        menu = self.page.locator("div[role='menu'][data-state='open']")
+        option = menu.locator("button[type='button'][data-selected]").filter(has_text=label)
+        count = await option.count()
+        if count == 0:
+            Logger.warning(f"GLM Chat: GLM-5.2 Deep Think effort option '{label}' not found.")
+            return False
+
+        for idx in range(min(count, 5)):
+            cand = option.nth(idx)
+            try:
+                if await cand.is_visible():
+                    selected = str((await cand.get_attribute("data-selected")) or "").strip().lower()
+                    if selected == "true":
+                        return True
+                    await cand.click(timeout=self._ui_timeout)
+                    await asyncio.sleep(0.1)
+                    return True
+            except Exception:
+                continue
+
+        return False
+
+    async def _set_glm_52_deepthink_state(self, state: bool, effort: str | None = None) -> None:
+        desired_enabled = bool(state)
+        desired_effort = self._normalize_glm_deepthink_effort(
+            effort or self._get_configured_glm_deepthink_effort()
+        )
+
+        trigger = await self._find_glm_52_deepthink_trigger()
+        current = await self._read_glm_52_deepthink_trigger_state(trigger)
+        if not current.get("exists"):
+            Logger.warning("GLM Chat: GLM-5.2 Deep Think control not found.")
+            return
+
+        if not desired_enabled:
+            if not current.get("enabled"):
+                return
+        elif current.get("enabled") and current.get("effort") == desired_effort:
+            return
+
+        if not await self._open_glm_52_deepthink_menu():
+            return
+
+        try:
+            if desired_enabled:
+                if current.get("effort") != desired_effort:
+                    await self._select_glm_52_deepthink_effort(desired_effort)
+                    if not await self._open_glm_52_deepthink_menu():
+                        return
+                if not await self._read_glm_52_deepthink_switch_enabled():
+                    await self._click_glm_52_deepthink_switch()
+            else:
+                if await self._read_glm_52_deepthink_switch_enabled():
+                    await self._click_glm_52_deepthink_switch()
+        finally:
+            await self._close_glm_52_deepthink_menu()
+
     async def _find_search_button(self):
         """Find the Web Search button in the active GLM composer layout."""
-        if not self._glm_tools_supported_for_model(self._get_configured_glm_model_friendly()):
-            return await self._find_compact_search_button()
-
-        button = await self._find_composer_toggle_button("Web search", state_attr="data-active")
-        if button:
-            return button
-        return await self._find_composer_toggle_button("Web search", state_attr="data-selected")
+        if self._glm_tools_supported_for_model(self._get_configured_glm_model_friendly()):
+            button = await self._find_composer_toggle_button("Web search", state_attr="data-active")
+            if button:
+                return button
+            button = await self._find_composer_toggle_button("Web search", state_attr="data-selected")
+            if button:
+                return button
+        return await self._find_compact_search_button()
 
     async def _find_tools_button(self):
         """Find the Tools button by its aria-label wrapper."""
         return await self._find_composer_toggle_button("Tools", state_attr="data-selected")
 
-    async def set_deepthink_state(self, state: bool) -> None:
+    async def set_deepthink_state(
+        self,
+        state: bool,
+        *,
+        effort: str | None = None,
+        model_label: str | None = None,
+    ) -> None:
         if not self.page:
+            return
+
+        await self._dismiss_dialog_close_buttons()
+        await self._close_glm_model_dropdown()
+
+        effective_model_label = str(model_label or "").strip()
+        if not effective_model_label:
+            effective_model_label = await self._read_current_glm_model_label()
+        if not effective_model_label:
+            effective_model_label = self._get_configured_glm_model_friendly()
+
+        if self._glm_uses_deepthink_effort_controls(effective_model_label):
+            await self._set_glm_52_deepthink_state(state, effort=effort)
             return
 
         button = await self._find_deepthink_button()
@@ -1652,14 +2420,15 @@ class GLMDriver(BaseDriver):
         if is_enabled == state:
             return
 
-        try:
-            await button.click()
-        except Exception as e:
-            Logger.warning(f"GLM Chat: failed to toggle Deep Think: {e}")
+        if not await self._click_glm_control(button, label="Deep Think"):
+            Logger.warning("GLM Chat: failed to toggle Deep Think.")
 
     async def set_search_state(self, state: bool) -> None:
         if not self.page:
             return
+
+        await self._dismiss_dialog_close_buttons()
+        await self._close_glm_model_dropdown()
 
         button = await self._find_search_button()
         if not button:
@@ -1677,15 +2446,19 @@ class GLMDriver(BaseDriver):
         if is_enabled == state:
             return
 
-        try:
-            await button.click(timeout=self._ui_timeout)
-        except Exception as e:
-            Logger.warning(f"GLM Chat: failed to toggle Search: {e}")
+        if not await self._click_glm_control(button, label="Search"):
+            Logger.warning("GLM Chat: failed to toggle Search.")
 
     async def _find_advanced_search_switch(self, search_button: Any | None = None):
         """Find the Advanced Search switch that appears while Search is hovered."""
         if not self.page:
             return None
+
+        await self._close_glm_model_dropdown()
+        await self._ensure_glm_pointer_events_ready(
+            context="GLM Chat: before hovering Search for Advanced Search",
+            timeout_ms=min(self._ui_timeout, 1000),
+        )
 
         button = search_button or await self._find_search_button()
         if not button:
@@ -1755,6 +2528,40 @@ class GLMDriver(BaseDriver):
                             }
                         }
 
+                        const findSwitchNear = (label) => {
+                            let node = label;
+                            for (let depth = 0; node && depth < 6; depth += 1) {
+                                if (node.matches?.('button[aria-checked]') && isVisible(node)) {
+                                    return node;
+                                }
+
+                                const switchButton = Array.from(
+                                    node.querySelectorAll?.('button[aria-checked]') || []
+                                ).find(isVisible);
+                                if (switchButton) {
+                                    return switchButton;
+                                }
+
+                                node = node.parentElement;
+                            }
+
+                            return null;
+                        };
+
+                        const labels = Array.from(
+                            document.querySelectorAll('span, div, p, button')
+                        ).filter((node) => (
+                            isVisible(node) &&
+                            normalize(node.textContent) === 'advanced search'
+                        ));
+
+                        for (const label of labels) {
+                            const switchButton = findSwitchNear(label);
+                            if (switchButton) {
+                                return switchButton;
+                            }
+                        }
+
                         return null;
                     }"""
                 )
@@ -1772,6 +2579,7 @@ class GLMDriver(BaseDriver):
         if not self.page:
             return
 
+        await self._dismiss_dialog_close_buttons()
         switch_button = await self._find_advanced_search_switch()
         if not switch_button:
             if state:
@@ -1802,11 +2610,15 @@ class GLMDriver(BaseDriver):
         except Exception as e:
             Logger.debug(f"GLM Chat: failed to verify Advanced Search state: {e}")
 
-    async def set_tools_state(self, state: bool) -> None:
+    async def set_tools_state(self, state: bool, *, model_label: str | None = None) -> None:
         if not self.page:
             return
 
-        supported = self._glm_tools_supported_for_model(self._get_configured_glm_model_friendly())
+        await self._dismiss_dialog_close_buttons()
+        await self._close_glm_model_dropdown()
+
+        effective_model_label = str(model_label or "").strip() or self._get_configured_glm_model_friendly()
+        supported = self._glm_tools_supported_for_model(effective_model_label)
         wanted = bool(state) and supported
 
         button = await self._find_tools_button()
@@ -1824,10 +2636,8 @@ class GLMDriver(BaseDriver):
         if is_enabled == wanted:
             return
 
-        try:
-            await button.click(timeout=self._ui_timeout)
-        except Exception as e:
-            Logger.warning(f"GLM Chat: failed to toggle Tools: {e}")
+        if not await self._click_glm_control(button, label="Tools"):
+            Logger.warning("GLM Chat: failed to toggle Tools.")
 
     async def upload_file(self, file_spec: Any) -> None:
         await self._upload_file(file_spec)
@@ -1963,6 +2773,35 @@ class GLMDriver(BaseDriver):
         )
 
     @classmethod
+    def _build_empty_completion_stream_error_message(cls) -> str:
+        return (
+            "GLM Chat returned an empty completion stream "
+            f"(the condition GLM shows as Error code: {cls.EMPTY_COMPLETION_STREAM_ERROR_CODE}). "
+            "IntenseRP attempted to refresh the page; please retry the request."
+        )
+
+    @staticmethod
+    def _glm_frontend_would_see_sse_data_event(body: bytes | bytearray | str | None) -> bool:
+        """
+        Mirror GLM's own fallback check for Error code 20001.
+
+        GLM's frontend splits the decoded stream on LF/LF and only clears its
+        empty-stream fallback when a complete event block starts with "data:".
+        A trailing partial event is ignored by that code path, so we ignore it too.
+        """
+        if body is None:
+            return False
+        if isinstance(body, str):
+            raw = body.encode("utf-8", errors="ignore")
+        else:
+            raw = bytes(body)
+        if not raw:
+            return False
+
+        complete_events = raw.split(b"\n\n")[:-1]
+        return any(event.startswith(b"data:") for event in complete_events)
+
+    @classmethod
     def _extract_model_capacity_error_from_data(cls, data: Any) -> str | None:
         if not isinstance(data, dict):
             return None
@@ -2000,6 +2839,8 @@ class GLMDriver(BaseDriver):
         if not self.page:
             return
 
+        await self._close_glm_model_dropdown()
+
         send_button = self.page.locator("button#send-message-button")
         if await send_button.count() == 0:
             Logger.warning("GLM Chat: send button not found.")
@@ -2036,10 +2877,13 @@ class GLMDriver(BaseDriver):
                 pass
 
         for attempt in range(max_retries):
-            try:
-                await send_button.first.click()
-            except Exception as e:
-                Logger.debug(f"GLM Chat: send button click failed: {e}")
+            clicked = await self._click_glm_control(
+                send_button.first,
+                label="send button",
+                timeout_ms=max(int(getattr(self, "_ui_timeout", 3000)), 3000),
+            )
+            if not clicked:
+                Logger.debug("GLM Chat: send button click failed.")
                 await asyncio.sleep(0.4)
                 continue
 
@@ -2292,6 +3136,18 @@ class GLMDriver(BaseDriver):
         intercepted_response: httpx.Response | None = None
         intercepted_request_abort = asyncio.Event()
         intercepted_request_finished = asyncio.Event()
+        request_capture_mode = self._get_request_capture_mode()
+        use_cdp_teeing = request_capture_mode == self.REQUEST_CAPTURE_MODE_CDP_TEEING
+        route_handlers_registered = False
+        cdp_session: Any = None
+        cdp_listeners_registered = False
+        cdp_tasks: set[asyncio.Task] = set()
+        request_methods: dict[str, str] = {}
+        cdp_pending_response_urls: dict[str, str] = {}
+        cdp_active_request_id: Optional[str] = None
+        cdp_stream_started = False
+        cdp_stream_finished = False
+        cdp_had_data = False
 
         def get_intercepted_activity_count() -> int:
             return intercepted_activity_count
@@ -2331,8 +3187,11 @@ class GLMDriver(BaseDriver):
         if macros_overrides:
             Logger.debug(f"GLM macros applied: {macros_overrides}")
 
-        effective_settings = self._resolve_glm_request_settings(resolved_model, overrides=macros_overrides)
+        request_overrides = dict(getattr(self, "_pending_request_overrides", {}) or {})
+        request_overrides.update(macros_overrides)
+        effective_settings = self._resolve_glm_request_settings(resolved_model, overrides=request_overrides)
         effective_deepthink = effective_settings["deepthink_enabled"]
+        deepthink_effort = str(effective_settings.get("deepthink_effort") or "").strip()
         effective_send_deepthink = effective_settings["send_deepthink"]
         enable_search = effective_settings["search_enabled"]
         enable_advanced_search = effective_settings["advanced_search_enabled"]
@@ -2361,6 +3220,7 @@ class GLMDriver(BaseDriver):
                 "model": resolved_model,
                 "ui_model": ui_model_label,
                 "deepthink_enabled": bool(effective_deepthink),
+                "deepthink_effort": deepthink_effort,
                 "send_deepthink": bool(effective_send_deepthink),
                 "search_enabled": bool(enable_search),
                 "advanced_search_enabled": bool(enable_advanced_search),
@@ -2425,22 +3285,344 @@ class GLMDriver(BaseDriver):
         if repetition_buster_enabled and prompt_matches_last:
             repetition_buster_error = await self._run_repetition_buster(
                 effective_deepthink=bool(effective_deepthink),
+                deepthink_effort=deepthink_effort,
                 enable_search=bool(enable_search),
                 enable_advanced_search=bool(enable_advanced_search),
                 enable_tools=bool(enable_tools),
+                ui_model_label=ui_model_label,
                 auto_delete_after_send=auto_delete_enabled,
             )
             if repetition_buster_error:
                 self._reset_generation_state()
+                self._pending_request_overrides = {}
                 yield f"data: {json.dumps({'error': repetition_buster_error})}\n\n"
                 return
 
+        full_response_body = bytearray()
+        text_buffer = bytearray()
+        text_buffer_pos = 0
+        thinking_emitted = IncrementalTextAccumulator()
+        answer_emitted = False
+        glm_block_active = False
+        emitted_openai_chunk = False
+        openai_usage: dict[str, Any] | None = None
+        openai_usage_emitted = False
+        openai_finish_emitted = False
+        capacity_error_message: str | None = None
+
+        try:
+            count_tokens_setting = self.config_manager.get_setting("glm_behavior", "count_tokens")
+        except Exception:
+            count_tokens_setting = None
+        # Default to enabled, even if the setting isn't present (older configs).
+        count_tokens_enabled = True if count_tokens_setting is None else bool(count_tokens_setting)
+
+        def request_aborted() -> bool:
+            return bool(
+                intercepted_request_abort.is_set()
+                or self.abort_requested
+                or (abort_event and abort_event.is_set())
+            )
+
+        def _normalize_openai_usage(raw: Any) -> dict[str, Any] | None:
+            if not isinstance(raw, dict):
+                return None
+
+            def _to_int(value: Any) -> int | None:
+                try:
+                    return int(value)
+                except Exception:
+                    return None
+
+            prompt_tokens = _to_int(raw.get("prompt_tokens"))
+            completion_tokens = _to_int(raw.get("completion_tokens"))
+            total_tokens = _to_int(raw.get("total_tokens"))
+
+            if prompt_tokens is None and completion_tokens is None and total_tokens is None:
+                return None
+
+            prompt_tokens = 0 if prompt_tokens is None else max(prompt_tokens, 0)
+            completion_tokens = 0 if completion_tokens is None else max(completion_tokens, 0)
+            if total_tokens is None:
+                total_tokens = prompt_tokens + completion_tokens
+            else:
+                total_tokens = max(total_tokens, 0)
+
+            usage: dict[str, Any] = {
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": completion_tokens,
+                "total_tokens": total_tokens,
+            }
+
+            prompt_details = raw.get("prompt_tokens_details")
+            if isinstance(prompt_details, dict):
+                usage["prompt_tokens_details"] = prompt_details
+
+            completion_details = raw.get("completion_tokens_details")
+            if isinstance(completion_details, dict):
+                usage["completion_tokens_details"] = completion_details
+
+            return usage
+
+        def enqueue_openai_delta(content: str, finish_reason: str | None = None) -> None:
+            nonlocal emitted_openai_chunk
+            if (not content) and (not finish_reason):
+                return
+            model_name = self.current_model or "glm-auto"
+            response_queue.put_nowait(
+                make_openai_delta_sse(
+                    model_name,
+                    content,
+                    finish_reason=finish_reason,
+                )
+            )
+            emitted_openai_chunk = True
+
+        def enqueue_openai_usage(usage: dict[str, Any]) -> None:
+            nonlocal emitted_openai_chunk, openai_usage_emitted
+            if openai_usage_emitted:
+                return
+
+            model_name = self.current_model or "glm-auto"
+            response_queue.put_nowait(make_openai_usage_sse(model_name, usage))
+            emitted_openai_chunk = True
+            openai_usage_emitted = True
+
+        def process_sse_line(line: str) -> None:
+            nonlocal thinking_emitted, answer_emitted, glm_block_active, openai_usage
+            nonlocal openai_finish_emitted, capacity_error_message
+            line = line.strip()
+            if not line.startswith("data:"):
+                return
+
+            data_str = line[len("data:") :].strip()
+            if not data_str or data_str == "[DONE]":
+                return
+
+            try:
+                payload = json.loads(data_str)
+            except Exception:
+                return
+
+            if not isinstance(payload, dict):
+                return
+
+            payload_type = str(payload.get("type") or "").strip().lower()
+            # Regeneration can use the same endpoint with slightly different type labels.
+            if not payload_type.startswith("chat:completion"):
+                return
+
+            data = payload.get("data")
+            if not isinstance(data, dict):
+                return
+
+            capacity_error_message = self._extract_model_capacity_error_from_data(data)
+            if capacity_error_message:
+                return
+
+            phase = str(data.get("phase") or "").strip().lower()
+
+            if count_tokens_enabled:
+                normalized_usage = _normalize_openai_usage(data.get("usage"))
+                if normalized_usage:
+                    openai_usage = normalized_usage
+
+            if phase == "done" and bool(data.get("done")):
+                if not openai_finish_emitted:
+                    if self.thinking_active and self.current_send_deepthink:
+                        enqueue_openai_delta("</think>")
+                        self.thinking_active = False
+                    enqueue_openai_delta("", finish_reason="stop")
+                    openai_finish_emitted = True
+                return
+
+            delta_content = data.get("delta_content")
+            edit_content = data.get("edit_content")
+
+            if isinstance(delta_content, str):
+                if phase == "thinking":
+                    if not self.current_send_deepthink:
+                        return
+                    if not self.thinking_active:
+                        enqueue_openai_delta("<think>")
+                        self.thinking_active = True
+                    stripped = self._strip_details_tags(delta_content)
+                    if stripped:
+                        enqueue_openai_delta(stripped)
+                        thinking_emitted.append(stripped)
+                    return
+
+                if phase == "answer":
+                    if self.thinking_active and self.current_send_deepthink:
+                        enqueue_openai_delta("</think>")
+                        self.thinking_active = False
+                    enqueue_openai_delta(delta_content)
+                    answer_emitted = True
+                    return
+
+                return
+
+            if isinstance(edit_content, str):
+                edit_content, glm_block_active = self._strip_glm_blocks_from_stream_chunk(
+                    edit_content, glm_block_active
+                )
+
+                # When thinking is enabled, GLM often sends a huge edit_content that includes the full
+                # <details> reasoning plus the first token(s) of the answer. Extract only the answer tail.
+                if phase == "answer":
+                    if self.current_send_deepthink and (self.thinking_active or not answer_emitted):
+                        reasoning = self._extract_reasoning_from_edit_content(edit_content)
+                        if reasoning:
+                            missing = thinking_emitted.missing_suffix(reasoning)
+                            if missing:
+                                if not self.thinking_active:
+                                    enqueue_openai_delta("<think>")
+                                    self.thinking_active = True
+                                enqueue_openai_delta(missing)
+                                thinking_emitted.append(missing)
+
+                    if self.thinking_active and self.current_send_deepthink:
+                        enqueue_openai_delta("</think>")
+                        self.thinking_active = False
+                    tail = self._extract_answer_tail_from_edit_content(edit_content)
+                    if tail:
+                        enqueue_openai_delta(tail)
+                        answer_emitted = True
+                    return
+
+                # GLM sometimes finalizes the answer with an "other" edit_content frame (tail append).
+                if phase == "other":
+                    if self.thinking_active and self.current_send_deepthink:
+                        enqueue_openai_delta("</think>")
+                        self.thinking_active = False
+                    if edit_content:
+                        enqueue_openai_delta(edit_content)
+                        answer_emitted = True
+                    return
+
+                # At this point answer content may already be streaming via delta_content; only
+                # treat tool_call edit_content as answer tail if we've already emitted answer.
+                if phase == "tool_call":
+                    if self.thinking_active and self.current_send_deepthink:
+                        enqueue_openai_delta("</think>")
+                        self.thinking_active = False
+                    if answer_emitted and edit_content:
+                        enqueue_openai_delta(edit_content)
+                        answer_emitted = True
+                    return
+
+        def process_glm_stream_chunk(chunk: bytes) -> None:
+            nonlocal intercepted_activity_count, text_buffer_pos
+            if not chunk:
+                return
+
+            intercepted_activity_count += 1
+            full_response_body.extend(chunk)
+            if capacity_error_message:
+                return
+
+            text_buffer.extend(chunk)
+
+            while True:
+                newline_idx = text_buffer.find(b"\n", text_buffer_pos)
+                if newline_idx == -1:
+                    break
+
+                line_bytes = text_buffer[text_buffer_pos:newline_idx]
+                text_buffer_pos = newline_idx + 1
+                try:
+                    process_sse_line(bytes(line_bytes).decode("utf-8", errors="ignore"))
+                except Exception:
+                    continue
+                if capacity_error_message:
+                    break
+
+            if text_buffer_pos > 8192:
+                del text_buffer[:text_buffer_pos]
+                text_buffer_pos = 0
+
+        def finalize_glm_stream_processing(*, aborted: bool = False) -> None:
+            nonlocal text_buffer_pos
+            if not capacity_error_message:
+                tail = bytes(text_buffer[text_buffer_pos:])
+                if tail.strip():
+                    try:
+                        process_sse_line(tail.decode("utf-8", errors="ignore"))
+                    except Exception:
+                        pass
+            text_buffer.clear()
+            text_buffer_pos = 0
+
+            if (
+                (not aborted)
+                and (not request_aborted())
+                and (not capacity_error_message)
+                and count_tokens_enabled
+                and (openai_usage is not None)
+                and (not openai_usage_emitted)
+            ):
+                enqueue_openai_usage(openai_usage)
+
+        async def finish_glm_stream_result(
+            *,
+            aborted: bool = False,
+            encountered_error: bool = False,
+        ) -> None:
+            if aborted or request_aborted():
+                Logger.warning("GLM Chat generation was aborted before completion.")
+
+            should_report_empty_stream_error = bool(
+                (not aborted)
+                and (not encountered_error)
+                and (not request_aborted())
+                and (not capacity_error_message)
+                and (not emitted_openai_chunk)
+            )
+
+            if capacity_error_message:
+                Logger.warning(capacity_error_message)
+                await self._refresh_page_after_capacity_error()
+                response_queue.put_nowait(
+                    f"data: {json.dumps({'error': capacity_error_message})}\n\n"
+                )
+            elif should_report_empty_stream_error:
+                msg = self._extract_model_capacity_error_from_text(
+                    full_response_body.decode("utf-8", errors="ignore")
+                )
+                if msg:
+                    await self._refresh_page_after_capacity_error()
+                if not msg:
+                    if self._glm_frontend_would_see_sse_data_event(full_response_body):
+                        # Surface a helpful error instead of silently returning an empty stream.
+                        msg = (
+                            "GLM Chat: intercepted completion produced no streamable output. "
+                            "This may indicate a GLM API / frontend change."
+                        )
+                    else:
+                        msg = self._build_empty_completion_stream_error_message()
+                        await self._reload_chat_page(
+                            "empty completion stream "
+                            f"(GLM Error code: {self.EMPTY_COMPLETION_STREAM_ERROR_CODE})"
+                        )
+                Logger.warning(msg)
+                response_queue.put_nowait(f"data: {json.dumps({'error': msg})}\n\n")
+
+            await response_queue.put(None)
+            intercepted_request_finished.set()
+            if (
+                not aborted
+                and (not encountered_error)
+                and (not request_aborted())
+                and (not capacity_error_message)
+            ):
+                Logger.success("GLM Chat response streaming completed.")
+
         async def handle_route(route):
-            nonlocal completion_claimed, intercepted_activity_count, intercepted_response
+            nonlocal completion_claimed, intercepted_response
             request = route.request
 
-            # Ignore preflight and any requests we aren't actively expecting to stream.
-            # GLM can sometimes fire background requests to the same endpoint.
+            # Ignore preflight and any requests we aren't actively expecting to stream
+            # GLM can sometimes fire background requests to the same endpoint
             try:
                 method = str(request.method or "").upper()
             except Exception:
@@ -2471,214 +3653,8 @@ class GLMDriver(BaseDriver):
             cookie_dict = {c["name"]: c["value"] for c in cookies}
 
             response_headers: Dict[str, str] = {}
-            full_response_body = bytearray()
             aborted = False
-            text_buffer = bytearray()
-            text_buffer_pos = 0
-            thinking_emitted = IncrementalTextAccumulator()
-            answer_emitted = False
-            glm_block_active = False
-            emitted_openai_chunk = False
-            openai_usage: dict[str, Any] | None = None
-            openai_usage_emitted = False
-            openai_finish_emitted = False
-            capacity_error_message: str | None = None
-
-            try:
-                count_tokens_setting = self.config_manager.get_setting("glm_behavior", "count_tokens")
-            except Exception:
-                count_tokens_setting = None
-            # Default to enabled, even if the setting isn't present (older configs)
-            count_tokens_enabled = True if count_tokens_setting is None else bool(count_tokens_setting)
-
-            def _normalize_openai_usage(raw: Any) -> dict[str, Any] | None:
-                if not isinstance(raw, dict):
-                    return None
-
-                def _to_int(value: Any) -> int | None:
-                    try:
-                        return int(value)
-                    except Exception:
-                        return None
-
-                prompt_tokens = _to_int(raw.get("prompt_tokens"))
-                completion_tokens = _to_int(raw.get("completion_tokens"))
-                total_tokens = _to_int(raw.get("total_tokens"))
-
-                if prompt_tokens is None and completion_tokens is None and total_tokens is None:
-                    return None
-
-                prompt_tokens = 0 if prompt_tokens is None else max(prompt_tokens, 0)
-                completion_tokens = 0 if completion_tokens is None else max(completion_tokens, 0)
-                if total_tokens is None:
-                    total_tokens = prompt_tokens + completion_tokens
-                else:
-                    total_tokens = max(total_tokens, 0)
-
-                usage: dict[str, Any] = {
-                    "prompt_tokens": prompt_tokens,
-                    "completion_tokens": completion_tokens,
-                    "total_tokens": total_tokens,
-                }
-
-                prompt_details = raw.get("prompt_tokens_details")
-                if isinstance(prompt_details, dict):
-                    usage["prompt_tokens_details"] = prompt_details
-
-                completion_details = raw.get("completion_tokens_details")
-                if isinstance(completion_details, dict):
-                    usage["completion_tokens_details"] = completion_details
-
-                return usage
-
-            def enqueue_openai_delta(content: str, finish_reason: str | None = None) -> None:
-                nonlocal emitted_openai_chunk
-                if (not content) and (not finish_reason):
-                    return
-                model_name = self.current_model or "glm-auto"
-                response_queue.put_nowait(
-                    make_openai_delta_sse(
-                        model_name,
-                        content,
-                        finish_reason=finish_reason,
-                    )
-                )
-                emitted_openai_chunk = True
-
-            def enqueue_openai_usage(usage: dict[str, Any]) -> None:
-                nonlocal emitted_openai_chunk, openai_usage_emitted
-                if openai_usage_emitted:
-                    return
-
-                model_name = self.current_model or "glm-auto"
-                response_queue.put_nowait(make_openai_usage_sse(model_name, usage))
-                emitted_openai_chunk = True
-                openai_usage_emitted = True
-
-            def process_sse_line(line: str) -> None:
-                nonlocal thinking_emitted, answer_emitted, glm_block_active, openai_usage
-                nonlocal openai_finish_emitted, capacity_error_message
-                line = line.strip()
-                if not line.startswith("data:"):
-                    return
-
-                data_str = line[len("data:") :].strip()
-                if not data_str or data_str == "[DONE]":
-                    return
-
-                try:
-                    payload = json.loads(data_str)
-                except Exception:
-                    return
-
-                if not isinstance(payload, dict):
-                    return
-
-                payload_type = str(payload.get("type") or "").strip().lower()
-                # Regeneration can use the same endpoint with slightly different type labels.
-                if not payload_type.startswith("chat:completion"):
-                    return
-
-                data = payload.get("data")
-                if not isinstance(data, dict):
-                    return
-
-                capacity_error_message = self._extract_model_capacity_error_from_data(data)
-                if capacity_error_message:
-                    return
-
-                phase = str(data.get("phase") or "").strip().lower()
-
-                if count_tokens_enabled:
-                    normalized_usage = _normalize_openai_usage(data.get("usage"))
-                    if normalized_usage:
-                        openai_usage = normalized_usage
-
-                if phase == "done" and bool(data.get("done")):
-                    if not openai_finish_emitted:
-                        if self.thinking_active and self.current_send_deepthink:
-                            enqueue_openai_delta("</think>")
-                            self.thinking_active = False
-                        enqueue_openai_delta("", finish_reason="stop")
-                        openai_finish_emitted = True
-                    return
-
-                delta_content = data.get("delta_content")
-                edit_content = data.get("edit_content")
-
-                if isinstance(delta_content, str):
-                    if phase == "thinking":
-                        if not self.current_send_deepthink:
-                            return
-                        if not self.thinking_active:
-                            enqueue_openai_delta("<think>")
-                            self.thinking_active = True
-                        stripped = self._strip_details_tags(delta_content)
-                        if stripped:
-                            enqueue_openai_delta(stripped)
-                            thinking_emitted.append(stripped)
-                        return
-
-                    if phase == "answer":
-                        if self.thinking_active and self.current_send_deepthink:
-                            enqueue_openai_delta("</think>")
-                            self.thinking_active = False
-                        enqueue_openai_delta(delta_content)
-                        answer_emitted = True
-                        return
-
-                    return
-
-                if isinstance(edit_content, str):
-                    edit_content, glm_block_active = self._strip_glm_blocks_from_stream_chunk(
-                        edit_content, glm_block_active
-                    )
-
-                    # When thinking is enabled, GLM often sends a huge edit_content that includes the full
-                    # <details> reasoning plus the first token(s) of the answer. Extract only the answer tail
-                    if phase == "answer":
-                        if self.current_send_deepthink and (self.thinking_active or not answer_emitted):
-                            reasoning = self._extract_reasoning_from_edit_content(edit_content)
-                            if reasoning:
-                                missing = thinking_emitted.missing_suffix(reasoning)
-                                if missing:
-                                    if not self.thinking_active:
-                                        enqueue_openai_delta("<think>")
-                                        self.thinking_active = True
-                                    enqueue_openai_delta(missing)
-                                    thinking_emitted.append(missing)
-
-                        if self.thinking_active and self.current_send_deepthink:
-                            enqueue_openai_delta("</think>")
-                            self.thinking_active = False
-                        tail = self._extract_answer_tail_from_edit_content(edit_content)
-                        if tail:
-                            enqueue_openai_delta(tail)
-                            answer_emitted = True
-                        return
-
-                    # GLM sometimes finalizes the answer with an "other" edit_content frame (tail append)
-                    # If we ignore this, the client can miss the last chunk of the message
-                    # So we handle it here
-                    if phase == "other":
-                        if self.thinking_active and self.current_send_deepthink:
-                            enqueue_openai_delta("</think>")
-                            self.thinking_active = False
-                        if edit_content:
-                            enqueue_openai_delta(edit_content)
-                            answer_emitted = True
-                        return
-
-                    # At this point answer content may already be streaming via delta_content; only
-                    # treat tool_call edit_content as answer tail if we've already emitted answer
-                    if phase == "tool_call":
-                        if self.thinking_active and self.current_send_deepthink:
-                            enqueue_openai_delta("</think>")
-                            self.thinking_active = False
-                        if answer_emitted and edit_content:
-                            enqueue_openai_delta(edit_content)
-                            answer_emitted = True
-                        return
+            encountered_error = False
 
             try:
                 json_body = None
@@ -2711,75 +3687,25 @@ class GLMDriver(BaseDriver):
                             response_headers[k] = v
 
                         async for chunk in response.aiter_bytes():
-                            intercepted_activity_count += 1
-                            if (
-                                intercepted_request_abort.is_set()
-                                or self.abort_requested
-                                or (abort_event and abort_event.is_set())
-                            ):
+                            if request_aborted():
                                 Logger.debug("Abort detected during GLM streaming, stopping...")
                                 aborted = True
                                 break
 
-                            full_response_body.extend(chunk)
-                            text_buffer.extend(chunk)
-
-                            while True:
-                                newline_idx = text_buffer.find(b"\n", text_buffer_pos)
-                                if newline_idx == -1:
-                                    break
-
-                                line_bytes = text_buffer[text_buffer_pos:newline_idx]
-                                text_buffer_pos = newline_idx + 1
-                                try:
-                                    process_sse_line(
-                                        bytes(line_bytes).decode("utf-8", errors="ignore")
-                                    )
-                                except Exception:
-                                    continue
-                                if capacity_error_message:
-                                    break
-
+                            process_glm_stream_chunk(chunk)
                             if capacity_error_message:
                                 break
 
-                            # Periodically compact the buffer to avoid unbounded growth
-                            if text_buffer_pos > 8192:
-                                del text_buffer[:text_buffer_pos]
-                                text_buffer_pos = 0
-
-                        # Flush any final SSE line if the stream didn't end with a newline
                         if not capacity_error_message:
-                            tail = bytes(text_buffer[text_buffer_pos:])
-                            if tail.strip():
-                                process_sse_line(tail.decode("utf-8", errors="ignore"))
-                        text_buffer.clear()
-                        text_buffer_pos = 0
-
-                        if (
-                            (not aborted)
-                            and (not intercepted_request_abort.is_set())
-                            and (not self.abort_requested)
-                            and (not capacity_error_message)
-                            and count_tokens_enabled
-                            and (openai_usage is not None)
-                            and (not openai_usage_emitted)
-                        ):
-                            enqueue_openai_usage(openai_usage)
+                            finalize_glm_stream_processing(aborted=aborted)
                 except httpx.ReadError as e:
-                    if (
-                        not aborted
-                        and (not intercepted_request_abort.is_set())
-                        and not self.abort_requested
-                    ):
+                    if not aborted and not request_aborted():
+                        encountered_error = True
                         Logger.error(f"Read error during GLM intercepted request: {e}")
                         response_queue.put_nowait(f"data: {json.dumps({'error': str(e)})}\n\n")
                 except Exception as e:
-                    if (
-                        not aborted
-                        and (not intercepted_request_abort.is_set())
-                        and not self.abort_requested
-                    ):
+                    if not aborted and not request_aborted():
+                        encountered_error = True
                         Logger.error(f"Error during GLM intercepted request: {e}")
                         response_queue.put_nowait(f"data: {json.dumps({'error': str(e)})}\n\n")
             except RuntimeError as e:
@@ -2790,66 +3716,257 @@ class GLMDriver(BaseDriver):
             finally:
                 intercepted_response = None
 
-            if aborted or intercepted_request_abort.is_set() or self.abort_requested:
-                Logger.warning("GLM Chat generation was aborted before completion.")
-
-            should_report_empty_stream_error = bool(
-                (not aborted)
-                and (not intercepted_request_abort.is_set())
-                and (not self.abort_requested)
-                and (not capacity_error_message)
-                and (not emitted_openai_chunk)
-            )
-
-            if (
-                aborted or intercepted_request_abort.is_set() or self.abort_requested
-            ):
+            if aborted or request_aborted():
                 try:
                     await route.abort()
                 except Exception as e:
                     Logger.error(f"GLM Chat: error finalizing route: {e}")
             else:
                 try:
-                    await route.fulfill(body=bytes(full_response_body), status=200, headers=response_headers)
+                    await route.fulfill(
+                        body=bytes(full_response_body),
+                        status=200,
+                        headers=response_headers,
+                    )
                 except Exception as e:
                     Logger.error(f"GLM Chat: error finalizing route: {e}")
 
-            if capacity_error_message:
-                Logger.warning(capacity_error_message)
-                await self._refresh_page_after_capacity_error()
-                response_queue.put_nowait(f"data: {json.dumps({'error': capacity_error_message})}\n\n")
-            elif should_report_empty_stream_error:
-                msg = self._extract_model_capacity_error_from_text(
-                    full_response_body.decode("utf-8", errors="ignore")
-                )
-                if msg:
-                    await self._refresh_page_after_capacity_error()
-                if not msg:
-                    # Surface a helpful error instead of silently returning an empty stream.
-                    msg = (
-                        "GLM Chat: intercepted completion produced no streamable output. "
-                        "This may indicate a GLM API / frontend change."
-                    )
-                Logger.warning(msg)
-                response_queue.put_nowait(f"data: {json.dumps({'error': msg})}\n\n")
+            await finish_glm_stream_result(
+                aborted=aborted,
+                encountered_error=encountered_error,
+            )
 
-            await response_queue.put(None)
-            intercepted_request_finished.set()
+        def _schedule_cdp_task(coro: Any, label: str) -> None:
+            try:
+                task = asyncio.create_task(coro)
+            except Exception as exc:
+                Logger.debug(f"GLM Chat: failed to schedule CDP handler for {label}: {exc}")
+                return
+
+            cdp_tasks.add(task)
+
+            def _on_done(done_task: asyncio.Task) -> None:
+                cdp_tasks.discard(done_task)
+                try:
+                    done_task.exception()
+                except asyncio.CancelledError:
+                    pass
+                except Exception as exc:
+                    Logger.debug(f"GLM Chat: CDP handler for {label} failed: {exc}")
+
+            task.add_done_callback(_on_done)
+
+        async def finish_cdp_stream(
+            request_id: str,
+            *,
+            aborted: bool = False,
+            encountered_error: bool = False,
+        ) -> None:
+            nonlocal cdp_stream_finished
+            if request_id != cdp_active_request_id or cdp_stream_finished:
+                return
+
+            cdp_stream_finished = True
+            if not aborted and not encountered_error:
+                finalize_glm_stream_processing(aborted=False)
+
+            await finish_glm_stream_result(
+                aborted=aborted,
+                encountered_error=encountered_error,
+            )
+            request_methods.pop(request_id, None)
+            cdp_pending_response_urls.pop(request_id, None)
+
+        async def feed_cdp_stream_chunk(request_id: str, data: bytes) -> None:
+            nonlocal cdp_had_data
+            if request_id != cdp_active_request_id or not data or cdp_stream_finished:
+                return
+
+            cdp_had_data = True
+            if request_aborted():
+                await finish_cdp_stream(request_id, aborted=True)
+                return
+
+            process_glm_stream_chunk(data)
+            if request_aborted():
+                await finish_cdp_stream(request_id, aborted=True)
+
+        async def feed_base64_cdp_stream_chunk(request_id: str, encoded_data: Any) -> None:
+            if not encoded_data:
+                return
+            encoded_text = str(encoded_data)
+            try:
+                data = base64.b64decode(encoded_text, validate=True)
+            except Exception:
+                data = encoded_text.encode("utf-8", errors="ignore")
+            await feed_cdp_stream_chunk(request_id, data)
+
+        async def start_cdp_stream(request_id: str, url: str) -> None:
+            nonlocal cdp_stream_started
             if (
-                not aborted
-                and (not intercepted_request_abort.is_set())
-                and not self.abort_requested
-                and (not capacity_error_message)
+                request_id != cdp_active_request_id
+                or not cdp_session
+                or cdp_stream_started
+                or cdp_stream_finished
             ):
-                Logger.success("GLM Chat response streaming completed.")
+                return
+
+            cdp_stream_started = True
+            Logger.info("Teeing GLM Chat API response via CDP...")
+            Logger.debug(f"Teeing request to: {url}")
+            try:
+                result = await cdp_session.send(
+                    "Network.streamResourceContent",
+                    {"requestId": request_id},
+                )
+            except Exception as exc:
+                message_text = f"GLM Chat CDP response streaming failed: {exc}"
+                Logger.error(message_text)
+                await response_queue.put({"error": message_text})
+                await finish_cdp_stream(request_id, encountered_error=True)
+                return
+
+            if isinstance(result, dict):
+                await feed_base64_cdp_stream_chunk(request_id, result.get("bufferedData"))
+
+        async def handle_cdp_request_will_be_sent(params: Any) -> None:
+            nonlocal completion_claimed, cdp_active_request_id
+            if not isinstance(params, dict):
+                return
+            request_id = str(params.get("requestId") or "").strip()
+            request = params.get("request")
+            if not request_id or not isinstance(request, dict):
+                return
+
+            method = str(request.get("method") or "").upper()
+            request_methods[request_id] = method
+            url = str(request.get("url") or "")
+            if method != "POST" or not self._is_completion_request_url(url):
+                return
+            if not completion_armed.is_set():
+                return
+
+            async with completion_claim_lock:
+                if completion_claimed:
+                    return
+                completion_claimed = True
+                cdp_active_request_id = request_id
+                completion_started.set()
+
+            Logger.info("Observing GLM Chat API request via CDP...")
+            Logger.debug(f"Observed request to: {url}")
+            pending_url = cdp_pending_response_urls.get(request_id)
+            if pending_url:
+                await start_cdp_stream(request_id, pending_url)
+
+        async def handle_cdp_response_received(params: Any) -> None:
+            if not isinstance(params, dict):
+                return
+            request_id = str(params.get("requestId") or "").strip()
+            response = params.get("response")
+            if not request_id or not isinstance(response, dict):
+                return
+            url = str(response.get("url") or "")
+            if not self._is_completion_request_url(url):
+                return
+            method = request_methods.get(request_id, "").upper()
+            if method and method != "POST":
+                return
+            cdp_pending_response_urls[request_id] = url
+            if request_id != cdp_active_request_id:
+                return
+            await start_cdp_stream(request_id, url)
+
+        async def handle_cdp_data_received(params: Any) -> None:
+            if not isinstance(params, dict):
+                return
+            request_id = str(params.get("requestId") or "").strip()
+            if request_id == cdp_active_request_id:
+                await feed_base64_cdp_stream_chunk(request_id, params.get("data"))
+
+        async def handle_cdp_loading_finished(params: Any) -> None:
+            if not isinstance(params, dict):
+                return
+            request_id = str(params.get("requestId") or "").strip()
+            if request_id == cdp_active_request_id:
+                await finish_cdp_stream(request_id)
+            else:
+                request_methods.pop(request_id, None)
+                cdp_pending_response_urls.pop(request_id, None)
+
+        async def handle_cdp_loading_failed(params: Any) -> None:
+            if not isinstance(params, dict):
+                return
+            request_id = str(params.get("requestId") or "").strip()
+            if request_id != cdp_active_request_id:
+                request_methods.pop(request_id, None)
+                cdp_pending_response_urls.pop(request_id, None)
+                return
+
+            if request_aborted():
+                await finish_cdp_stream(request_id, aborted=True)
+                return
+
+            error_text = str(params.get("errorText") or "network loading failed").strip()
+            if "ERR_ABORTED" in error_text.upper() and cdp_had_data:
+                Logger.debug(
+                    "GLM Chat CDP stream ended with net::ERR_ABORTED after data arrived; "
+                    "treating it as complete."
+                )
+                await finish_cdp_stream(request_id)
+                return
+
+            message_text = f"GLM Chat CDP stream failed: {error_text}"
+            Logger.error(message_text)
+            await response_queue.put({"error": message_text})
+            await finish_cdp_stream(request_id, encountered_error=True)
+
+        def on_cdp_request_will_be_sent(params: Any) -> None:
+            _schedule_cdp_task(handle_cdp_request_will_be_sent(params), "requestWillBeSent")
+
+        def on_cdp_response_received(params: Any) -> None:
+            _schedule_cdp_task(handle_cdp_response_received(params), "responseReceived")
+
+        def on_cdp_data_received(params: Any) -> None:
+            _schedule_cdp_task(handle_cdp_data_received(params), "dataReceived")
+
+        def on_cdp_loading_finished(params: Any) -> None:
+            _schedule_cdp_task(handle_cdp_loading_finished(params), "loadingFinished")
+
+        def on_cdp_loading_failed(params: Any) -> None:
+            _schedule_cdp_task(handle_cdp_loading_failed(params), "loadingFailed")
 
         route_owner = self.context or self.page
         if not route_owner:
             raise RuntimeError("GLM Chat: browser context is not available.")
 
-        await route_owner.route("**/api/v2/chat/completions**", handle_route)
-
         try:
+            if use_cdp_teeing:
+                if not self.context or not self.page:
+                    message_text = "GLM Chat CDP setup failed: browser context is not available."
+                    Logger.error(message_text)
+                    yield f"data: {json.dumps({'error': message_text})}\n\n"
+                    return
+                try:
+                    cdp_session = await self.context.new_cdp_session(self.page)
+                    await cdp_session.send("Network.enable", {})
+                    cdp_session.on("Network.requestWillBeSent", on_cdp_request_will_be_sent)
+                    cdp_session.on("Network.responseReceived", on_cdp_response_received)
+                    cdp_session.on("Network.dataReceived", on_cdp_data_received)
+                    cdp_session.on("Network.loadingFinished", on_cdp_loading_finished)
+                    cdp_session.on("Network.loadingFailed", on_cdp_loading_failed)
+                    cdp_listeners_registered = True
+                    Logger.info("GLM Chat Request Capture Mode: CDP Teeing.")
+                except Exception as exc:
+                    message_text = f"GLM Chat CDP setup failed: {exc}"
+                    Logger.error(message_text)
+                    yield f"data: {json.dumps({'error': message_text})}\n\n"
+                    return
+            else:
+                await route_owner.route(self.COMPLETION_ROUTE_GLOB, handle_route)
+                route_handlers_registered = True
+                Logger.info("GLM Chat Request Capture Mode: Replay.")
+
             regenerated = False
             clean_regen_state: Dict[str, Any] | None = None
             multi_slot_state: Dict[str, Any] | None = None
@@ -2859,6 +3976,7 @@ class GLMDriver(BaseDriver):
             if clean_regeneration:
                 clean_regen_state = {
                     "deepthink_enabled": bool(effective_deepthink),
+                    "deepthink_effort": deepthink_effort,
                     "search_enabled": bool(enable_search),
                     "advanced_search_enabled": bool(enable_advanced_search),
                     "tools_enabled": bool(enable_tools),
@@ -2867,6 +3985,7 @@ class GLMDriver(BaseDriver):
                 }
                 multi_slot_state = self._build_multi_slot_cache_state(
                     effective_deepthink=bool(effective_deepthink),
+                    deepthink_effort=deepthink_effort,
                     enable_search=bool(enable_search),
                     enable_advanced_search=bool(enable_advanced_search),
                     enable_tools=bool(enable_tools),
@@ -2887,8 +4006,12 @@ class GLMDriver(BaseDriver):
 
                     #  toggles must match before regenerating (GLM UI can reset them on refresh)
                     try:
-                        await self.set_tools_state(enable_tools)
-                        await self.set_deepthink_state(effective_deepthink)
+                        await self.set_tools_state(enable_tools, model_label=ui_model_label)
+                        await self.set_deepthink_state(
+                            effective_deepthink,
+                            effort=deepthink_effort,
+                            model_label=ui_model_label,
+                        )
                         await self.set_search_state(enable_search)
                         await self.set_advanced_search_state(enable_advanced_search)
                         await asyncio.sleep(self._post_delay_s)
@@ -2950,9 +4073,11 @@ class GLMDriver(BaseDriver):
             if not regenerated:
                 await self._prepare_new_chat_request_ui(
                     effective_deepthink=bool(effective_deepthink),
+                    deepthink_effort=deepthink_effort,
                     enable_search=bool(enable_search),
                     enable_advanced_search=bool(enable_advanced_search),
                     enable_tools=bool(enable_tools),
+                    ui_model_label=ui_model_label,
                 )
 
                 if send_as_text_file:
@@ -3059,10 +4184,38 @@ class GLMDriver(BaseDriver):
                 except asyncio.TimeoutError:
                     Logger.debug("GLM Chat: timed out waiting for intercepted request cleanup.")
             self._reset_generation_state()
-            try:
-                await route_owner.unroute("**/api/v2/chat/completions**", handle_route)
-            except Exception:
+            self._pending_request_overrides = {}
+            if route_handlers_registered:
                 try:
-                    await route_owner.unroute("**/api/v2/chat/completions**")
+                    await route_owner.unroute(self.COMPLETION_ROUTE_GLOB, handle_route)
+                except Exception:
+                    try:
+                        await route_owner.unroute(self.COMPLETION_ROUTE_GLOB)
+                    except Exception:
+                        pass
+            if cdp_session and cdp_listeners_registered:
+                for event_name, listener in (
+                    ("Network.requestWillBeSent", on_cdp_request_will_be_sent),
+                    ("Network.responseReceived", on_cdp_response_received),
+                    ("Network.dataReceived", on_cdp_data_received),
+                    ("Network.loadingFinished", on_cdp_loading_finished),
+                    ("Network.loadingFailed", on_cdp_loading_failed),
+                ):
+                    try:
+                        cdp_session.remove_listener(event_name, listener)
+                    except Exception:
+                        pass
+            for task in list(cdp_tasks):
+                if not task.done():
+                    task.cancel()
+            tasks_to_wait = set(cdp_tasks)
+            if tasks_to_wait:
+                try:
+                    await asyncio.wait(tasks_to_wait, timeout=1.0)
                 except Exception:
                     pass
+            if cdp_session:
+                try:
+                    await cdp_session.detach()
+                except Exception as exc:
+                    Logger.debug(f"GLM Chat: CDP detach failed: {exc}")

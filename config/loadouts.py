@@ -272,6 +272,37 @@ def _validate_field_type(prefix: str, field: SettingField, value: Any) -> Any:
             )
         return value
 
+    if field.type == SettingType.SWITCHER:
+        if not isinstance(value, str):
+            raise LoadoutValidationError(f"{prefix}: '{field.key}' must be a string.")
+        options: list[str] = []
+        disabled_options: set[str] = set()
+        for option in field.options or []:
+            if isinstance(option, dict):
+                option_value = str(option.get("value") or option.get("key") or option.get("id") or "").strip()
+                if not option_value:
+                    option_value = str(option.get("label") or option.get("name") or option.get("display") or "").strip()
+                is_enabled = bool(option.get("enabled", True))
+            elif isinstance(option, (tuple, list)):
+                option_value = str(option[1] if len(option) >= 2 else option[0]).strip()
+                is_enabled = bool(option[2]) if len(option) >= 3 else True
+            else:
+                option_value = str(option or "").strip()
+                is_enabled = True
+            if not option_value:
+                continue
+            if is_enabled:
+                options.append(option_value)
+            else:
+                disabled_options.add(option_value)
+        if value in disabled_options:
+            raise LoadoutValidationError(f"{prefix}: '{field.key}' option '{value}' is disabled.")
+        if options and value not in options:
+            raise LoadoutValidationError(
+                f"{prefix}: '{field.key}' must be one of: {', '.join(options)}."
+            )
+        return value
+
     if field.type == SettingType.INPUT_PAIR:
         if not isinstance(value, list):
             raise LoadoutValidationError(f"{prefix}: '{field.key}' must be a list of [name, value] pairs.")

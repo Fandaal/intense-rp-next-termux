@@ -20,7 +20,6 @@ from utils.logger import Logger
 DISCORD_INVITE_URL = "https://discord.gg/4Gvjk2RdsK"
 REPOSITORY_URL = "https://github.com/LyubomirT/intense-rp-next"
 DOCS_HOME_URL = "https://intense-rp-next.readthedocs.io/en/latest/"
-DONATE_URL = f"{DOCS_HOME_URL}hands/support/#financial-support-optional"
 
 
 class _TileFlowLayout(QLayout):
@@ -308,7 +307,6 @@ class HelpWindow(QMainWindow):
                     ("Contributors", IconType.CONTRIBUTORS, "", self.show_contributors),
                     ("Discord Server", IconType.DISCORD, "Join the IntenseRP Next Discord server for community help and quick questions.", self.open_discord),
                     ("GitHub", IconType.GITHUB, "Open the IntenseRP Next GitHub repository.", self.open_github),
-                    ("Donate", IconType.DONATE, "Support the project financially.", self.open_donate),
                 ],
             ),
         ]
@@ -411,6 +409,3 @@ class HelpWindow(QMainWindow):
 
     def open_docs(self):
         QDesktopServices.openUrl(QUrl(DOCS_HOME_URL))
-
-    def open_donate(self):
-        QDesktopServices.openUrl(QUrl(DONATE_URL))

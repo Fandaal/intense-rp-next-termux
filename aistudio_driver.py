@@ -1,9 +1,12 @@
 """Browser driver for Google AI Studio, including UI control and stream interception."""
 
 import asyncio
+import base64
 import codecs
 import json
+import math
 import os
+import random
 import re
 import secrets
 import shutil
@@ -155,6 +158,8 @@ class _AiStudioJsonEventStreamParser:
 class AIStudioDriver(BaseDriver):
     """Drive the Google AI Studio web UI and expose OpenAI-style streaming output."""
 
+    REQUEST_CAPTURE_MODE_REPLAY = "replay"
+    REQUEST_CAPTURE_MODE_CDP_TEEING = "cdp_teeing"
     START_URL = "https://aistudio.google.com/prompts/new_chat?temporary=true"
     AISTUDIO_HOST = "aistudio.google.com"
     AUTH_HOST_MARKER = "accounts.google.com"
@@ -204,6 +209,24 @@ class AIStudioDriver(BaseDriver):
         "button[aria-label='Agree to the copyright acknowledgement']"
     )
     PROMPT_MEDIA_CONTAINER_SELECTOR = "[data-test-id='prompt-media-container']"
+    ADD_MEDIA_BUTTON_SELECTORS = [
+        "button[data-test-id='add-media-button']",
+        "[data-test-id='add-media-button']",
+        "button[aria-label='Insert images, videos, audio, or files']",
+        "button.mat-mdc-menu-trigger[aria-label*='files']",
+    ]
+    UPLOAD_FILE_MENU_ITEM_SELECTORS = [
+        "button.upload-file-menu-item",
+        ".upload-file-menu-item",
+        "button[role='menuitem']:has-text('Upload files')",
+        "[role='menuitem']:has-text('Upload files')",
+        "button:has-text('Upload files')",
+    ]
+    UPLOAD_FILE_INPUT_SELECTORS = [
+        "input.file-input[type='file']",
+        "input[type='file'][accept*='text/*']",
+        "input[type='file']",
+    ]
     ASSISTANT_TURN_SELECTOR = "div.chat-turn-container.code-block-aligner.model.render.ng-star-inserted"
     ASSISTANT_EDIT_BUTTON_SELECTORS = [
         "button.toggle-edit-button",
@@ -213,6 +236,15 @@ class AIStudioDriver(BaseDriver):
         "textarea.textarea",
         "textarea[class*='textarea']",
         "textarea",
+    ]
+    ASSISTANT_EDIT_SAVE_BUTTON_SELECTORS = [
+        "button[data-test-id*='save']",
+        "button[name*='save']",
+        "button[aria-label='Save']",
+        "button[aria-label*='Save']",
+        "button:has-text('Save')",
+        "button:has-text('Done')",
+        "button:has-text('Update')",
     ]
     SAFETY_RATINGS_BUTTON_SELECTOR = "button[aria-label*='Safety Ratings']"
     RUN_SAFETY_SETTINGS_PANEL_SELECTOR = "div.run-safety-settings"
@@ -269,8 +301,15 @@ class AIStudioDriver(BaseDriver):
     ]
     INTERCEPT_FIRST_CHUNK_TIMEOUT_S = 180.0
     INTERCEPT_IDLE_TIMEOUT_S = 75.0
+    SEND_CLICK_CONFIRM_TIMEOUT_MS = 2200
+    SEND_CLICK_MAX_ATTEMPTS = 3
     MAX_ANTI_CENSORSHIP_NUDGES = 3
     CAARS_MEANINGFUL_CHUNK_TARGET = 5
+    BACKGROUND_RESILIENCE_BROWSER_ARGS: tuple[str, ...] = (
+        "--disable-background-timer-throttling",
+        "--disable-backgrounding-occluded-windows",
+        "--disable-renderer-backgrounding",
+    )
     RATE_LIMIT_HINT_RE = re.compile(
         r"(rate\s*limit|too\s*many\s*requests|\b429\b|quota|limit\s*reached)",
         flags=re.IGNORECASE,
@@ -431,9 +470,19 @@ class AIStudioDriver(BaseDriver):
         self._preflight_state: Optional[Dict[str, Any]] = None
         self._preflight_system_prompt_text = ""
         self._assume_english_ui_notice_logged = False
+        self._minimized_hmm_notice_sent = False
+        self._last_mouse_position: tuple[float, float] | None = None
 
     def get_start_url(self) -> str:
         return self.START_URL
+
+    def _get_browser_launch_args(self) -> list[str]:
+        """Add AI Studio-only launch flags that keep hidden windows responsive."""
+        args = super()._get_browser_launch_args()
+        for arg in self.BACKGROUND_RESILIENCE_BROWSER_ARGS:
+            if arg not in args:
+                args.append(arg)
+        return args
 
     def should_apply_configured_model_before_request(self) -> bool:
         """Let the AI Studio request flow own model selection."""
@@ -844,7 +893,278 @@ class AIStudioDriver(BaseDriver):
             await asyncio.sleep(0.4)
 
     async def _human_delay(self, delay_s: float = 0.8) -> None:
-        await asyncio.sleep(max(0.0, float(delay_s)))
+        delay = max(0.0, float(delay_s))
+        if self._humanize_mouse_movements_enabled() and delay > 0.0:
+            delay = (delay * random.uniform(0.85, 1.25)) + random.uniform(0.03, 0.16)
+        await asyncio.sleep(delay)
+
+    def _humanize_mouse_movements_enabled(self) -> bool:
+        """Return whether AI Studio should use slower, pointer-visible UI actions."""
+        try:
+            return bool(
+                self.config_manager.get_setting(
+                    "aistudio_behavior",
+                    "humanize_mouse_movements",
+                )
+            )
+        except Exception:
+            return False
+
+    async def _restore_minimized_window_for_hmm(self) -> None:
+        """Restore AI Studio if Chromium is minimized before humanized pointer work."""
+        if not self.page or not self.context:
+            return
+        if not self._humanize_mouse_movements_enabled():
+            return
+
+        cdp_session = None
+        try:
+            cdp_session = await self.context.new_cdp_session(self.page)
+            window_info = await cdp_session.send("Browser.getWindowForTarget")
+            bounds = window_info.get("bounds") if isinstance(window_info, dict) else None
+            if not isinstance(bounds, dict):
+                return
+
+            window_state = str(bounds.get("windowState") or "").strip().lower()
+            if window_state != "minimized":
+                return
+
+            window_id = window_info.get("windowId")
+            await cdp_session.send(
+                "Browser.setWindowBounds",
+                {
+                    "windowId": window_id,
+                    "bounds": {"windowState": "normal"},
+                },
+            )
+            try:
+                await self.page.bring_to_front()
+            except Exception:
+                pass
+
+            Logger.warning(
+                "Google AI Studio: browser window was minimized while Humanize Mouse "
+                "Movements was enabled; restored it before a pointer action."
+            )
+            if not self._minimized_hmm_notice_sent:
+                self._minimized_hmm_notice_sent = True
+                self.notify_user(
+                    "Google AI Studio Browser Restored",
+                    "AI Studio was minimized with Humanize Mouse Movements enabled, so IntenseRP restored the browser window. Check the app for more info.",
+                    level="warning",
+                    dialog_message=(
+                        "AI Studio was minimized while Humanize Mouse Movements was enabled, "
+                        "so IntenseRP restored the browser window before clicking.\n\n"
+                        "Minimized AI Studio windows can miss clicks, hover actions, and "
+                        "file-picker actions. You can still leave the browser unfocused: "
+                        "just open another window or focus a different one instead of "
+                        "minimizing the AI Studio browser."
+                    ),
+                )
+            await asyncio.sleep(0.15)
+        except Exception as e:
+            Logger.debug(
+                "Google AI Studio: minimized-window restore check failed before "
+                f"humanized action: {e}"
+            )
+        finally:
+            if cdp_session is not None:
+                try:
+                    await cdp_session.detach()
+                except Exception:
+                    pass
+
+    async def _humanized_action_pause(
+        self,
+        min_s: float = 0.04,
+        max_s: float = 0.14,
+    ) -> None:
+        """Add a tiny optional pause around UI actions when paced interactions are enabled."""
+        if not self._humanize_mouse_movements_enabled():
+            return
+
+        low = max(0.0, float(min_s))
+        high = max(low, float(max_s))
+        await asyncio.sleep(random.uniform(low, high))
+
+    @staticmethod
+    def _click_timeout_for_probe(timeout: Any, cap_ms: float = 1500.0) -> float:
+        try:
+            value = float(timeout)
+        except Exception:
+            value = cap_ms
+        if value <= 0:
+            return 0.0
+        return min(value, cap_ms)
+
+    def _mouse_steps_for_target(self, target: tuple[float, float] | None) -> int:
+        if target is None or self._last_mouse_position is None:
+            return random.randint(12, 24)
+
+        distance = math.hypot(
+            float(target[0]) - float(self._last_mouse_position[0]),
+            float(target[1]) - float(self._last_mouse_position[1]),
+        )
+        base_steps = int(distance / 18.0) + random.randint(4, 10)
+        return max(8, min(48, base_steps))
+
+    async def _humanized_click_position(
+        self,
+        locator,
+        *,
+        timeout: Any = 3000,
+    ) -> tuple[dict[str, float] | None, tuple[float, float] | None]:
+        """Pick a slightly varied visible click point inside a locator."""
+        try:
+            await locator.scroll_into_view_if_needed(
+                timeout=self._click_timeout_for_probe(timeout)
+            )
+        except Exception:
+            pass
+
+        try:
+            box = await locator.bounding_box(
+                timeout=self._click_timeout_for_probe(timeout)
+            )
+        except Exception:
+            box = None
+        if not box:
+            return None, None
+
+        try:
+            left = float(box.get("x") or 0.0)
+            top = float(box.get("y") or 0.0)
+            width = float(box.get("width") or 0.0)
+            height = float(box.get("height") or 0.0)
+        except Exception:
+            return None, None
+        if width <= 0.0 or height <= 0.0:
+            return None, None
+
+        x_margin = min(width * 0.25, 14.0)
+        y_margin = min(height * 0.25, 10.0)
+        rel_x = (
+            width / 2.0
+            if width <= (x_margin * 2.0)
+            else random.uniform(x_margin, width - x_margin)
+        )
+        rel_y = (
+            height / 2.0
+            if height <= (y_margin * 2.0)
+            else random.uniform(y_margin, height - y_margin)
+        )
+        return {"x": rel_x, "y": rel_y}, (left + rel_x, top + rel_y)
+
+    async def _click_locator(
+        self,
+        locator,
+        *,
+        timeout: Any = 3000,
+        force: bool | None = None,
+        position: dict[str, float] | None = None,
+        button: str | None = None,
+        click_count: int | None = None,
+        no_wait_after: bool | None = None,
+    ) -> None:
+        """Click a locator, optionally adding native Playwright pointer movement and pacing."""
+        kwargs: dict[str, Any] = {"timeout": timeout}
+        if force is not None:
+            kwargs["force"] = force
+        if button is not None:
+            kwargs["button"] = button
+        if click_count is not None:
+            kwargs["click_count"] = click_count
+        if no_wait_after is not None:
+            kwargs["no_wait_after"] = no_wait_after
+
+        if not self._humanize_mouse_movements_enabled():
+            if position is not None:
+                kwargs["position"] = position
+            await locator.click(**kwargs)
+            return
+
+        await self._restore_minimized_window_for_hmm()
+
+        target = None
+        click_position = position
+        if click_position is None:
+            click_position, target = await self._humanized_click_position(
+                locator,
+                timeout=timeout,
+            )
+        if click_position is not None:
+            kwargs["position"] = click_position
+
+        kwargs["delay"] = random.uniform(45.0, 140.0)
+        kwargs["steps"] = self._mouse_steps_for_target(target)
+
+        await self._humanized_action_pause(0.04, 0.16)
+        try:
+            await self._restore_minimized_window_for_hmm()
+            await locator.click(**kwargs)
+            if target is not None:
+                self._last_mouse_position = target
+        finally:
+            await self._humanized_action_pause(0.06, 0.20)
+
+    async def _move_mouse_to_point(self, x: float, y: float) -> None:
+        if not self.page:
+            return
+
+        x = float(x)
+        y = float(y)
+        if not self._humanize_mouse_movements_enabled():
+            await self.page.mouse.move(x, y)
+            self._last_mouse_position = (x, y)
+            return
+
+        await self._restore_minimized_window_for_hmm()
+
+        start = self._last_mouse_position
+        if start is not None:
+            distance = math.hypot(x - float(start[0]), y - float(start[1]))
+            if distance > 70.0:
+                dx = x - float(start[0])
+                dy = y - float(start[1])
+                px = -dy / distance
+                py = dx / distance
+                bend = min(distance * 0.18, 42.0) * random.uniform(-1.0, 1.0)
+                t = random.uniform(0.35, 0.65)
+                mid_x = float(start[0]) + (dx * t) + (px * bend)
+                mid_y = float(start[1]) + (dy * t) + (py * bend)
+                await self.page.mouse.move(
+                    mid_x,
+                    mid_y,
+                    steps=max(4, self._mouse_steps_for_target((mid_x, mid_y)) // 2),
+                )
+                self._last_mouse_position = (mid_x, mid_y)
+
+        await self.page.mouse.move(x, y, steps=self._mouse_steps_for_target((x, y)))
+        self._last_mouse_position = (x, y)
+
+    async def _click_mouse_point(self, x: float, y: float) -> None:
+        if not self.page:
+            return
+
+        if not self._humanize_mouse_movements_enabled():
+            await self.page.mouse.move(x, y)
+            await asyncio.sleep(0.04)
+            await self.page.mouse.click(x, y)
+            await asyncio.sleep(0.08)
+            self._last_mouse_position = (float(x), float(y))
+            return
+
+        await self._humanized_action_pause(0.03, 0.12)
+        await self._move_mouse_to_point(float(x), float(y))
+        await self._humanized_action_pause(0.04, 0.13)
+        await self._restore_minimized_window_for_hmm()
+        await self.page.mouse.click(
+            float(x),
+            float(y),
+            delay=random.uniform(45.0, 130.0),
+        )
+        self._last_mouse_position = (float(x), float(y))
+        await self._humanized_action_pause(0.06, 0.18)
 
     async def _accept_terms_of_service_if_present(self, timeout_ms: int = 3500) -> None:
         """Pause automation while the AI Studio legal acknowledgement dialog is open."""
@@ -881,7 +1201,7 @@ class AIStudioDriver(BaseDriver):
             return False
 
         try:
-            await field.click(timeout=3000)
+            await self._click_locator(field, timeout=3000)
         except Exception:
             pass
 
@@ -1295,7 +1615,7 @@ class AIStudioDriver(BaseDriver):
             return False
 
         try:
-            await trigger.first.click(timeout=3000)
+            await self._click_locator(trigger.first, timeout=3000)
         except Exception as e:
             Logger.warning(f"Google AI Studio: failed to open model selector: {e}")
             return False
@@ -1314,6 +1634,28 @@ class AIStudioDriver(BaseDriver):
     async def _click_model_family_filter(self) -> bool:
         if not self.page:
             return False
+
+        try:
+            root = self.page.locator("[data-test-id='model-carousel-in-selector']")
+            buttons = root.locator("button")
+            count = await buttons.count()
+        except Exception:
+            count = 0
+
+        target_label = self._normalize_text(self.MODEL_FAMILY_FILTER_LABEL)
+        for idx in range(min(count, 24)):
+            button = buttons.nth(idx)
+            try:
+                if not await button.is_visible():
+                    continue
+                text = self._normalize_text(str(await button.inner_text() or ""))
+                if text != target_label:
+                    continue
+                await self._click_locator(button, timeout=2500)
+                await self._ui_settle_pause(0.2)
+                return True
+            except Exception:
+                continue
 
         try:
             clicked = await self.page.evaluate(
@@ -1364,7 +1706,7 @@ class AIStudioDriver(BaseDriver):
                 pass
 
             try:
-                await candidate.click(timeout=3000)
+                await self._click_locator(candidate, timeout=3000)
                 return True
             except Exception:
                 continue
@@ -1883,7 +2225,7 @@ class AIStudioDriver(BaseDriver):
             return
 
         try:
-            await toggle.click(timeout=3000)
+            await self._click_locator(toggle, timeout=3000)
         except Exception as e:
             try:
                 await self._dismiss_transient_overlays()
@@ -2006,7 +2348,10 @@ class AIStudioDriver(BaseDriver):
         return bool(applied)
 
     async def _ui_settle_pause(self, delay_s: float = 0.22) -> None:
-        await asyncio.sleep(max(0.0, float(delay_s)))
+        delay = max(0.0, float(delay_s))
+        if self._humanize_mouse_movements_enabled() and delay > 0.0:
+            delay += random.uniform(0.02, 0.12)
+        await asyncio.sleep(delay)
 
     async def _dismiss_transient_overlays(self) -> None:
         """Dismiss transient menus and backdrops that can steal subsequent clicks."""
@@ -2081,10 +2426,7 @@ class AIStudioDriver(BaseDriver):
             try:
                 x = float(box["x"]) + min(max(float(box["width"]) * 0.25, 12.0), 48.0)
                 y = float(box["y"]) + min(max(float(box["height"]) * 0.5, 8.0), 20.0)
-                await self.page.mouse.move(x, y)
-                await asyncio.sleep(0.04)
-                await self.page.mouse.click(x, y)
-                await asyncio.sleep(0.08)
+                await self._click_mouse_point(x, y)
                 Logger.extra_debug(
                     "Google AI Studio timing: refocus composer -> mouse click completed "
                     f"in {time.perf_counter() - started:.3f}s"
@@ -2099,7 +2441,7 @@ class AIStudioDriver(BaseDriver):
 
         click_started = time.perf_counter()
         try:
-            await editor.click(timeout=2000)
+            await self._click_locator(editor, timeout=2000)
             Logger.extra_debug(
                 "Google AI Studio timing: refocus composer -> locator click completed "
                 f"in {time.perf_counter() - click_started:.3f}s "
@@ -2163,7 +2505,7 @@ class AIStudioDriver(BaseDriver):
             attempt_started = time.perf_counter()
             Logger.extra_debug(f"{debug_prefix} -> attempt {attempt} start")
             try:
-                await field.click(timeout=1500, force=True)
+                await self._click_locator(field, timeout=1500, force=True)
                 Logger.extra_debug(
                     f"{debug_prefix} -> attempt {attempt} click completed in "
                     f"{time.perf_counter() - attempt_started:.3f}s"
@@ -2247,6 +2589,7 @@ class AIStudioDriver(BaseDriver):
                     f"{debug_prefix} -> applied by evaluate in "
                     f"{time.perf_counter() - started:.3f}s"
                 )
+                await self._humanized_action_pause(0.05, 0.16)
                 return True
 
             fill_started = time.perf_counter()
@@ -2266,6 +2609,7 @@ class AIStudioDriver(BaseDriver):
                         f"{time.perf_counter() - started:.3f}s "
                         f"(fill phase {time.perf_counter() - fill_started:.3f}s)"
                     )
+                    await self._humanized_action_pause(0.05, 0.16)
                     return True
                 Logger.extra_debug(
                     f"{debug_prefix} -> attempt {attempt} fill value mismatch "
@@ -2470,7 +2814,7 @@ class AIStudioDriver(BaseDriver):
             return True
 
         try:
-            await button.click(timeout=3000)
+            await self._click_locator(button, timeout=3000)
         except Exception:
             return False
 
@@ -2593,7 +2937,7 @@ class AIStudioDriver(BaseDriver):
             for _ in range(3):
                 await self._ui_settle_pause(0.16)
                 try:
-                    await close_button.click(timeout=2000, force=True)
+                    await self._click_locator(close_button, timeout=2000, force=True)
                 except Exception:
                     try:
                         await close_button.evaluate("el => el.click()")
@@ -2646,7 +2990,7 @@ class AIStudioDriver(BaseDriver):
             return False
 
         try:
-            await trigger.click(timeout=3000)
+            await self._click_locator(trigger, timeout=3000)
         except Exception as e:
             Logger.warning(f"Google AI Studio: failed to open safety settings: {e}")
             return False
@@ -2811,7 +3155,7 @@ class AIStudioDriver(BaseDriver):
             pass
 
         try:
-            await target.click(timeout=3000)
+            await self._click_locator(target, timeout=3000)
         except Exception:
             return False
         await self._ui_settle_pause(0.18)
@@ -2856,7 +3200,7 @@ class AIStudioDriver(BaseDriver):
                 continue
 
             try:
-                await candidate.click(timeout=3000)
+                await self._click_locator(candidate, timeout=3000)
                 await self._ui_settle_pause(0.18)
                 return True
             except Exception:
@@ -3176,59 +3520,135 @@ class AIStudioDriver(BaseDriver):
             )
             return dialog is not None
 
+        async def _find_upload_file_input(timeout_ms: int = 0):
+            deadline = time.time() + max(0.0, float(timeout_ms) / 1000.0)
+            while True:
+                for selector in self.UPLOAD_FILE_INPUT_SELECTORS:
+                    locator = self.page.locator(selector)
+                    try:
+                        count = await locator.count()
+                    except Exception:
+                        count = 0
+                    if count > 0:
+                        return locator.nth(0)
+
+                if timeout_ms <= 0 or time.time() >= deadline:
+                    return None
+                await asyncio.sleep(0.1)
+
         async def _trigger_picker_upload(chooser_files_value: Any) -> bool:
             add_media_button = await self._find_first_visible(
-                ["button[data-test-id='add-media-button']", "[data-test-id='add-media-button']"],
+                self.ADD_MEDIA_BUTTON_SELECTORS,
                 timeout_ms=8000,
             )
             if add_media_button is None:
                 Logger.warning("Google AI Studio: add-media button was not found.")
                 return False
 
-            async with self.page.expect_file_chooser(timeout=6000) as fc_info:
-                await add_media_button.click(timeout=3000)
-                await self.page.wait_for_selector(".mat-mdc-menu-content", timeout=5000, state="visible")
-                clicked = await self.page.evaluate(
-                    """() => {
-                        const isVisible = (el) => {
-                            if (!el) return false;
-                            const rect = el.getBoundingClientRect();
-                            if (!rect || rect.width <= 0 || rect.height <= 0) return false;
-                            const style = window.getComputedStyle(el);
-                            if (!style) return false;
-                            return style.visibility !== 'hidden' && style.display !== 'none';
-                        };
+            try:
+                await self._click_locator(add_media_button, timeout=3000)
+            except Exception as e:
+                try:
+                    await self._click_locator(add_media_button, timeout=3000, force=True)
+                except Exception:
+                    Logger.warning(f"Google AI Studio: failed to click add-media button: {e}")
+                    return False
 
-                        const menus = Array.from(document.querySelectorAll('.mat-mdc-menu-content')).filter(isVisible);
-                        if (!menus.length) return false;
-
-                        const menu = menus[0];
-                        const items = Array.from(menu.children).filter(isVisible);
-                        if (items.length < 2) return false;
-
-                        const target = items[1];
-                        try {
-                            target.click();
-                            return true;
-                        } catch (e) {
-                            try {
-                                const nested = target.querySelector('button, [role="menuitem"]');
-                                if (nested) {
-                                    nested.click();
-                                    return true;
-                                }
-                            } catch (e2) {}
-                            return false;
-                        }
-                    }"""
+            try:
+                await self.page.wait_for_selector(
+                    ".mat-mdc-menu-content, .mat-mdc-menu-panel, .cdk-overlay-pane",
+                    timeout=5000,
+                    state="visible",
                 )
-                if not clicked:
-                    raise RuntimeError("AI Studio file picker menu item was not clickable.")
+            except Exception:
+                pass
 
-            chooser = await fc_info.value
-            await chooser.set_files(chooser_files_value)
-            await self._ui_settle_pause(0.4)
-            return True
+            file_input = await _find_upload_file_input(timeout_ms=800)
+            if file_input is None:
+                try:
+                    file_input = await _find_upload_file_input(timeout_ms=0)
+                except Exception:
+                    file_input = None
+
+            if file_input is not None:
+                try:
+                    await file_input.set_input_files(chooser_files_value)
+                    await self._ui_settle_pause(0.4)
+                    return True
+                except Exception as e:
+                    Logger.debug(
+                        f"Google AI Studio: direct upload input failed, trying picker menu: {e}"
+                    )
+
+            try:
+                async with self.page.expect_file_chooser(timeout=6000) as fc_info:
+                    upload_item = await self._find_first_visible(
+                        self.UPLOAD_FILE_MENU_ITEM_SELECTORS,
+                        timeout_ms=2500,
+                    )
+                    clicked = False
+                    if upload_item is not None:
+                        try:
+                            await self._click_locator(upload_item, timeout=2500)
+                            clicked = True
+                        except Exception:
+                            try:
+                                await self._click_locator(upload_item, timeout=2500, force=True)
+                                clicked = True
+                            except Exception:
+                                clicked = False
+
+                    if not clicked:
+                        clicked = await self.page.evaluate(
+                            """() => {
+                                const normalize = (value) => (value || '').toString().replace(/\\s+/g, ' ').trim().toLowerCase();
+                                const isVisible = (el) => {
+                                    if (!el) return false;
+                                    const rect = el.getBoundingClientRect();
+                                    if (!rect || rect.width <= 0 || rect.height <= 0) return false;
+                                    const style = window.getComputedStyle(el);
+                                    if (!style) return false;
+                                    return style.visibility !== 'hidden' && style.display !== 'none';
+                                };
+
+                                const candidates = Array.from(document.querySelectorAll(
+                                    'button.upload-file-menu-item, .upload-file-menu-item, button[role="menuitem"], [role="menuitem"], button'
+                                )).filter(isVisible);
+                                const target = candidates.find((el) => {
+                                    const text = normalize(el.innerText || el.textContent || '');
+                                    const aria = normalize(el.getAttribute('aria-label'));
+                                    const classes = normalize(el.className);
+                                    return classes.includes('upload-file-menu-item')
+                                        || text.includes('upload files')
+                                        || aria.includes('upload files');
+                                });
+                                if (!target) return false;
+                                try {
+                                    target.click();
+                                    return true;
+                                } catch (e) {
+                                    return false;
+                                }
+                            }"""
+                        )
+                    if not clicked:
+                        raise RuntimeError("AI Studio file picker menu item was not clickable.")
+
+                chooser = await fc_info.value
+                await chooser.set_files(chooser_files_value)
+                await self._ui_settle_pause(0.4)
+                return True
+            except Exception as e:
+                file_input = await _find_upload_file_input(timeout_ms=1000)
+                if file_input is not None:
+                    try:
+                        await file_input.set_input_files(chooser_files_value)
+                        await self._ui_settle_pause(0.4)
+                        return True
+                    except Exception:
+                        pass
+                Logger.warning(f"Google AI Studio: upload file picker did not open: {e}")
+                return False
 
         def _materialize_payload(payload: dict) -> str | None:
             nonlocal temp_dir, temp_path
@@ -3300,7 +3720,7 @@ class AIStudioDriver(BaseDriver):
                         )
                         if accept_button is not None:
                             try:
-                                await accept_button.click(timeout=3000)
+                                await self._click_locator(accept_button, timeout=3000)
                             except Exception:
                                 try:
                                     await accept_button.evaluate("el => el.click()")
@@ -3392,7 +3812,7 @@ class AIStudioDriver(BaseDriver):
             await self._dismiss_transient_overlays()
             click_started = time.perf_counter()
             try:
-                await trigger.click(timeout=2000, force=True)
+                await self._click_locator(trigger, timeout=2000, force=True)
                 Logger.extra_debug(
                     "Google AI Studio timing: system-instructions open panel -> "
                     f"attempt {attempt} click completed in "
@@ -3514,7 +3934,7 @@ class AIStudioDriver(BaseDriver):
 
             click_started = time.perf_counter()
             try:
-                await close_button.click(timeout=2000, force=True)
+                await self._click_locator(close_button, timeout=2000, force=True)
                 Logger.extra_debug(
                     "Google AI Studio timing: system-instructions close panel -> "
                     f"attempt {attempt} click completed in "
@@ -3743,6 +4163,106 @@ class AIStudioDriver(BaseDriver):
         """Locate the first visible AI Studio send/run button."""
         return await self._find_first_visible(self.SEND_BUTTON_SELECTORS, timeout_ms=timeout_ms)
 
+    async def _read_prompt_composer_text(self, timeout_ms: int = 0) -> str | None:
+        """Return the current visible prompt composer text, if it can be read."""
+        editor = await self._find_first_visible(self.CHAT_READY_SELECTORS, timeout_ms=timeout_ms)
+        if editor is None:
+            return None
+
+        try:
+            return str(
+                await editor.evaluate(
+                    """(el) => {
+                        const target = (el && typeof el.value !== 'undefined')
+                            ? el
+                            : (el && el.querySelector ? el.querySelector('textarea') : null);
+                        if (!target) return '';
+                        return (target.value ?? target.textContent ?? '').toString();
+                    }"""
+                )
+                or ""
+            )
+        except Exception:
+            return None
+
+    async def _prompt_has_attached_media(self, timeout_ms: int = 0) -> bool:
+        """Return whether the prompt composer currently shows an attached media chip."""
+        media = await self._find_first_visible(
+            [self.PROMPT_MEDIA_CONTAINER_SELECTOR],
+            timeout_ms=timeout_ms,
+        )
+        return media is not None
+
+    async def _send_button_is_clickable(self, button) -> bool:
+        """Return whether AI Studio's run control currently looks ready to submit."""
+        if button is None:
+            return False
+
+        try:
+            if not await button.is_visible():
+                return False
+        except Exception:
+            return False
+
+        if await self._run_control_looks_like_stop(button):
+            return False
+
+        try:
+            if not await button.is_enabled():
+                return False
+        except Exception:
+            pass
+
+        disabled_attr = None
+        try:
+            disabled_attr = await button.get_attribute("disabled")
+        except Exception:
+            disabled_attr = None
+
+        aria_disabled = ""
+        try:
+            aria_disabled = str(await button.get_attribute("aria-disabled") or "").strip().lower()
+        except Exception:
+            aria_disabled = ""
+
+        return disabled_attr is None and aria_disabled != "true"
+
+    async def _wait_for_send_click_observed(
+        self,
+        *,
+        previous_composer_text: str | None,
+        previous_prompt_had_media: bool = False,
+        completion_started: asyncio.Event | None = None,
+        timeout_ms: int | None = None,
+    ) -> bool:
+        """Wait until the UI proves a send click was accepted."""
+        timeout = (
+            self.SEND_CLICK_CONFIRM_TIMEOUT_MS
+            if timeout_ms is None
+            else max(0, int(timeout_ms))
+        )
+        deadline = time.time() + (float(timeout) / 1000.0)
+        had_text = bool(str(previous_composer_text or "").strip())
+
+        while True:
+            if completion_started is not None and completion_started.is_set():
+                return True
+
+            if await self._find_stop_generation_button(timeout_ms=0) is not None:
+                return True
+
+            if had_text:
+                current_text = await self._read_prompt_composer_text(timeout_ms=0)
+                if current_text is not None and not current_text.strip():
+                    return True
+
+            if previous_prompt_had_media and not await self._prompt_has_attached_media(timeout_ms=0):
+                return True
+
+            if timeout <= 0 or time.time() >= deadline:
+                return False
+            await asyncio.sleep(0.1)
+
     async def _run_control_looks_like_stop(self, button) -> bool:
         """Return whether AI Studio's run control is currently in Stop mode."""
         if button is None:
@@ -3827,12 +4347,12 @@ class AIStudioDriver(BaseDriver):
             return False
 
         try:
-            await button.click(timeout=2000)
+            await self._click_locator(button, timeout=2000)
             await self._ui_settle_pause(0.2)
             return True
         except Exception as e:
             try:
-                await button.click(timeout=2000, force=True)
+                await self._click_locator(button, timeout=2000, force=True)
                 await self._ui_settle_pause(0.2)
                 return True
             except Exception:
@@ -3849,7 +4369,12 @@ class AIStudioDriver(BaseDriver):
                 return False
             await asyncio.sleep(0.15)
 
-    async def send_message(self, timeout: int | None = None) -> None:
+    async def send_message(
+        self,
+        timeout: int | None = None,
+        *,
+        completion_started: asyncio.Event | None = None,
+    ) -> None:
         """Wait for the send button to become enabled and click it."""
         wait_timeout_s = 15.0 if timeout is None else max(float(timeout), 0.0)
         deadline = time.time() + wait_timeout_s
@@ -3865,19 +4390,10 @@ class AIStudioDriver(BaseDriver):
                 await asyncio.sleep(0.15)
                 continue
 
-            disabled_attr = None
-            try:
-                disabled_attr = await button.get_attribute("disabled")
-            except Exception:
-                disabled_attr = None
+            if await self._run_control_looks_like_stop(button):
+                return
 
-            aria_disabled = ""
-            try:
-                aria_disabled = str(await button.get_attribute("aria-disabled") or "").strip().lower()
-            except Exception:
-                aria_disabled = ""
-
-            if disabled_attr is None and aria_disabled != "true":
+            if await self._send_button_is_clickable(button):
                 break
 
             last_state = "disabled"
@@ -3889,22 +4405,98 @@ class AIStudioDriver(BaseDriver):
                 return
             await asyncio.sleep(0.15)
 
-        try:
-            await self._refocus_composer_before_send()
-            await button.click(timeout=3000)
-            await self._ui_settle_pause(0.25)
-        except Exception as e:
+        last_error: Exception | None = None
+        previous_composer_text = await self._read_prompt_composer_text(timeout_ms=0)
+        previous_prompt_had_media = await self._prompt_has_attached_media(timeout_ms=0)
+        for attempt in range(1, self.SEND_CLICK_MAX_ATTEMPTS + 1):
+            if completion_started is not None and completion_started.is_set():
+                return
+            if await self._find_stop_generation_button(timeout_ms=0) is not None:
+                return
+
+            if attempt > 1:
+                button = await self._find_send_button(timeout_ms=1200)
+                if button is None:
+                    last_state = "not found"
+                    if await self._wait_for_send_click_observed(
+                        previous_composer_text=previous_composer_text,
+                        previous_prompt_had_media=previous_prompt_had_media,
+                        completion_started=completion_started,
+                        timeout_ms=900,
+                    ):
+                        return
+                    continue
+                if await self._run_control_looks_like_stop(button):
+                    return
+                if not await self._send_button_is_clickable(button):
+                    last_state = "disabled"
+                    if await self._wait_for_send_click_observed(
+                        previous_composer_text=previous_composer_text,
+                        previous_prompt_had_media=previous_prompt_had_media,
+                        completion_started=completion_started,
+                        timeout_ms=900,
+                    ):
+                        return
+                    await self._ui_settle_pause(0.2)
+                    continue
+
             try:
                 await self._refocus_composer_before_send()
-                await button.click(timeout=3000, force=True)
+                await self._click_locator(button, timeout=3000)
                 await self._ui_settle_pause(0.25)
+            except Exception as e:
+                last_error = e
+                try:
+                    await self._refocus_composer_before_send()
+                    await self._click_locator(button, timeout=3000, force=True)
+                    await self._ui_settle_pause(0.25)
+                except Exception as force_error:
+                    last_error = force_error
+                    Logger.debug(
+                        "Google AI Studio: send button click failed "
+                        f"on attempt {attempt}/{self.SEND_CLICK_MAX_ATTEMPTS}: "
+                        f"{force_error} (initial click error: {e})"
+                    )
+                    await self._ui_settle_pause(0.25)
+                    continue
+
+            if await self._wait_for_send_click_observed(
+                previous_composer_text=previous_composer_text,
+                previous_prompt_had_media=previous_prompt_had_media,
+                completion_started=completion_started,
+            ):
                 return
-            except Exception:
-                Logger.warning(f"Google AI Studio: failed to click the send button: {e}")
+
+            Logger.warning(
+                "Google AI Studio: send click was not confirmed "
+                f"on attempt {attempt}/{self.SEND_CLICK_MAX_ATTEMPTS}; retrying."
+            )
+            await self._ui_settle_pause(0.35)
+
+        if last_error:
+            Logger.warning(f"Google AI Studio: failed to click the send button: {last_error}")
+        else:
+            Logger.warning(
+                "Google AI Studio: send button click did not register "
+                f"(last state: {last_state})."
+            )
 
     @staticmethod
     def _is_generate_content_url(url: str) -> bool:
         return AIStudioDriver.GENERATE_URL_SUBSTRING in str(url or "")
+
+    def _get_request_capture_mode(self) -> str:
+        try:
+            mode = str(
+                self.config_manager.get_setting("aistudio_behavior", "request_capture_mode")
+                or self.REQUEST_CAPTURE_MODE_REPLAY
+            ).strip().lower()
+        except Exception:
+            mode = self.REQUEST_CAPTURE_MODE_REPLAY
+
+        if mode == self.REQUEST_CAPTURE_MODE_CDP_TEEING:
+            return self.REQUEST_CAPTURE_MODE_CDP_TEEING
+        return self.REQUEST_CAPTURE_MODE_REPLAY
 
     def _is_generate_content_response(self, response) -> bool:
         """Return whether a Playwright response matches AI Studio's GenerateContent call."""
@@ -4082,6 +4674,7 @@ class AIStudioDriver(BaseDriver):
             if target is None:
                 continue
             try:
+                await self._restore_minimized_window_for_hmm()
                 await target.hover(timeout=3000)
                 await asyncio.sleep(0.15)
                 return True
@@ -4165,6 +4758,269 @@ class AIStudioDriver(BaseDriver):
         """Return whether the latest assistant turn has visible generated text."""
         return bool(await self._latest_assistant_turn_visible_text())
 
+    def _anti_censorship_edit_save_timeout_ms(self) -> int:
+        value = self._clamp_int(
+            self.config_manager.get_setting(
+                "aistudio_behavior",
+                "anti_censorship_edit_save_timeout",
+            ),
+            10,
+            1,
+            60,
+        )
+        return int(value) * 1000
+
+    def _anti_censorship_edit_save_retries(self) -> int:
+        return self._clamp_int(
+            self.config_manager.get_setting(
+                "aistudio_behavior",
+                "anti_censorship_edit_save_retries",
+            ),
+            2,
+            0,
+            5,
+        )
+
+    async def _track_assistant_edit_textarea(self, textarea):
+        """Return a locator tied to the exact assistant edit textarea when possible."""
+        if not self.page or textarea is None:
+            return textarea
+
+        token = f"irp-edit-{secrets.token_hex(8)}"
+        try:
+            await textarea.evaluate(
+                "(el, value) => el.setAttribute('data-irp-assistant-edit-token', value)",
+                token,
+            )
+            return self.page.locator(f"textarea[data-irp-assistant-edit-token='{token}']")
+        except Exception:
+            return textarea
+
+    async def _assistant_edit_textarea_visible(self, textarea) -> bool:
+        if textarea is None:
+            return False
+
+        try:
+            count = await textarea.count()
+            if count <= 0:
+                return False
+        except Exception:
+            pass
+
+        try:
+            return bool(await textarea.is_visible())
+        except Exception:
+            return False
+
+    async def _looks_like_prompt_composer_textarea(self, textarea) -> bool:
+        """Return whether a textarea is AI Studio's main prompt composer."""
+        if textarea is None:
+            return False
+
+        try:
+            return bool(
+                await textarea.evaluate(
+                    r"""(el) => {
+                        const normalize = (value) => (value || '').toString().replace(/\s+/g, ' ').trim().toLowerCase();
+                        const placeholder = normalize(el.getAttribute('placeholder'));
+                        if (placeholder.includes('start typing a prompt')) return true;
+                        if (placeholder.includes('enter a prompt')) return true;
+                        if (placeholder.includes('type a prompt')) return true;
+
+                        const label = normalize(el.getAttribute('aria-label'));
+                        if (label.includes('prompt')) return true;
+
+                        const composerHost = el.closest(
+                            'ms-prompt-input, ms-run-input, xap-prompt-input, ' +
+                            '.prompt-input, .prompt-input-wrapper, .prompt-input-container, ' +
+                            '.composer, .composer-container, .input-area, .input-container'
+                        );
+                        const turnHost = el.closest(
+                            'div.chat-turn-container.code-block-aligner.model.render.ng-star-inserted, ' +
+                            'ms-chat-turn'
+                        );
+                        return Boolean(composerHost && !turnHost);
+                    }"""
+                )
+            )
+        except Exception:
+            return False
+
+    async def _is_assistant_edit_textarea_candidate(self, textarea) -> bool:
+        if textarea is None:
+            return False
+        try:
+            if not await textarea.is_visible():
+                return False
+        except Exception:
+            return False
+        return not await self._looks_like_prompt_composer_textarea(textarea)
+
+    async def _find_first_assistant_edit_textarea_within(self, root, timeout_ms: int = 0):
+        if root is None:
+            return None
+
+        deadline = time.time() + max(0.0, float(timeout_ms) / 1000.0)
+        while True:
+            for selector in self.ASSISTANT_EDIT_TEXTAREA_SELECTORS:
+                locator = root.locator(selector)
+                try:
+                    count = await locator.count()
+                except Exception:
+                    count = 0
+
+                for idx in range(min(count, 10)):
+                    candidate = locator.nth(idx)
+                    if await self._is_assistant_edit_textarea_candidate(candidate):
+                        return candidate
+
+            if timeout_ms <= 0 or time.time() >= deadline:
+                return None
+            await asyncio.sleep(0.1)
+
+    async def _find_assistant_edit_save_button(self, container, timeout_ms: int = 0):
+        """Find the visible Save/Done button for an assistant edit session."""
+        deadline = time.time() + max(0.0, float(timeout_ms) / 1000.0)
+        while True:
+            button = None
+            if container is not None:
+                button = await self._find_first_visible_within(
+                    container,
+                    self.ASSISTANT_EDIT_SAVE_BUTTON_SELECTORS,
+                    timeout_ms=0,
+                )
+            if button is None:
+                button = await self._find_first_visible(
+                    self.ASSISTANT_EDIT_SAVE_BUTTON_SELECTORS,
+                    timeout_ms=0,
+                )
+
+            if button is not None:
+                try:
+                    if await button.is_enabled():
+                        return button
+                except Exception:
+                    return button
+
+            if timeout_ms <= 0 or time.time() >= deadline:
+                return None
+            await asyncio.sleep(0.15)
+
+    async def _wait_for_assistant_edit_to_close(self, textarea, timeout_ms: int) -> bool:
+        """Wait until AI Studio has left assistant edit mode."""
+        deadline = time.time() + max(0.0, float(timeout_ms) / 1000.0)
+        while True:
+            if not await self._assistant_edit_textarea_visible(textarea):
+                return True
+            if timeout_ms <= 0 or time.time() >= deadline:
+                return False
+            await asyncio.sleep(0.15)
+
+    async def _press_assistant_edit_shortcut(self, textarea) -> bool:
+        try:
+            await textarea.press("Control+Enter", timeout=3000)
+            return True
+        except Exception:
+            try:
+                if self.page:
+                    await self.page.keyboard.press("Control+Enter")
+                    return True
+            except Exception:
+                return False
+        return False
+
+    async def _submit_assistant_edit(self, textarea, container) -> bool:
+        """Click/wait for AI Studio's assistant edit save instead of racing the composer."""
+        timeout_ms = self._anti_censorship_edit_save_timeout_ms()
+        attempts = self._anti_censorship_edit_save_retries() + 1
+
+        for attempt in range(1, attempts + 1):
+            button_wait_ms = timeout_ms if attempt > 1 else min(timeout_ms, 2000)
+            save_button = await self._find_assistant_edit_save_button(
+                container,
+                timeout_ms=button_wait_ms,
+            )
+            if save_button is not None:
+                try:
+                    await self._click_locator(save_button, timeout=3000)
+                except Exception:
+                    try:
+                        await self._click_locator(save_button, timeout=3000, force=True)
+                    except Exception as e:
+                        Logger.debug(
+                            "Google AI Studio: assistant edit save button click failed "
+                            f"on attempt {attempt}: {e}"
+                        )
+            else:
+                Logger.debug(
+                    "Google AI Studio: assistant edit save button was not visible "
+                    f"on attempt {attempt}; trying Ctrl+Enter."
+                )
+                await self._press_assistant_edit_shortcut(textarea)
+
+            if await self._wait_for_assistant_edit_to_close(textarea, timeout_ms=timeout_ms):
+                await self._ui_settle_pause(0.25)
+                return True
+
+            Logger.warning(
+                "Google AI Studio: assistant edit did not finish saving "
+                f"on attempt {attempt}/{attempts}."
+            )
+            await self._ui_settle_pause(0.35)
+
+        return False
+
+    async def _open_assistant_edit_mode(self, turn, container):
+        """Open assistant edit mode and return its textarea, proving it is not the composer."""
+        for attempt in range(1, 4):
+            if not await self._hover_assistant_turn_controls(turn, container):
+                Logger.warning(
+                    "Google AI Studio: could not reveal assistant controls "
+                    f"for anti-censorship replacement on attempt {attempt}/3."
+                )
+                await self._ui_settle_pause(0.3)
+                continue
+
+            await self._ui_settle_pause(0.25)
+            edit_button = await self._find_first_visible_within(
+                container,
+                self.ASSISTANT_EDIT_BUTTON_SELECTORS,
+                timeout_ms=1600,
+            )
+            if edit_button is None:
+                Logger.warning(
+                    "Google AI Studio: assistant edit button was not found "
+                    f"on attempt {attempt}/3."
+                )
+                await self._ui_settle_pause(0.35)
+                continue
+
+            try:
+                await self._click_locator(edit_button, timeout=3500)
+            except Exception as e:
+                try:
+                    await self._click_locator(edit_button, timeout=3500, force=True)
+                except Exception:
+                    Logger.warning(
+                        f"Google AI Studio: failed to click assistant edit button "
+                        f"on attempt {attempt}/3: {e}"
+                    )
+                    await self._ui_settle_pause(0.35)
+                    continue
+
+            await self._ui_settle_pause(0.45)
+            textarea = await self._find_assistant_edit_textarea(container, timeout_ms=3000)
+            if textarea is not None:
+                return textarea
+
+            Logger.warning(
+                "Google AI Studio: assistant edit button was clicked, but edit mode "
+                f"did not open on attempt {attempt}/3."
+            )
+            await self._ui_settle_pause(0.45)
+
+        return None
+
     async def _replace_latest_assistant_message(self, replacement_text: str) -> bool:
         """Edit the latest assistant turn in-place and replace it with the provided text."""
         if await self._is_system_prompt_panel_open():
@@ -4181,33 +5037,14 @@ class AIStudioDriver(BaseDriver):
             Logger.warning("Google AI Studio: assistant turn for anti-censorship replacement was not found.")
             return False
 
-        if not await self._hover_assistant_turn_controls(turn, container):
-            Logger.warning("Google AI Studio: could not reveal assistant controls for anti-censorship replacement.")
-            return False
-
-        edit_button = await self._find_first_visible_within(
-            container,
-            self.ASSISTANT_EDIT_BUTTON_SELECTORS,
-            timeout_ms=1200,
-        )
-        if edit_button is None:
-            Logger.warning("Google AI Studio: assistant edit button was not found.")
-            return False
-
-        try:
-            await edit_button.click(timeout=3000)
-        except Exception as e:
-            try:
-                await edit_button.click(timeout=3000, force=True)
-            except Exception:
-                Logger.warning(f"Google AI Studio: failed to open assistant edit mode: {e}")
-                return False
-
-        await self._ui_settle_pause(0.18)
-        textarea = await self._find_assistant_edit_textarea(container, timeout_ms=5000)
+        textarea = await self._open_assistant_edit_mode(turn, container)
         if textarea is None:
-            Logger.warning("Google AI Studio: assistant edit textarea was not found.")
+            Logger.warning(
+                "Google AI Studio: assistant edit mode did not open; refusing to write "
+                "the replacement into the prompt composer."
+            )
             return False
+        textarea = await self._track_assistant_edit_textarea(textarea)
 
         if not await self._set_text_control_value(textarea, str(replacement_text or "")):
             Logger.warning("Google AI Studio: failed to replace the blocked assistant message.")
@@ -4215,32 +5052,46 @@ class AIStudioDriver(BaseDriver):
 
         await self._ui_settle_pause(0.28)
         try:
-            await textarea.click(timeout=2000, force=True)
+            await self._click_locator(textarea, timeout=2000, force=True)
         except Exception:
             pass
 
-        try:
-            await textarea.press("Control+Enter", timeout=3000)
-        except Exception as e:
-            try:
-                if self.page:
-                    await self.page.keyboard.press("Control+Enter")
-            except Exception:
-                Logger.warning(f"Google AI Studio: failed to submit assistant edit with Ctrl+Enter: {e}")
-                return False
+        if not await self._submit_assistant_edit(textarea, container):
+            Logger.warning("Google AI Studio: assistant edit save did not complete.")
+            return False
 
-        await self._ui_settle_pause(0.35)
         await self._refocus_composer_before_send()
         return True
 
     async def _find_assistant_edit_textarea(self, container, timeout_ms: int = 0):
-        """Find the assistant-edit textarea using a global visible lookup only."""
-        _ = container
-        return await self._find_first_visible(
-            self.ASSISTANT_EDIT_TEXTAREA_SELECTORS,
-            timeout_ms=int(timeout_ms or 0),
-            poll_interval_s=0.1,
+        """Find the assistant-edit textarea, explicitly excluding the prompt composer."""
+        scoped = await self._find_first_assistant_edit_textarea_within(
+            container,
+            timeout_ms=min(int(timeout_ms or 0), 1200),
         )
+        if scoped is not None:
+            return scoped
+
+        if not self.page:
+            return None
+
+        deadline = time.time() + max(0.0, float(timeout_ms) / 1000.0)
+        while True:
+            for selector in self.ASSISTANT_EDIT_TEXTAREA_SELECTORS:
+                locator = self.page.locator(selector)
+                try:
+                    count = await locator.count()
+                except Exception:
+                    count = 0
+
+                for idx in range(min(count, 10)):
+                    candidate = locator.nth(idx)
+                    if await self._is_assistant_edit_textarea_candidate(candidate):
+                        return candidate
+
+            if timeout_ms <= 0 or time.time() >= deadline:
+                return None
+            await asyncio.sleep(0.1)
 
     async def _click_regenerate(self) -> bool:
         """Click the most recent visible regenerate button in the chat transcript."""
@@ -4275,7 +5126,7 @@ class AIStudioDriver(BaseDriver):
                 continue
 
             try:
-                await button.first.click(timeout=3000)
+                await self._click_locator(button.first, timeout=3000)
                 return True
             except Exception:
                 continue
@@ -4531,6 +5382,19 @@ class AIStudioDriver(BaseDriver):
         self.current_send_deepthink = bool(effective_settings["send_deepthink"])
         anti_censorship_enabled = bool(effective_settings.get("anti_censorship"))
         caars_enabled = bool(effective_settings.get("caars_enabled"))
+        request_capture_mode = self._get_request_capture_mode()
+        use_cdp_teeing = request_capture_mode == self.REQUEST_CAPTURE_MODE_CDP_TEEING
+        route_handlers_registered = False
+        cdp_session: Any = None
+        cdp_listeners_registered = False
+        cdp_tasks: set[asyncio.Task] = set()
+        cdp_request_methods: Dict[str, str] = {}
+        cdp_pending_response_meta: Dict[str, Dict[str, Any]] = {}
+        cdp_active_request_id: str | None = None
+        cdp_stream_started = False
+        cdp_stream_finished = False
+        cdp_had_data = False
+        cdp_stream_state: Dict[str, Any] | None = None
 
         def _build_caars_savior_settings() -> Dict[str, Any]:
             savior_label = str(
@@ -4555,6 +5419,8 @@ class AIStudioDriver(BaseDriver):
         def _reset_attempt_state() -> None:
             nonlocal response_queue, completion_armed, completion_started
             nonlocal completion_claim_lock, completion_claimed, current_attempt_meta
+            nonlocal cdp_active_request_id, cdp_stream_started, cdp_stream_finished
+            nonlocal cdp_had_data, cdp_stream_state
             response_queue = asyncio.Queue()
             completion_armed = asyncio.Event()
             completion_started = asyncio.Event()
@@ -4570,6 +5436,13 @@ class AIStudioDriver(BaseDriver):
                 "aborted": False,
             }
             self.thinking_active = False
+            cdp_active_request_id = None
+            cdp_stream_started = False
+            cdp_stream_finished = False
+            cdp_had_data = False
+            cdp_stream_state = None
+            cdp_request_methods.clear()
+            cdp_pending_response_meta.clear()
 
         async def _wait_for_attempt_start(log_label: str) -> bool:
             if completion_started.is_set():
@@ -4724,7 +5597,10 @@ class AIStudioDriver(BaseDriver):
 
             completion_armed.set()
             Logger.info("Google AI Studio: sending request...")
-            await self.send_message(timeout=send_timeout)
+            await self.send_message(
+                timeout=send_timeout,
+                completion_started=completion_started,
+            )
 
             if await _wait_for_attempt_start("Google AI Studio"):
                 return None
@@ -4870,13 +5746,395 @@ class AIStudioDriver(BaseDriver):
                 Logger.info("Google AI Studio CAARS: sending main continue nudge...")
             else:
                 Logger.info("Google AI Studio: sending anti-censorship continue nudge...")
-            await self.send_message()
+            await self.send_message(completion_started=completion_started)
             if await _wait_for_attempt_start(log_label):
                 return None
             return (
                 f"{log_label} failed because the continue nudge did not start a "
                 "completion request."
             )
+
+        def _new_stream_state(status_code: int = 200) -> Dict[str, Any]:
+            return {
+                "parser": _AiStudioJsonEventStreamParser(),
+                "response_status": int(status_code or 200),
+                "aborted": False,
+                "encountered_error": False,
+                "emitted_text": False,
+                "hard_censorship_hint": False,
+                "rate_limit_hint": False,
+            }
+
+        async def _process_attempt_stream_event(
+            stream_state: Dict[str, Any],
+            parsed_event: Any,
+        ) -> None:
+            stream_state["hard_censorship_hint"] = (
+                bool(stream_state.get("hard_censorship_hint"))
+                or self._event_looks_hard_censored(parsed_event)
+            )
+            stream_state["rate_limit_hint"] = (
+                bool(stream_state.get("rate_limit_hint"))
+                or self._event_looks_rate_limited(parsed_event)
+            )
+            emitted = await self._process_stream_event(
+                parsed_event,
+                response_queue,
+                send_deepthink=bool(effective_settings["send_deepthink"]),
+            )
+            stream_state["emitted_text"] = bool(stream_state.get("emitted_text")) or emitted
+
+        async def _feed_attempt_stream_chunk(
+            stream_state: Dict[str, Any],
+            chunk: bytes,
+        ) -> None:
+            if not chunk or bool(stream_state.get("encountered_error")):
+                return
+
+            parser = stream_state.get("parser")
+            if not isinstance(parser, _AiStudioJsonEventStreamParser):
+                return
+
+            try:
+                parsed_events = parser.feed(chunk)
+            except Exception as e:
+                stream_state["encountered_error"] = True
+                Logger.error(f"Google AI Studio: failed to parse response stream: {e}")
+                await response_queue.put({"error": str(e)})
+                return
+
+            for parsed_event in parsed_events:
+                try:
+                    await _process_attempt_stream_event(stream_state, parsed_event)
+                except Exception as e:
+                    stream_state["encountered_error"] = True
+                    Logger.error(f"Google AI Studio: failed to process response stream: {e}")
+                    await response_queue.put({"error": str(e)})
+                    return
+                if bool(stream_state.get("encountered_error")):
+                    return
+
+        async def _finalize_attempt_stream_state(
+            stream_state: Dict[str, Any],
+            *,
+            flush_parser: bool = True,
+        ) -> bool:
+            nonlocal current_attempt_meta
+
+            if (
+                flush_parser
+                and not bool(stream_state.get("aborted"))
+                and not bool(stream_state.get("encountered_error"))
+            ):
+                parser = stream_state.get("parser")
+                if isinstance(parser, _AiStudioJsonEventStreamParser):
+                    try:
+                        parsed_events = parser.finish()
+                    except Exception as e:
+                        stream_state["encountered_error"] = True
+                        Logger.error(f"Google AI Studio: failed to parse response stream: {e}")
+                        await response_queue.put({"error": str(e)})
+                    else:
+                        for parsed_event in parsed_events:
+                            try:
+                                await _process_attempt_stream_event(stream_state, parsed_event)
+                            except Exception as e:
+                                stream_state["encountered_error"] = True
+                                Logger.error(f"Google AI Studio: failed to process response stream: {e}")
+                                await response_queue.put({"error": str(e)})
+                                break
+                            if bool(stream_state.get("encountered_error")):
+                                break
+
+            if self.thinking_active:
+                if bool(effective_settings["send_deepthink"]):
+                    await self._enqueue_openai_delta(response_queue, "</think>")
+                self.thinking_active = False
+
+            response_status = int(stream_state.get("response_status") or 0)
+            stream_state["rate_limit_hint"] = bool(
+                stream_state.get("rate_limit_hint") or response_status == 429
+            )
+            emitted_text = bool(stream_state.get("emitted_text"))
+            encountered_error = bool(stream_state.get("encountered_error"))
+            aborted = bool(stream_state.get("aborted"))
+            no_text_detected = (not emitted_text) and (not encountered_error) and (not aborted)
+
+            if no_text_detected:
+                if bool(stream_state.get("rate_limit_hint")):
+                    message_text = self._build_rate_limit_error_message(response_status)
+                    Logger.warning(message_text)
+                    await response_queue.put({"error": message_text})
+                    encountered_error = True
+                    stream_state["encountered_error"] = True
+                elif anti_censorship_enabled:
+                    Logger.warning(
+                        "Google AI Studio returned no assistant text, but anti-censorship is enabled. "
+                        "Deferring the final decision until blocked-turn checks finish."
+                    )
+                else:
+                    message_text = (
+                        "Google AI Studio returned no assistant text. "
+                        "The request may have been submitted before the UI fully settled."
+                    )
+                    Logger.warning(message_text)
+                    await response_queue.put({"error": message_text})
+                    encountered_error = True
+                    stream_state["encountered_error"] = True
+
+            current_attempt_meta = {
+                "hard_censorship_hint": bool(stream_state.get("hard_censorship_hint")),
+                "rate_limit_hint": bool(stream_state.get("rate_limit_hint")),
+                "no_text_detected": bool(no_text_detected),
+                "response_status": int(response_status),
+                "encountered_error": bool(encountered_error),
+                "emitted_text": bool(emitted_text),
+                "aborted": bool(aborted),
+            }
+
+            if emitted_text and (not encountered_error) and (not aborted) and (not self.abort_requested):
+                await self._enqueue_openai_delta(response_queue, "", finish_reason="stop")
+
+            return bool(encountered_error)
+
+        def _schedule_cdp_task(coro: Any, label: str) -> None:
+            try:
+                task = asyncio.create_task(coro)
+            except Exception as exc:
+                Logger.debug(f"Google AI Studio: failed to schedule CDP handler for {label}: {exc}")
+                return
+
+            cdp_tasks.add(task)
+
+            def _on_done(done_task: asyncio.Task) -> None:
+                cdp_tasks.discard(done_task)
+                try:
+                    done_task.exception()
+                except asyncio.CancelledError:
+                    pass
+                except Exception as exc:
+                    Logger.debug(f"Google AI Studio: CDP handler for {label} failed: {exc}")
+
+            task.add_done_callback(_on_done)
+
+        def _request_aborted() -> bool:
+            return bool(self.abort_requested or (abort_event and abort_event.is_set()))
+
+        async def _finish_cdp_stream(
+            request_id: str,
+            *,
+            aborted: bool = False,
+            encountered_error: bool = False,
+        ) -> None:
+            nonlocal cdp_stream_finished, cdp_active_request_id, cdp_stream_state
+            if request_id != cdp_active_request_id or cdp_stream_finished:
+                return
+
+            cdp_stream_finished = True
+            if cdp_stream_state is None:
+                meta = cdp_pending_response_meta.get(request_id) or {}
+                cdp_stream_state = _new_stream_state(int(meta.get("status") or 200))
+            cdp_stream_state["aborted"] = bool(cdp_stream_state.get("aborted")) or aborted
+            cdp_stream_state["encountered_error"] = (
+                bool(cdp_stream_state.get("encountered_error")) or encountered_error
+            )
+
+            await _finalize_attempt_stream_state(
+                cdp_stream_state,
+                flush_parser=not bool(cdp_stream_state.get("aborted")),
+            )
+            await response_queue.put(None)
+            cdp_request_methods.pop(request_id, None)
+            cdp_pending_response_meta.pop(request_id, None)
+            cdp_active_request_id = None
+            cdp_stream_state = None
+
+            if (
+                not aborted
+                and not encountered_error
+                and not bool(current_attempt_meta.get("encountered_error"))
+                and not _request_aborted()
+            ):
+                Logger.success("Google AI Studio CDP stream completed.")
+
+        async def _feed_cdp_stream_chunk(request_id: str, data: bytes) -> None:
+            nonlocal cdp_had_data, cdp_stream_state
+            if request_id != cdp_active_request_id or not data or cdp_stream_finished:
+                return
+
+            if cdp_stream_state is None:
+                meta = cdp_pending_response_meta.get(request_id) or {}
+                cdp_stream_state = _new_stream_state(int(meta.get("status") or 200))
+
+            cdp_had_data = True
+            if _request_aborted():
+                await _finish_cdp_stream(request_id, aborted=True)
+                return
+
+            await _feed_attempt_stream_chunk(cdp_stream_state, data)
+            if bool(cdp_stream_state.get("encountered_error")):
+                await _finish_cdp_stream(request_id, encountered_error=True)
+                return
+
+            if _request_aborted():
+                await _finish_cdp_stream(request_id, aborted=True)
+
+        async def _feed_base64_cdp_stream_chunk(request_id: str, encoded_data: Any) -> None:
+            if not encoded_data:
+                return
+            encoded_text = str(encoded_data)
+            try:
+                data = base64.b64decode(encoded_text, validate=True)
+            except Exception:
+                data = encoded_text.encode("utf-8", errors="ignore")
+            await _feed_cdp_stream_chunk(request_id, data)
+
+        async def _start_cdp_stream(request_id: str, meta: Dict[str, Any]) -> None:
+            nonlocal cdp_stream_started, cdp_stream_state
+            if (
+                request_id != cdp_active_request_id
+                or not cdp_session
+                or cdp_stream_started
+                or cdp_stream_finished
+            ):
+                return
+
+            cdp_stream_started = True
+            cdp_stream_state = _new_stream_state(int(meta.get("status") or 200))
+            url = str(meta.get("url") or "")
+            Logger.info("Teeing Google AI Studio API response via CDP...")
+            Logger.debug(f"Teeing request to: {url}")
+            try:
+                result = await cdp_session.send(
+                    "Network.streamResourceContent",
+                    {"requestId": request_id},
+                )
+            except Exception as exc:
+                message_text = f"Google AI Studio CDP response streaming failed: {exc}"
+                Logger.error(message_text)
+                await response_queue.put({"error": message_text})
+                await _finish_cdp_stream(request_id, encountered_error=True)
+                return
+
+            if isinstance(result, dict):
+                await _feed_base64_cdp_stream_chunk(request_id, result.get("bufferedData"))
+
+        async def _handle_cdp_request_will_be_sent(params: Any) -> None:
+            nonlocal completion_claimed, cdp_active_request_id
+            nonlocal cdp_stream_started, cdp_stream_finished, cdp_had_data, cdp_stream_state
+            if not isinstance(params, dict):
+                return
+            request_id = str(params.get("requestId") or "").strip()
+            request = params.get("request")
+            if not request_id or not isinstance(request, dict):
+                return
+
+            method = str(request.get("method") or "").upper()
+            cdp_request_methods[request_id] = method
+            url = str(request.get("url") or "")
+            if method != "POST" or not self._is_generate_content_url(url):
+                return
+            if not completion_armed.is_set():
+                return
+
+            async with completion_claim_lock:
+                if completion_claimed:
+                    return
+                completion_claimed = True
+                cdp_active_request_id = request_id
+                cdp_stream_started = False
+                cdp_stream_finished = False
+                cdp_had_data = False
+                cdp_stream_state = None
+                completion_started.set()
+
+            Logger.info("Observing Google AI Studio API request via CDP...")
+            Logger.debug(f"Observed request to: {url}")
+            pending_meta = cdp_pending_response_meta.get(request_id)
+            if pending_meta:
+                await _start_cdp_stream(request_id, pending_meta)
+
+        async def _handle_cdp_response_received(params: Any) -> None:
+            if not isinstance(params, dict):
+                return
+            request_id = str(params.get("requestId") or "").strip()
+            response = params.get("response")
+            if not request_id or not isinstance(response, dict):
+                return
+            url = str(response.get("url") or "")
+            if not self._is_generate_content_url(url):
+                return
+            method = cdp_request_methods.get(request_id, "").upper()
+            if method and method != "POST":
+                return
+            try:
+                status = int(response.get("status") or 200)
+            except Exception:
+                status = 200
+            meta = {"url": url, "status": status}
+            cdp_pending_response_meta[request_id] = meta
+            if request_id != cdp_active_request_id:
+                return
+            await _start_cdp_stream(request_id, meta)
+
+        async def _handle_cdp_data_received(params: Any) -> None:
+            if not isinstance(params, dict):
+                return
+            request_id = str(params.get("requestId") or "").strip()
+            if request_id == cdp_active_request_id:
+                await _feed_base64_cdp_stream_chunk(request_id, params.get("data"))
+
+        async def _handle_cdp_loading_finished(params: Any) -> None:
+            if not isinstance(params, dict):
+                return
+            request_id = str(params.get("requestId") or "").strip()
+            if request_id == cdp_active_request_id:
+                await _finish_cdp_stream(request_id)
+            else:
+                cdp_request_methods.pop(request_id, None)
+                cdp_pending_response_meta.pop(request_id, None)
+
+        async def _handle_cdp_loading_failed(params: Any) -> None:
+            if not isinstance(params, dict):
+                return
+            request_id = str(params.get("requestId") or "").strip()
+            if request_id != cdp_active_request_id:
+                cdp_request_methods.pop(request_id, None)
+                cdp_pending_response_meta.pop(request_id, None)
+                return
+
+            if _request_aborted():
+                await _finish_cdp_stream(request_id, aborted=True)
+                return
+
+            error_text = str(params.get("errorText") or "network loading failed").strip()
+            if "ERR_ABORTED" in error_text.upper() and cdp_had_data:
+                Logger.debug(
+                    "Google AI Studio CDP stream ended with net::ERR_ABORTED after data arrived; "
+                    "treating it as complete."
+                )
+                await _finish_cdp_stream(request_id)
+                return
+
+            message_text = f"Google AI Studio CDP stream failed: {error_text}"
+            Logger.error(message_text)
+            await response_queue.put({"error": message_text})
+            await _finish_cdp_stream(request_id, encountered_error=True)
+
+        def _on_cdp_request_will_be_sent(params: Any) -> None:
+            _schedule_cdp_task(_handle_cdp_request_will_be_sent(params), "requestWillBeSent")
+
+        def _on_cdp_response_received(params: Any) -> None:
+            _schedule_cdp_task(_handle_cdp_response_received(params), "responseReceived")
+
+        def _on_cdp_data_received(params: Any) -> None:
+            _schedule_cdp_task(_handle_cdp_data_received(params), "dataReceived")
+
+        def _on_cdp_loading_finished(params: Any) -> None:
+            _schedule_cdp_task(_handle_cdp_loading_finished(params), "loadingFinished")
+
+        def _on_cdp_loading_failed(params: Any) -> None:
+            _schedule_cdp_task(_handle_cdp_loading_failed(params), "loadingFailed")
 
         async def handle_route(route):
             nonlocal completion_claimed, current_attempt_meta
@@ -4916,15 +6174,11 @@ class AIStudioDriver(BaseDriver):
             cookie_dict = {c["name"]: c["value"] for c in cookies}
             request_body = self._extract_request_body_bytes(request)
 
-            parser = _AiStudioJsonEventStreamParser()
+            stream_state = _new_stream_state()
             response_headers: Dict[str, str] = {}
             full_response_body = bytearray()
             response_status = 200
             aborted = False
-            encountered_error = False
-            emitted_text = False
-            hard_censorship_hint = False
-            rate_limit_hint = False
 
             try:
                 client = await self._get_http_client()
@@ -4938,6 +6192,7 @@ class AIStudioDriver(BaseDriver):
 
                 async with client.stream(request.method, request.url, **request_kwargs) as response:
                     response_status = int(response.status_code)
+                    stream_state["response_status"] = response_status
                     for k, v in response.headers.items():
                         response_headers[k] = v
                     response_headers.pop("content-encoding", None)
@@ -4948,87 +6203,26 @@ class AIStudioDriver(BaseDriver):
                         if self.abort_requested or (abort_event and abort_event.is_set()):
                             Logger.debug("Abort detected during Google AI Studio streaming, stopping...")
                             aborted = True
+                            stream_state["aborted"] = True
                             break
 
                         full_response_body.extend(chunk)
-                        for parsed_event in parser.feed(chunk):
-                            hard_censorship_hint = (
-                                hard_censorship_hint or self._event_looks_hard_censored(parsed_event)
-                            )
-                            rate_limit_hint = (
-                                rate_limit_hint or self._event_looks_rate_limited(parsed_event)
-                            )
-                            emitted = await self._process_stream_event(
-                                parsed_event,
-                                response_queue,
-                                send_deepthink=bool(effective_settings["send_deepthink"]),
-                            )
-                            emitted_text = emitted_text or emitted
-
-                    if not aborted:
-                        for parsed_event in parser.finish():
-                            hard_censorship_hint = (
-                                hard_censorship_hint or self._event_looks_hard_censored(parsed_event)
-                            )
-                            rate_limit_hint = (
-                                rate_limit_hint or self._event_looks_rate_limited(parsed_event)
-                            )
-                            emitted = await self._process_stream_event(
-                                parsed_event,
-                                response_queue,
-                                send_deepthink=bool(effective_settings["send_deepthink"]),
-                            )
-                            emitted_text = emitted_text or emitted
+                        await _feed_attempt_stream_chunk(stream_state, chunk)
+                        if bool(stream_state.get("encountered_error")):
+                            break
             except httpx.ReadError as e:
                 if not aborted and not self.abort_requested:
-                    encountered_error = True
+                    stream_state["encountered_error"] = True
                     Logger.error(f"Google AI Studio: read error during intercepted request: {e}")
                     await response_queue.put({"error": str(e)})
             except Exception as e:
                 if not aborted and not self.abort_requested:
-                    encountered_error = True
+                    stream_state["encountered_error"] = True
                     Logger.error(f"Google AI Studio: error during intercepted request: {e}")
                     await response_queue.put({"error": str(e)})
 
-            if self.thinking_active:
-                if bool(effective_settings["send_deepthink"]):
-                    await self._enqueue_openai_delta(response_queue, "</think>")
-                self.thinking_active = False
-
-            rate_limit_hint = bool(rate_limit_hint or response_status == 429)
-            no_text_detected = (not emitted_text) and (not encountered_error) and (not aborted)
-            if no_text_detected:
-                if rate_limit_hint:
-                    message = self._build_rate_limit_error_message(response_status)
-                    Logger.warning(message)
-                    await response_queue.put({"error": message})
-                    encountered_error = True
-                elif anti_censorship_enabled:
-                    Logger.warning(
-                        "Google AI Studio returned no assistant text, but anti-censorship is enabled. "
-                        "Deferring the final decision until blocked-turn checks finish."
-                    )
-                else:
-                    message = (
-                        "Google AI Studio returned no assistant text. "
-                        "The request may have been submitted before the UI fully settled."
-                    )
-                    Logger.warning(message)
-                    await response_queue.put({"error": message})
-                    encountered_error = True
-
-            current_attempt_meta = {
-                "hard_censorship_hint": bool(hard_censorship_hint),
-                "rate_limit_hint": bool(rate_limit_hint),
-                "no_text_detected": bool(no_text_detected),
-                "response_status": int(response_status),
-                "encountered_error": bool(encountered_error),
-                "emitted_text": bool(emitted_text),
-                "aborted": bool(aborted),
-            }
-
-            if emitted_text and (not encountered_error) and (not aborted) and (not self.abort_requested):
-                await self._enqueue_openai_delta(response_queue, "", finish_reason="stop")
+            await _finalize_attempt_stream_state(stream_state, flush_parser=not aborted)
+            encountered_error = bool(stream_state.get("encountered_error"))
 
             if "content-type" not in response_headers:
                 response_headers["content-type"] = "application/json+protobuf; charset=UTF-8"
@@ -5046,9 +6240,33 @@ class AIStudioDriver(BaseDriver):
             if not encountered_error and not aborted and not self.abort_requested:
                 Logger.success("Google AI Studio response streaming completed.")
 
-        await self.page.route(self.GENERATE_ROUTE_GLOB, handle_route)
-
         try:
+            if use_cdp_teeing:
+                if not self.context or not self.page:
+                    message_text = "Google AI Studio CDP setup failed: browser context is not available."
+                    Logger.error(message_text)
+                    yield f"data: {json.dumps({'error': message_text})}\n\n"
+                    return
+                try:
+                    cdp_session = await self.context.new_cdp_session(self.page)
+                    await cdp_session.send("Network.enable", {})
+                    cdp_session.on("Network.requestWillBeSent", _on_cdp_request_will_be_sent)
+                    cdp_session.on("Network.responseReceived", _on_cdp_response_received)
+                    cdp_session.on("Network.dataReceived", _on_cdp_data_received)
+                    cdp_session.on("Network.loadingFinished", _on_cdp_loading_finished)
+                    cdp_session.on("Network.loadingFailed", _on_cdp_loading_failed)
+                    cdp_listeners_registered = True
+                    Logger.info("Google AI Studio Request Capture Mode: CDP Teeing.")
+                except Exception as exc:
+                    message_text = f"Google AI Studio CDP setup failed: {exc}"
+                    Logger.error(message_text)
+                    yield f"data: {json.dumps({'error': message_text})}\n\n"
+                    return
+            else:
+                await self.page.route(self.GENERATE_ROUTE_GLOB, handle_route)
+                route_handlers_registered = True
+                Logger.info("Google AI Studio Request Capture Mode: Replay.")
+
             formatted_message, system_prompt_text = self._prepare_prompt_payload(message_for_formatting)
             aistudio_extra_prompt_texts: Dict[str, str] = {}
             text_file_message = str(effective_settings.get("text_file_message") or "")
@@ -5298,10 +6516,40 @@ class AIStudioDriver(BaseDriver):
             self.current_model = None
             self.current_send_deepthink = None
             self.thinking_active = False
-            try:
-                await self.page.unroute(self.GENERATE_ROUTE_GLOB)
-            except Exception:
-                pass
+            if route_handlers_registered:
+                try:
+                    await self.page.unroute(self.GENERATE_ROUTE_GLOB, handle_route)
+                except Exception:
+                    try:
+                        await self.page.unroute(self.GENERATE_ROUTE_GLOB)
+                    except Exception:
+                        pass
+            if cdp_session and cdp_listeners_registered:
+                for event_name, listener in (
+                    ("Network.requestWillBeSent", _on_cdp_request_will_be_sent),
+                    ("Network.responseReceived", _on_cdp_response_received),
+                    ("Network.dataReceived", _on_cdp_data_received),
+                    ("Network.loadingFinished", _on_cdp_loading_finished),
+                    ("Network.loadingFailed", _on_cdp_loading_failed),
+                ):
+                    try:
+                        cdp_session.remove_listener(event_name, listener)
+                    except Exception:
+                        pass
+            for task in list(cdp_tasks):
+                if not task.done():
+                    task.cancel()
+            tasks_to_wait = set(cdp_tasks)
+            if tasks_to_wait:
+                try:
+                    await asyncio.wait(tasks_to_wait, timeout=1.0)
+                except Exception:
+                    pass
+            if cdp_session:
+                try:
+                    await cdp_session.detach()
+                except Exception as exc:
+                    Logger.debug(f"Google AI Studio: CDP detach failed: {exc}")
             if preflight_settings_for_next_chat is not None:
                 self._schedule_preflight_next_chat(
                     preflight_settings_for_next_chat,

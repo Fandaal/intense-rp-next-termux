@@ -28,6 +28,7 @@ PROVIDER_ICON_MAP: dict[str, str] = {
     DriverProvider.PERPLEXITY.value: "providers/perplexity.svg",
     DriverProvider.HUGGINGCHAT.value: "providers/huggingface.svg",
     DriverProvider.AI_STUDIO.value: "providers/aistudio.svg",
+    DriverProvider.MIMO.value: "providers/xiaomi.svg",
 }
 
 

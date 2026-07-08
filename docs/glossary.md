@@ -16,7 +16,7 @@ This page translates the names, acronyms, and weird bits that show up around Int
 | IntenseRP / IRP | The local desktop app and API bridge. | "IRP" is just the short name people use when typing fast. |
 | IRP Next v2 | The current rewritten version of IntenseRP Next. | v2 uses FastAPI, PySide6, and Playwright/Patchright instead of the older v1 stack. |
 | Client | The app sending requests to IntenseRP. | Usually SillyTavern, but any OpenAI-compatible client can work. |
-| Provider | The AI service IntenseRP is driving in a browser. | Examples: DeepSeek, GLM Chat, Kimi / Moonshot, QwenLM, Perplexity, HuggingChat, and Google AI Studio. |
+| Provider | The AI service IntenseRP is driving in a browser. | Examples: DeepSeek, GLM Chat, Kimi / Moonshot, QwenLM, Perplexity, HuggingChat, Google AI Studio, and Xiaomi MiMo. |
 | Provider web UI | The normal website interface for a provider. | IntenseRP automates this page instead of calling the provider's official API. |
 | Driver | Provider-specific automation code. | A driver knows which buttons, streams, model pickers, and quirks belong to one provider. |
 | OpenAI-compatible API | An API shaped like OpenAI's chat/completions endpoints. | It lets clients reuse their OpenAI-style connection settings with IntenseRP. |
@@ -24,7 +24,7 @@ This page translates the names, acronyms, and weird bits that show up around Int
 | `/v1` | The API route prefix IntenseRP exposes. | The main routes are `/v1/models`, `/v1/chat/completions`, and `/v1/completions`. |
 | Model ID | The model name sent by the client. | In IntenseRP, many model IDs are really behavior presets rather than exact provider models. |
 | Behavior preset | A model ID that selects a behavior mode. | Example: `deepseek-reasoner` turns DeepThink on, while `deepseek-chat` turns it off. |
-| Real model ID | A model ID that maps to an actual provider model picker entry. | Used for providers with real model selection, such as GLM Chat, QwenLM, Perplexity, HuggingChat, and Google AI Studio. |
+| Real model ID | A model ID that maps to an actual provider model picker entry. | Used for providers with real model selection, such as GLM Chat, QwenLM, Perplexity, HuggingChat, Google AI Studio, and Xiaomi MiMo. |
 | UMM / Universal Model Names | Provider-neutral model names like `intenserp-auto`. | Handy if you switch providers often. See [Universal Model Names](features/universal-model-names.md). |
 | Hotswap | Switching providers from the main window while the app is running. | It saves a trip into Settings. See [Hotswaps](features/hotswaps.md). |
 | Loadout | A named set of formatting and provider behavior settings. | Experimental, provider-scoped, and useful for quickly changing "profiles" of settings. |
@@ -96,9 +96,9 @@ This page translates the names, acronyms, and weird bits that show up around Int
 | Reuse Matching Chat / Clean Regeneration | Reopen/regenerate a matching previous chat instead of creating a new one. | Helpful for SillyTavern swipes/regenerations. |
 | Search Older Matching Chats | Reuse one of several older cached matching chats. | Also called multi-slot cache in older/internal wording. |
 | Delete Chat After Reply | Delete the provider-side chat after a successful response. | Usually incompatible with Reuse Matching Chat. |
-| Repetition Buster | GLM workaround for duplicate prompts. | Sends a throwaway prompt first so GLM treats the real request as fresh. |
-| Anti-Censorship | Provider-specific recovery from blocked/refusal-like output. | Behavior differs by provider; it is not a guarantee of any result. |
-| CAARS | Cupcake's AIStudio AntiCensorship Ratelimit Saver. | AI Studio-only flow that runs a secondary "savior" model before continuing with the real one. |
+| Repetition Buster | GLM duplicate-prompt workaround. | Sends a throwaway prompt first so GLM treats the real request as fresh. |
+| Blocked-Response Handling | Provider-specific handling for blocked/refusal-like output. | Behavior differs by provider; it does not override provider policy or guarantee any result. |
+| CAARS | AI Studio-only prelude for blocked-response handling. | Runs a secondary model before continuing with the main one. |
 | Preflight Next Chat | Prepare a blank AI Studio chat after a response finishes. | Best-effort speed-up for the next request. |
 | Safety Filters | Provider-side content filters. | AI Studio exposes sliders; IntenseRP can lower them, but cannot make the model ignore all safety behavior. |
 
@@ -117,6 +117,7 @@ This page translates the names, acronyms, and weird bits that show up around Int
 | Playwright | Browser automation library. | IntenseRP uses it to control the provider web UI. |
 | Patchright | Playwright-compatible browser automation fork used here. | Helps IntenseRP drive provider pages in a real browser. |
 | Browser Manager | Utility window for installing, reinstalling, or deleting the browser bundle. | See [Browser Manager](util-reference/browser-manager.md). |
+| Browser proxy | Optional proxy passed to provider browser contexts. | Useful for providers with regional access issues, especially MiMo. |
 | WAF | Web Application Firewall. | A provider-side protection layer that can sometimes dislike automated browsers. |
 | Config directory | The folder where IntenseRP stores settings, keys, profiles, and logs. | Treat it as sensitive. It can contain credentials and session data. |
 | App flags | Hidden persistent app switches. | Advanced/internal state stored separately from normal settings. |
@@ -126,9 +127,9 @@ This page translates the names, acronyms, and weird bits that show up around Int
 | Console dump | Export of console contents. | Useful when sharing logs after something breaks. |
 | Bug report bundle | A zip with selected diagnostics. | Built to share enough context for debugging while redacting some sensitive values. |
 | Remote Control | Experimental browser page for controlling IntenseRP from another device. | Still respects IP whitelist rules when enabled. |
-| Providers in Parallel | Experimental mode that keeps multiple provider browsers alive. | Requests route by model ID. |
-| Parallel Request Queue | Experimental mode that lets different provider lanes work at once. | Requires Providers in Parallel. |
-| Full Parallelization | Experimental mode with multiple lanes per provider. | Needs saved accounts/profiles and uses much more RAM. |
+| Providers in Parallel | Runtime mode that keeps multiple provider browsers alive. | Requests route by model ID. |
+| Concurrent Requests | Runtime queue mode that lets different provider lanes work at once. | Now part of Providers in Parallel Mode. |
+| Multiple Instances per Provider | Providers in Parallel mode with multiple lanes per provider. | Needs saved accounts/profiles and uses much more RAM. |
 
 ---
 

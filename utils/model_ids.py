@@ -23,6 +23,7 @@ REAL_MODEL_ID_PROVIDERS: set[DriverProvider] = {
     DriverProvider.PERPLEXITY,
     DriverProvider.HUGGINGCHAT,
     DriverProvider.AI_STUDIO,
+    DriverProvider.MIMO,
 }
 
 UMM_MODEL_IDS: tuple[str, ...] = (
@@ -85,6 +86,11 @@ LEGACY_MODE_BY_PROVIDER: Dict[DriverProvider, Dict[str, str]] = {
         "aistudio-chat": MODE_CHAT,
         "aistudio-reasoner": MODE_REASONER,
     },
+    DriverProvider.MIMO: {
+        "mimo-auto": MODE_AUTO,
+        "mimo-chat": MODE_CHAT,
+        "mimo-reasoner": MODE_REASONER,
+    },
 }
 
 LEGACY_MODEL_IDS_BY_PROVIDER: Dict[DriverProvider, tuple[str, ...]] = {
@@ -100,6 +106,7 @@ LEGACY_MODEL_PREFIX_BY_PROVIDER: Dict[DriverProvider, str] = {
     DriverProvider.PERPLEXITY: "perplexity",
     DriverProvider.HUGGINGCHAT: "huggingchat",
     DriverProvider.AI_STUDIO: "aistudio",
+    DriverProvider.MIMO: "mimo",
 }
 
 OWNED_BY_PROVIDER: Dict[DriverProvider, str] = {
@@ -110,6 +117,7 @@ OWNED_BY_PROVIDER: Dict[DriverProvider, str] = {
     DriverProvider.PERPLEXITY: "perplexity",
     DriverProvider.HUGGINGCHAT: "huggingchat",
     DriverProvider.AI_STUDIO: "aistudio",
+    DriverProvider.MIMO: "mimo",
 }
 
 AISTUDIO_MODEL_OVERRIDE_SUFFIX_RE = re.compile(r"-(minimal|low|medium|high|r[0-4])$")

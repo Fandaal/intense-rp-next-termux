@@ -81,14 +81,6 @@ Opens the main documentation page.
 
 :material-arrow-right: [Open Docs](https://intense-rp-next.readthedocs.io/en/latest/)
 
-### :material-heart: Donate
-
-Opens the optional financial support section in the docs.
-
-:material-arrow-right: [Support the Project](../hands/support.md#financial-support-optional)
-
----
-
 ## :material-arrow-left: Back
 
 [:material-arrow-left: Util Reference](../util-reference.md)

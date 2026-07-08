@@ -17,7 +17,7 @@
   <img alt="Python" src="https://img.shields.io/badge/python-3.12%2B-3776AB?style=flat-square&logo=python&logoColor=white" />
   <a href="LICENSE"><img alt="License" src="https://img.shields.io/github/license/LyubomirT/intense-rp-next?style=flat-square" /></a>
   <a href="https://intense-rp-next.readthedocs.io/en/latest/"><img alt="Docs" src="https://img.shields.io/website?url=https%3A%2F%2Fintense-rp-next.readthedocs.io%2Fen%2Flatest%2F&label=docs&style=flat-square" /></a>
-  <img alt="Status" src="https://img.shields.io/badge/status-stable-2ea44f?style=flat-square" />
+  <img alt="Status" src="https://img.shields.io/badge/status-archived-6a737d?style=flat-square" />
   <a href="https://discord.gg/4Gvjk2RdsK"><img alt="Discord" src="https://img.shields.io/badge/Discord-5865F2?style=flat-square&logo=discord&logoColor=white" /></a>
 </p>
 
@@ -40,18 +40,19 @@ https://github.com/user-attachments/assets/ebf1bfcd-3b23-4614-b584-174791bcb004
 
 
 <p align="center">
-  <a href="https://intense-rp-next.readthedocs.io/en/latest/hands/support/"><img src=".github/svgs/donate.svg" alt="Support the Project" height="42"></a>
-  &nbsp;&nbsp;&nbsp;
   <a href="https://github.com/LyubomirT/intense-rp-next/stargazers"><img src=".github/svgs/star2.svg" alt="Leave a Star" height="42"></a>
 </p>
+
+> [!IMPORTANT]
+> This project is being archived and is no longer actively maintained. The code and docs remain available for historical/reference use. Provider websites can change without notice, so existing integrations may break. Use this only with services, accounts, and data you are authorized to access, and follow the applicable provider terms.
 
 
 ## Welcome 👋
 
-If you're here because you want to use an LLM in SillyTavern without wiring up a paid official API: Welcome to the club!
-IntenseRP Next v2 drives official provider web apps (like DeepSeek, Z.AI, Kimi, QwenLM, Perplexity, HuggingChat, and Google AI Studio) in a real browser, and re-exposes them as an OpenAI-compatible endpoint.
+If you're here because you need a local bridge between SillyTavern and a browser-based provider chat, this repository may still be useful as reference.
+IntenseRP Next v2 drives supported provider web apps (like DeepSeek, Z.AI, Kimi, QwenLM, Perplexity, HuggingChat, and Google AI Studio) in a real browser, and re-exposes the browser session as an OpenAI-compatible endpoint.
 
-Compared to official APIs, this is often free-ish depending on the provider/account, and it gives you access to the full web UI experience (including reasoning toggles, search, file uploads, and more). Not without tradeoffs, of course - see below.
+It can mirror provider web UI controls such as reasoning toggles, search, file uploads, and model pickers where those controls are available to your account. The tradeoff is that it depends on third-party web pages, so it is inherently fragile and should be treated as a local personal-use tool.
   
 ## Start here! 🎁
 
@@ -66,19 +67,17 @@ And it's done! It should Just Work™️.
 IntenseRP Next v2 (sometimes shortened to "IRP Next v2") is a local bridge between:
 
 - an OpenAI-style client (like SillyTavern), and
-- a supported provider web app (DeepSeek, GLM Chat, Kimi / Moonshot, QwenLM, Perplexity, or HuggingChat; Google AI Studio is temporarily locked by default)
+- a supported provider web app (DeepSeek, GLM Chat, Kimi / Moonshot, QwenLM, Perplexity, HuggingChat, or Google AI Studio)
 
 Under the hood it:
 
 1. Starts a local FastAPI server (OpenAI-compatible routes under `/v1`)
 2. Launches a real Chromium session (Patchright/Playwright)
 3. Logs in (manual or auto-login)
-4. Intercepts the provider's streaming network responses
+4. Captures the provider's streaming responses in the browser session
 5. Re-emits them as OpenAI-style SSE deltas for your client
 
-In normal human terms, it's free-ish access to LLMs via their official web apps, but turned into an API you can use in SillyTavern and other OpenAI-compatible clients.
-
-Of course, there are also official paid APIs, but not everyone can pay for them, so this is kind of a free alternative. 🙂
+In normal human terms, it is a local compatibility layer between a desktop browser session and OpenAI-style clients.
 
 ## Should you use it? 🎯
 
@@ -86,7 +85,7 @@ If you read this far, you probably have a use case in mind! But here's the objec
 
 It would work well for you if you:
 
-- want free-ish access to provider web models via the official web apps
+- want a local bridge for provider web models
 - prefer a clicky desktop app over a pile of scripts
 - are OK with the occasional wait or hiccup (web apps change)
 
@@ -94,6 +93,7 @@ Not the best fit if you:
 
 - need high throughput / parallel requests without using the experimental parallel modes
 - want to run headless on a server
+- need an actively maintained project with support guarantees
 - want something that never breaks (that's perhaps the biggest caveat)
 
 > [!NOTE]
@@ -106,7 +106,7 @@ Not the best fit if you:
 v2 is a full rewrite based on lessons learned from the original **IntenseRP API** (by Omega-Slender) and my own **IntenseRP Next v1**.
 The focus is less on a pile of features and more on making it sane to maintain and hard to break.
 
-It's a more modular codebase with a Playwright-first approach (network interception, no scraping), a better UI (PySide6), and a cleaner settings model, plus built-in update and migration flows.
+It's a more modular codebase with a Playwright-first browser-control approach, a better UI (PySide6), and a cleaner settings model, plus built-in update and migration flows.
 
 If you want to compare, have a look:
 
@@ -115,7 +115,7 @@ If you want to compare, have a look:
 | Backend | Python (Flask) | Python (FastAPI) |
 | UI | customtkinter | PySide6 (Qt) |
 | Automation | Selenium-based | Playwright (Patchright) |
-| Scraping | HTML parsing (plus workarounds for NI) | Native Network interception |
+| Response capture | HTML parsing | Structured browser response handling |
 
 ## Quick start
 
@@ -178,7 +178,7 @@ Once the app says **Running (Port 7777)**:
 | Endpoint | `http://127.0.0.1:7777/v1` |
 | API | OpenAI-compatible chat or text completions |
 | API key | Leave blank (unless you enabled API keys) |
-| Model | Provider model IDs like `deepseek-*`, `glm-*`, `moonshot-*`, `qwen-*`, `perplexity-*`, or `huggingchat-*` |
+| Model | Provider model IDs like `deepseek-*`, `glm-*`, `moonshot-*`, `qwen-*`, `perplexity-*`, `huggingchat-*`, or `aistudio-*` |
 
 Available model IDs (depends on provider):
 
@@ -209,7 +209,7 @@ Available model IDs (depends on provider):
   - `huggingchat-auto` (uses your IntenseRP settings)
   - `huggingchat-chat` (uses HuggingChat's default/off behavior)
   - `huggingchat-reasoner` (enables HuggingChat Thinking where available)
-- Google AI Studio (only when **Ignore Provider Locks** is enabled):
+- Google AI Studio:
   - `aistudio-auto` (uses your IntenseRP settings)
   - `aistudio-chat` (forces Thinking off, Send Thinking off)
   - `aistudio-reasoner` (forces Thinking on, Send Thinking follows your setting)
@@ -258,7 +258,7 @@ Current supported providers:
 | <img src=".github/svgs/providers/qwen.svg" width="18" alt=""> **QwenLM** | Stable | Thinking, Web Search, model selection, token counting, and uploads |
 | <img src=".github/svgs/providers/perplexity.svg" width="18" alt=""> **Perplexity** | Verification | Model selection, Thinking/Search controls, uploads, and email-code login |
 | <img src=".github/svgs/providers/huggingface.svg" width="18" alt=""> **HuggingChat** | Early integration | Model/provider selection, Thinking Effort, Exa search, uploads, and tight monthly credits |
-| <img src=".github/svgs/providers/aistudio.svg" width="18" alt=""> **Google AI Studio** | Temporarily locked | Driver/settings remain available; launch/routing requires **Ignore Provider Locks** |
+| <img src=".github/svgs/providers/aistudio.svg" width="18" alt=""> **Google AI Studio** | Usable | Gemini model selection, Thinking Level, Search/URL Context, and so on |
 
 More detail lives in `docs/` (best viewed as the docs site - see below).
 
@@ -275,13 +275,11 @@ python -m pip install -r docs/requirements.txt
 zensical serve
 ```
 
-## Support the project ❤️
+## Project status
 
-If IntenseRP Next v2 is useful to you, and you wish to help, thank you!! The easiest support is a [star](https://github.com/LyubomirT/intense-rp-next/stargazers) and a quick [issue report / feature request](https://github.com/LyubomirT/intense-rp-next/issues) when something is missing or broken.
+IntenseRP Next v2 is being archived.
 
-If you want quicker back-and-forth or community troubleshooting, you can also join the [IntenseRP Next Discord server](https://discord.gg/4Gvjk2RdsK).
-
-If you want to help financially as well (optional, but appreciated), see: [Support the Project](https://intense-rp-next.readthedocs.io/en/latest/hands/support/#financial-support-optional) in the docs.
+Existing releases and docs remain available for people who already use the project or want to learn from the code. Community links may remain online, but no active maintenance or support response is promised.
 
 ## Security and privacy notes
 
@@ -291,15 +289,9 @@ If you want to help financially as well (optional, but appreciated), see: [Suppo
 
 ## Contributing 🤝
 
-Bug reports, suggestions, and PRs are welcome!! 💖
+This repository is being archived, so new issues and PRs may not be reviewed.
 
-Just note a few things:
-
-- This is still a fast-moving codebase. A PR can become outdated quickly.
-- Provider behavior changes are inevitable (web UIs are a moving target).
-- I move this in a very "me" way due to how fast things change, meaning not every idea will align with my vision even if it's objectively good.
-
-If you're not sure where to start, open an issue first - it saves everyone time.
+Existing issues, release notes, and docs remain available as reference. If you fork or continue the project privately, please review the provider terms, security assumptions, and maintenance risk before relying on it.
 
 ## Contributors ❤️
 

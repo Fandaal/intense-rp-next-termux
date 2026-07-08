@@ -21,6 +21,7 @@ Right now this feature works on:
 - Moonshot / Kimi
 - QwenLM
 - HuggingChat
+- Xiaomi MiMo
 
 It does **not** work on **Perplexity** or **Google AI Studio** right now.
 
@@ -73,7 +74,7 @@ That matters because provider chat IDs are usually only valid for the account th
 
 DeepSeek has one extra rule here.
 
-If a DeepSeek chat gets content-filtered / censored, IntenseRP does **not** save that chat into the older-chat cache. DeepSeek disables regeneration on censored chats anyway, so keeping those around would just create dead cache entries.
+If a DeepSeek chat gets content-filtered, IntenseRP does **not** save that chat into the older-chat cache. DeepSeek disables regeneration on content-filtered chats anyway, so keeping those around would just create dead cache entries.
 
 ---
 
@@ -86,6 +87,7 @@ You enable it in the provider Behavior pages:
 - **Provider Behavior** -> **Moonshot** -> **Search Older Matching Chats**
 - **Provider Behavior** -> **QwenLM** -> **Search Older Matching Chats**
 - **Provider Behavior** -> **HuggingChat** -> **Search Older Matching Chats**
+- **Provider Behavior** -> **Xiaomi MiMo** -> **Search Older Matching Chats**
 
 And again, it only does anything if **Reuse Matching Chat** is already enabled for that provider.
 
@@ -98,6 +100,7 @@ And again, it only does anything if **Reuse Matching Chat** is already enabled f
 - [:material-refresh: Moonshot Behavior](../providers/moonshot-behavior.md#reuse-matching-chat)
 - [:material-refresh: QwenLM Behavior](../providers/qwen-behavior.md#reuse-matching-chat)
 - [:material-refresh: HuggingChat Behavior](../providers/huggingchat-behavior.md#reuse-matching-chat)
+- [:material-refresh: Xiaomi MiMo Behavior](../providers/mimo-behavior.md#reuse-matching-chat)
 - [:material-cloud: Provider Support](../advanced/provider-support.md)
 
 ---

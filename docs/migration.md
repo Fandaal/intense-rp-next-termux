@@ -190,20 +190,15 @@ http://127.0.0.1:7777/v1
 
 Available models:
 
-Depends on your active provider:
+Depends on your active provider. v2 uses the same behavior pattern across providers:
 
-- DeepSeek:
-  - `deepseek-auto` (respects v2 settings)
-  - `deepseek-chat` (forces DeepThink off)
-  - `deepseek-reasoner` (forces DeepThink on)
-- GLM Chat:
-  - `glm-auto` (respects v2 settings)
-  - `glm-chat` (forces Deep Think off)
-  - `glm-reasoner` (forces Deep Think on)
-- Moonshot:
-  - `moonshot-auto` (respects v2 settings)
-  - `moonshot-chat` (forces Thinking off)
-  - `moonshot-reasoner` (forces Thinking on)
+| Pattern | Behavior |
+|---|---|
+| `<provider>-auto` | Respects your v2 settings |
+| `<provider>-chat` | Forces reasoning/thinking off where the provider allows it |
+| `<provider>-reasoner` | Forces reasoning/thinking on where the provider allows it |
+
+For the old v1/API providers, that means IDs like `deepseek-auto`, `glm-chat`, or `moonshot-reasoner`. Newer providers follow the same pattern.
 
 ---
 

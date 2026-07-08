@@ -1,20 +1,31 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import shutil
 import subprocess
 import sys
 import tempfile
 import time
+import traceback
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
-from PySide6.QtCore import QObject, Qt, QThread, Signal
-from PySide6.QtGui import QIcon
-from PySide6.QtWidgets import QApplication, QLabel, QProgressBar, QVBoxLayout, QWidget
+from PySide6.QtCore import QObject, Qt, QThread, QUrl, Signal
+from PySide6.QtGui import QDesktopServices, QGuiApplication, QIcon
+from PySide6.QtWidgets import (
+    QApplication,
+    QFrame,
+    QHBoxLayout,
+    QLabel,
+    QProgressBar,
+    QPushButton,
+    QVBoxLayout,
+    QWidget,
+)
 
 
 class UpdateFailed(RuntimeError):
@@ -25,7 +36,10 @@ DEFAULT_PAYLOAD_DIRNAME = "intense-rp-next"
 DEFAULT_OPTIONAL_DIRNAME = "optional"
 DEFAULT_LOCK_WAIT_S = 300.0
 POSTUPDATE_FLAG_FILENAME = "postupdate_notes_url.txt"
+POSTUPDATE_CLEANUP_FILENAME = "postupdate_cleanup.json"
+PRESERVED_DIR_NAMES = ("config_data", "logs")
 PRESERVED_ROOT_FILENAMES = ("loadouts.json",)
+PRESERVED_ROOT_GLOB_PATTERNS = ("*_dir.txt",)
 CHROMIUM_SINGLETON_LOCK_FILENAMES = (
     "SingletonLock",
     "SingletonCookie",
@@ -39,6 +53,8 @@ class UpdateArgs:
     app_pid: int
     exe_name: Optional[str]
     payload_dir: Optional[Path]
+    release_url: str = ""
+    legacy_restore_config_logs: bool = False
 
 
 def _is_frozen() -> bool:
@@ -367,17 +383,237 @@ def _compute_backup_dir(install_dir: Path) -> Path:
     return install_dir.with_name(f"{install_dir.name}-backup-{_timestamp()}")
 
 
-def _perform_update(args: UpdateArgs, *, status_cb, progress_cb) -> None:
+def _compute_preserve_dir(install_dir: Path) -> Path:
+    return install_dir.with_name(f"{install_dir.name}-preserve-{_timestamp()}")
+
+
+def _unique_relpaths(relpaths: list[Path]) -> list[Path]:
+    unique: list[Path] = []
+    seen: set[str] = set()
+    for relpath in relpaths:
+        key = relpath.as_posix().lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(relpath)
+    return unique
+
+
+def _iter_preserved_relpaths(root: Path) -> list[Path]:
+    relpaths: list[Path] = []
+
+    for dirname in PRESERVED_DIR_NAMES:
+        path = root / dirname
+        if path.exists():
+            relpaths.append(Path(dirname))
+
+    for filename in PRESERVED_ROOT_FILENAMES:
+        path = root / filename
+        if path.exists():
+            relpaths.append(Path(filename))
+
+    for pattern in PRESERVED_ROOT_GLOB_PATTERNS:
+        try:
+            matches = list(root.glob(pattern))
+        except Exception:
+            matches = []
+        for match in matches:
+            if match.exists():
+                relpaths.append(Path(match.name))
+
+    return _unique_relpaths(relpaths)
+
+
+def _remove_path(path: Path) -> None:
+    if not path.exists() and not path.is_symlink():
+        return
+    if path.is_dir() and not path.is_symlink():
+        shutil.rmtree(path)
+    else:
+        path.unlink(missing_ok=True)
+
+
+def _scrub_payload_preserved_items(payload_dir: Path, *, log_cb=None) -> None:
+    """
+    Release packages should not ship config/log data, but remove it from the
+    staged payload just in case so local data never gets replaced by accident.
+    """
+    for relpath in _iter_preserved_relpaths(payload_dir):
+        target = payload_dir / relpath
+        try:
+            _remove_path(target)
+            if log_cb is not None:
+                log_cb(f"Removed preserved path from payload: {relpath.as_posix()}")
+        except Exception as exc:
+            raise UpdateFailed(f"Could not remove preserved payload path '{relpath}': {exc}") from exc
+
+
+def _detach_preserved_items(install_dir: Path, preserve_dir: Path, *, log_cb=None) -> list[Path]:
+    detached: list[Path] = []
+    try:
+        for relpath in _iter_preserved_relpaths(install_dir):
+            source = install_dir / relpath
+            destination = preserve_dir / relpath
+            destination.parent.mkdir(parents=True, exist_ok=True)
+
+            def do_move() -> None:
+                shutil.move(str(source), str(destination))
+
+            _retry(do_move, retries=60, delay_s=0.5)
+            detached.append(relpath)
+            if log_cb is not None:
+                log_cb(f"Preserved local path: {relpath.as_posix()}")
+    except Exception:
+        try:
+            _restore_detached_items(preserve_dir, install_dir, detached, log_cb=log_cb)
+        except Exception as restore_exc:
+            if log_cb is not None:
+                log_cb(f"Failed to restore local data after preserve failure: {restore_exc}")
+        raise
+    return detached
+
+
+def _restore_detached_items(preserve_dir: Path, install_dir: Path, relpaths: list[Path], *, log_cb=None) -> None:
+    restored: list[Path] = []
+    try:
+        for relpath in relpaths:
+            source = preserve_dir / relpath
+            if not source.exists() and not source.is_symlink():
+                continue
+
+            destination = install_dir / relpath
+            if destination.exists() or destination.is_symlink():
+                raise UpdateFailed(f"Refusing to replace preserved local path: {destination}")
+
+            destination.parent.mkdir(parents=True, exist_ok=True)
+
+            def do_move() -> None:
+                shutil.move(str(source), str(destination))
+
+            _retry(do_move, retries=60, delay_s=0.5)
+            restored.append(relpath)
+            if log_cb is not None:
+                log_cb(f"Restored local path: {relpath.as_posix()}")
+    except Exception:
+        for relpath in reversed(restored):
+            source = install_dir / relpath
+            destination = preserve_dir / relpath
+            if not source.exists() and not source.is_symlink():
+                continue
+            if destination.exists() or destination.is_symlink():
+                continue
+            try:
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                shutil.move(str(source), str(destination))
+            except Exception as restore_exc:
+                if log_cb is not None:
+                    log_cb(f"Failed to re-preserve local path '{relpath}': {restore_exc}")
+        raise
+
+    try:
+        preserve_dir.rmdir()
+    except Exception:
+        pass
+
+
+def _rollback_update(
+    *,
+    install_dir: Path,
+    backup_dir: Path,
+    preserve_dir: Path,
+    detached_relpaths: list[Path],
+    log_cb=None,
+) -> None:
+    try:
+        if install_dir.exists() and backup_dir.exists():
+            _remove_path(install_dir)
+        if backup_dir.exists() and not install_dir.exists():
+            backup_dir.rename(install_dir)
+        if detached_relpaths and install_dir.exists():
+            _restore_detached_items(preserve_dir, install_dir, detached_relpaths, log_cb=log_cb)
+    except Exception as exc:
+        if log_cb is not None:
+            log_cb(f"Rollback failed: {exc}")
+
+
+def _write_postupdate_cleanup_manifest(install_dir: Path, backup_dir: Path, *, log_cb=None) -> None:
+    payload = {
+        "version": 1,
+        "backup_dir": str(backup_dir),
+        "created_at": datetime.now().isoformat(timespec="seconds"),
+    }
+    try:
+        (install_dir / POSTUPDATE_CLEANUP_FILENAME).write_text(
+            json.dumps(payload, indent=2),
+            encoding="utf-8",
+        )
+        if log_cb is not None:
+            log_cb(f"Wrote post-update cleanup manifest for backup: {backup_dir}")
+    except Exception as exc:
+        if log_cb is not None:
+            log_cb(f"Failed to write post-update cleanup manifest: {exc}")
+
+
+def _make_update_log_path() -> Path:
+    return Path(tempfile.gettempdir()) / f"intenserp-updater-{_timestamp()}.log"
+
+
+def _append_update_log(log_path: Path, message: str) -> None:
+    try:
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(log_path, "a", encoding="utf-8") as handle:
+            handle.write(f"[{datetime.now().isoformat(timespec='seconds')}] {message}\n")
+    except Exception:
+        pass
+
+
+def _latest_backup_dir(install_dir: Path) -> Path | None:
+    try:
+        parent = install_dir.resolve().parent
+    except Exception:
+        parent = install_dir.parent
+
+    try:
+        candidates = [
+            path
+            for path in parent.glob(f"{install_dir.name}-backup*")
+            if path.exists() and path.is_dir()
+        ]
+    except Exception:
+        candidates = []
+
+    if not candidates:
+        return None
+
+    def mtime(path: Path) -> float:
+        try:
+            return path.stat().st_mtime
+        except Exception:
+            return 0.0
+
+    candidates.sort(key=mtime, reverse=True)
+    return candidates[0]
+
+
+def _perform_update(args: UpdateArgs, *, status_cb, progress_cb, log_cb=None) -> None:
     install_dir = args.install_dir.resolve()
     updater_path = _resolve_updater_exe_path()
     payload_dir = (args.payload_dir or _default_payload_dir(updater_path)).resolve()
+    preserve_dir = _compute_preserve_dir(install_dir)
+    detached_relpaths: list[Path] = []
+    rollback_allowed = True
+
+    def status(text: str) -> None:
+        if log_cb is not None:
+            log_cb(text)
+        status_cb(text)
 
     try:
         os.chdir(tempfile.gettempdir())
     except Exception:
         pass
 
-    status_cb("Waiting for the app to close…")
+    status("Waiting for the app to close…")
     progress_cb(5)
     _wait_for_pid(args.app_pid, timeout_s=240.0)
     try:
@@ -387,7 +623,7 @@ def _perform_update(args: UpdateArgs, *, status_cb, progress_cb) -> None:
     try:
         removed_locks = _cleanup_playwright_singleton_locks(install_dir)
         if removed_locks:
-            status_cb(f"Removed {removed_locks} stale browser profile lock file(s)…")
+            status(f"Removed {removed_locks} stale browser profile lock file(s)…")
     except Exception:
         pass
 
@@ -397,7 +633,15 @@ def _perform_update(args: UpdateArgs, *, status_cb, progress_cb) -> None:
     if not payload_dir.exists() or not payload_dir.is_dir():
         raise UpdateFailed(f"Update payload directory not found: {payload_dir}")
 
-    status_cb("Preparing backup…")
+    if args.legacy_restore_config_logs:
+        status("Using legacy config/log restore mode…")
+    else:
+        status("Preserving local data…")
+        progress_cb(10)
+        _scrub_payload_preserved_items(payload_dir, log_cb=log_cb)
+        detached_relpaths = _detach_preserved_items(install_dir, preserve_dir, log_cb=log_cb)
+
+    status("Preparing backup…")
     progress_cb(15)
     backup_dir = _compute_backup_dir(install_dir)
 
@@ -414,21 +658,26 @@ def _perform_update(args: UpdateArgs, *, status_cb, progress_cb) -> None:
         if now - last_hint_at < 2.0:
             return
         last_hint_at = now
-        status_cb(
+        status(
             "Waiting for Windows to release files…\n"
             "Close File Explorer windows opened to the app folder and try again."
         )
 
     lock_wait_s = DEFAULT_LOCK_WAIT_S if sys.platform.startswith("win") else 60.0
-    _retry(
-        do_backup,
-        retries=max(1, int(lock_wait_s / 0.25)),
-        delay_s=0.25,
-        on_retry=on_backup_retry,
-    )
+    try:
+        _retry(
+            do_backup,
+            retries=max(1, int(lock_wait_s / 0.25)),
+            delay_s=0.25,
+            on_retry=on_backup_retry,
+        )
+    except Exception:
+        if detached_relpaths:
+            _restore_detached_items(preserve_dir, install_dir, detached_relpaths, log_cb=log_cb)
+        raise
 
     try:
-        status_cb("Installing new version…")
+        status("Installing new version…")
         progress_cb(35)
 
         def do_install() -> None:
@@ -436,38 +685,32 @@ def _perform_update(args: UpdateArgs, *, status_cb, progress_cb) -> None:
 
         _retry(do_install, retries=40, delay_s=0.5)
 
-        status_cb("Restoring configs and logs…")
-        progress_cb(60)
-        _merge_copy_dir(backup_dir / "config_data", install_dir / "config_data")
-        _merge_copy_dir(backup_dir / "logs", install_dir / "logs")
-        _merge_copy_root_files(backup_dir, install_dir, PRESERVED_ROOT_FILENAMES)
-
-        copied_any = False
-        for txt_path in backup_dir.glob("*_dir.txt"):
-            if txt_path.is_file():
-                shutil.copy2(txt_path, install_dir / txt_path.name)
-                copied_any = True
-        legacy_pointer = backup_dir / "config_dir.txt"
-        if legacy_pointer.exists() and legacy_pointer.is_file():
-            shutil.copy2(legacy_pointer, install_dir / legacy_pointer.name)
-            copied_any = True
-        if not copied_any:
-            pass
-
-        status_cb("Cleaning up old version…")
-        progress_cb(75)
-
-        def do_cleanup() -> None:
-            shutil.rmtree(backup_dir)
-
-        try:
-            _retry(do_cleanup, retries=60, delay_s=0.5)
-        except Exception:
-            pass
-
-        status_cb("Launching updated app…")
-        progress_cb(90)
         exe_path = _select_main_exe(install_dir, args.exe_name)
+
+        progress_cb(60)
+        if args.legacy_restore_config_logs:
+            status("Restoring configs and logs…")
+            _merge_copy_dir(backup_dir / "config_data", install_dir / "config_data")
+            _merge_copy_dir(backup_dir / "logs", install_dir / "logs")
+            _merge_copy_root_files(backup_dir, install_dir, PRESERVED_ROOT_FILENAMES)
+
+            for txt_path in backup_dir.glob("*_dir.txt"):
+                if txt_path.is_file():
+                    shutil.copy2(txt_path, install_dir / txt_path.name)
+        else:
+            status("Restoring local data…")
+            _restore_detached_items(preserve_dir, install_dir, detached_relpaths, log_cb=log_cb)
+
+        # DON'T ROLL BACK RIGHT AWAY
+        # users will do it manually if they want to revetr
+        rollback_allowed = False
+
+        status("Leaving old version available until relaunch…")
+        progress_cb(75)
+        _write_postupdate_cleanup_manifest(install_dir, backup_dir, log_cb=log_cb)
+
+        status("Launching updated app…")
+        progress_cb(90)
 
         try:
             (install_dir / POSTUPDATE_FLAG_FILENAME).write_text("true", encoding="utf-8")
@@ -489,23 +732,17 @@ def _perform_update(args: UpdateArgs, *, status_cb, progress_cb) -> None:
             stdin=subprocess.DEVNULL,
         )
 
-        status_cb("Done.")
+        status("Done.")
         progress_cb(100)
     except Exception:
-        try:
-            if backup_dir.exists():
-                try:
-                    if install_dir.exists():
-                        shutil.rmtree(install_dir)
-                except Exception:
-                    pass
-                try:
-                    if not install_dir.exists():
-                        backup_dir.rename(install_dir)
-                except Exception:
-                    pass
-        except Exception:
-            pass
+        if rollback_allowed:
+            _rollback_update(
+                install_dir=install_dir,
+                backup_dir=backup_dir,
+                preserve_dir=preserve_dir,
+                detached_relpaths=detached_relpaths,
+                log_cb=log_cb,
+            )
         raise
 
 
@@ -513,29 +750,45 @@ class _Worker(QObject):
     status = Signal(str)
     progress = Signal(int)
     finished = Signal()
-    failed = Signal(str)
+    failed = Signal(str, str)
 
     def __init__(self, args: UpdateArgs):
         super().__init__()
         self._args = args
+        self._log_path = _make_update_log_path()
 
     def run(self) -> None:
+        def log(message: str) -> None:
+            _append_update_log(self._log_path, message)
+
+        log("Updater started.")
+        log(f"Install dir: {self._args.install_dir}")
+        log(f"Payload dir: {self._args.payload_dir}")
+        log(f"Legacy config/log restore: {self._args.legacy_restore_config_logs}")
         try:
             _perform_update(
                 self._args,
                 status_cb=lambda s: self.status.emit(s),
                 progress_cb=lambda p: self.progress.emit(int(p)),
+                log_cb=log,
             )
+            log("Updater finished successfully.")
             self.finished.emit()
         except Exception as exc:
-            self.failed.emit(str(exc))
+            log("Updater failed.")
+            log(traceback.format_exc())
+            self.failed.emit(str(exc), str(self._log_path))
 
 
 class UpdateWindow(QWidget):
     def __init__(self, args: UpdateArgs):
         super().__init__()
+        self._args = args
+        self._failure_text = ""
+        self._failure_log_path = ""
+
         self.setWindowTitle("Updating…")
-        self.setFixedWidth(420)
+        self.setFixedWidth(520)
         self.setMinimumHeight(140)
 
         icon = _find_default_icon()
@@ -557,6 +810,10 @@ class UpdateWindow(QWidget):
         self._bar.setTextVisible(False)
         layout.addWidget(self._bar)
 
+        self._failure_buttons = self._build_failure_buttons()
+        self._failure_buttons.hide()
+        layout.addWidget(self._failure_buttons)
+
         self._thread = QThread(self)
         self._worker = _Worker(args)
         self._worker.moveToThread(self._thread)
@@ -574,7 +831,7 @@ class UpdateWindow(QWidget):
         self._thread.wait(1000)
         QApplication.instance().quit()
 
-    def _on_failed(self, message: str) -> None:
+    def _on_failed(self, message: str, log_path: str = "") -> None:
         hint = ""
         lowered = (message or "").lower()
         # Windows-specific file locking hints
@@ -584,9 +841,67 @@ class UpdateWindow(QWidget):
                     "\n\nTip: close any File Explorer windows opened to the app folder "
                     "(and disable Preview pane), then try again."
                 )
-        self._label.setText(f"Update failed:\n{message}{hint}")
+        log_hint = f"\n\nLog: {log_path}" if log_path else ""
+        self._failure_log_path = log_path
+        self._failure_text = f"Update failed:\n{message}{hint}{log_hint}"
+        self._label.setText(self._failure_text)
+        self._failure_buttons.show()
         self._thread.quit()
         self._thread.wait(1000)
+
+    def _build_failure_buttons(self) -> QFrame:
+        frame = QFrame()
+        frame.setStyleSheet("background-color: transparent;")
+
+        outer = QVBoxLayout(frame)
+        outer.setContentsMargins(0, 4, 0, 0)
+        outer.setSpacing(8)
+
+        first_row = QHBoxLayout()
+        first_row.setContentsMargins(0, 0, 0, 0)
+        first_row.setSpacing(8)
+        first_row.addWidget(self._make_failure_button("Copy Error", self._copy_failure_text))
+        first_row.addWidget(self._make_failure_button("Open Install Folder", self._open_install_folder))
+        first_row.addWidget(self._make_failure_button("Open Backup", self._open_backup_folder))
+        outer.addLayout(first_row)
+
+        second_row = QHBoxLayout()
+        second_row.setContentsMargins(0, 0, 0, 0)
+        second_row.setSpacing(8)
+        if (self._args.release_url or "").strip():
+            second_row.addWidget(self._make_failure_button("Release Page", self._open_release_page))
+        second_row.addWidget(self._make_failure_button("Close", self._close_after_failure))
+        outer.addLayout(second_row)
+        return frame
+
+    def _make_failure_button(self, text: str, callback: Callable[[], None]) -> QPushButton:
+        button = QPushButton(text)
+        button.setCursor(Qt.PointingHandCursor)
+        button.clicked.connect(lambda _checked=False: callback())
+        return button
+
+    def _copy_failure_text(self) -> None:
+        clipboard = QGuiApplication.clipboard()
+        if clipboard is not None:
+            clipboard.setText(self._failure_text)
+
+    def _open_install_folder(self) -> None:
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(self._args.install_dir)))
+
+    def _open_backup_folder(self) -> None:
+        backup_dir = _latest_backup_dir(self._args.install_dir)
+        if backup_dir is None:
+            self._label.setText(f"{self._failure_text}\n\nNo backup folder was found next to the app.")
+            return
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(backup_dir)))
+
+    def _open_release_page(self) -> None:
+        url = (self._args.release_url or "").strip()
+        if url:
+            QDesktopServices.openUrl(QUrl(url))
+
+    def _close_after_failure(self) -> None:
+        QApplication.instance().quit()
 
 
 def _find_default_icon() -> Optional[QIcon]:
@@ -611,6 +926,8 @@ def _parse_args(argv: list[str]) -> UpdateArgs:
     parser.add_argument("--app-pid", type=int, default=0)
     parser.add_argument("--exe-name", default=None)
     parser.add_argument("--payload-dir", default=None)
+    parser.add_argument("--release-url", default="")
+    parser.add_argument("--legacy-restore-config-logs", action="store_true")
     ns = parser.parse_args(argv)
 
     install_dir = Path(ns.install_dir).expanduser()
@@ -621,6 +938,8 @@ def _parse_args(argv: list[str]) -> UpdateArgs:
         app_pid=int(ns.app_pid or 0),
         exe_name=exe_name,
         payload_dir=payload_dir,
+        release_url=str(ns.release_url or "").strip(),
+        legacy_restore_config_logs=bool(ns.legacy_restore_config_logs),
     )
 
 
